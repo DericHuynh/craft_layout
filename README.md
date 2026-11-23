@@ -1,0 +1,135 @@
+# `keru_layout`
+
+`keru_layout` is a UI layout library that uses a new algorithm. It's used in the [Keru GUI library](https://github.com/kekelp/keru/), but it's available here as a self-contained crate.
+
+## The Idea
+
+Most layout algorithms will do one or more traversals of the tree of UI elements and calculate the size and position of each element as they go.
+
+However, the kind of dependencies that layout libraries usually expose can go along the direction of the tree (`Frac`, `Fill`), but also in the opposite direction (`FitContent`), or "laterally" (`AspectRatio`, wrapping text).
+
+In short, the idea of this library is to consider the resulting graph of dependencies and to solve it directly. The algorithm traverses the abstract dependency graph rather than the real UI tree.
+
+## Advantages
+
+- Performance: this library is very fast. [See this page for benchmarks](https://kekelp.github.io/arewelayoutyet/). Forked from [this repo](https://github.com/marc2332/arewelayoutyet) from the Torin author.
+
+    `keru_layout` is the fastest or close to the fastest in all the categories that it supports. While other libraries have their strengths and their weaknesses, `keru_layout` is consistently fast in all cases. 
+    
+    It's likely that the other libraries are going faster when their top-down or bottom-up traversals of the UI tree happen to line up with the real structure of the dependency graph, and slower when the shapes don't match as well. By traversing the dependency graph directly, the new algorithm has more consistent performance regardless of the layout.
+
+- Correctness: in some rare cases, such as layouts with many `AspectRatio` dependencies, a traditional tree-based algorithm would have to perform many traversals of the UI tree in order to finally compute the correct results. To avoid spending too much time on layout, many libraries will cut corners and silently produce an inconsistent layout.
+
+    I wrote about one of these cases in this older [blog post](https://kekelp.github.io/keru/blog/layout/).
+
+- Developer Experience: while it's usually not a problem to work around the correctness issues of traditional layout algorithms, it can still be confusing to run into them during development. Using a more consistent algorithm leads to fewer surprises and less confusion.
+
+- Debuggability: almost all layout systems can express cyclic dependencies between elements, but in a traditional tree-based algorithm, this will result in a silently "broken" or inconsistent layout. With this algorithm, we can give the user a clear warning and an accurate list of the nodes that were stuck in cycles.
+
+## Usage
+
+`keru_layout` has a trait-based API similar to Taffy's low-level API.
+There's also an alternative API similar to Taffy's high-level API where the library provides a ready-to-use `LayoutTree`, but it's only meant for quick experiments, examples and testing.
+
+The trait-based API assumes that you already have a tree of UI elements, and that every UI element roughly corresponds to one layout element. Then, using the library looks like this:
+
+1) Add a `LayoutParams` to each UI node. This is the struct that defines the node's layout role (size, position, stack, grid, etc).
+2) Add a `NodeLayoutData` to each UI node. This is a small opaque struct that the solver uses to store per-node intermediate results and flags.
+
+    >The layout solver could store all the `NodeLayoutData`s internally, but then it would have to maintain a mapping between your `NodeId`s and its own internal `NodeLayoutData` ids. If you help the solver out by storing the `NodeLayoutData`s in your own tree, it can go much faster.
+
+    >If your UI nodes already have a lot of data in them, it may be good for performance to store the `LayoutParams` and `NodeLayoutData` separately: for example, in a `SecondaryMap` if the tree is a `SlotMap`, or in a parallel `Vec` if the tree is a `Slab`.
+
+3) Add a single centralized `LayoutData` to your top level struct, or anywhere.
+
+4) Implement the `TreeAdapter` trait for the whole UI tree:
+
+    - Set the `NodeId` type to the Id that can be used to refer to nodes in the UI tree, such as a slotmap key or a slab index.
+    - Fill in the `node_layout_params()`, `node_layout_data()`, `node_layout_data_mut()` and `layout_data()` to simply access the data corresponding to that `NodeId`.
+
+    - Implement the `root()`, `parent()`, `first_child()`, `next_sibling()` methods so that the layout solver can read the preexisting tree links of your UI nodes.
+
+    - Implement `measure_text_width()` and `measure_text_height()` for text, or `measure_content()` for other intrinsic content. These methods default to zero.
+
+    - Finally, implement the `write_output_rect()` callback, and make it write provided output rects where you need them to go, such as a `rect` field in the UI node.
+
+    - Optionally, implement the `layout_warning()` callback to notify the user about any cycles or other issues in their layout.
+
+Then, you can call the trait's `solve_layout()` method to calculate the layout and write all the output sizes.
+
+### `LayoutTree` API
+
+Create a `LayoutTree`, then insert nodes into the layout tree to match the structure of your UI tree, run `tree.solve_layout()`, then use `tree.layout()` on each node to extract the results and use them to update the corresponding UI node.
+
+`tree.root()` returns a `NodeId`, and insertion returns a `ChildId`. Borrow either handle for lookups and parent arguments. Moves and removals take a `ChildId`. Choose `Destination::LastChildOf` to append under a parent or `Destination::Before` to insert before a child under that child's current parent. Node operations report stale or foreign handles. `tree.layout()` returns the last published rectangle and reports `TreeError::LayoutUnavailable` for new or disabled nodes. Cloned trees have their own handles, accessible through the clone's root and children. The clone's first solve refreshes its measurements. `LayoutTree::with_capacity` returns a capacity error if the requested reservation fails.
+
+Use `to_svg()` to draw the resulting layout. To reuse an output buffer across frames, clear a `String` and pass it to `write_svg()` or `write_svg_with_text()`.
+
+```rust,no_run
+use keru_layout::*;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# #[cfg(feature = "incremental")]
+# {
+let mut tree: LayoutTree = LayoutTree::new();
+let row = tree.add_node(&tree.root(), LayoutParams { size: Xy::new(Size::FitContent, Size::FitContent), ..LayoutParams::DEFAULT })?;
+let item = tree.add_node(&row, LayoutParams { size: Xy::new(Size::Pixels(100.0), Size::Pixels(20.0)), ..LayoutParams::DEFAULT })?;
+tree.solve_layout(Xy::new(800.0, 600.0));
+// Read the output rect for the "item" node
+let rect = tree.layout(&item)?;
+// Draw the layout rectangles as SVG to inspect the layout
+std::fs::write("example.svg", tree.to_svg())?;
+# }
+# Ok(())
+# }
+```
+
+### Wrapping, margins, and block flow
+
+- `ChildrenLayout::Wrap` lays out successive rows or columns. Choose an axis, per-line arrangement, item spacing, and line spacing. Line breaks use item sizes before distributing the remaining main-axis space to weighted `Fill` children. The tallest or widest intrinsic item sets the cross-axis extent of its line. Cross-axis `Fill` children stretch inside that extent.
+- `LayoutParams::margin` takes pairs of physical left/right and top/bottom edges. `Margin::px` accepts finite pixel values, including negative margins. Margins affect the space a child occupies in a stack, wrap, grid, or block, and the output rectangle is the child's box inside those margins.
+- `ChildrenLayout::Block` implements CSS normal flow for block boxes. `Size::Auto` fills the containing width for an in-flow block and fits the content on the height axis. `Margin::AUTO` distributes spare inline space, so two auto inline margins center a fixed-width block. Adjoining vertical margins collapse between siblings, through empty blocks, and across eligible parent-child edges. Box dimensions include padding. This mode lays out block boxes in a UI tree. Floats, clearance, and inline CSS formatting are outside its scope.
+
+### Custom content and pixel rounding
+
+Set `LayoutParams::content_measure` to `ContentMeasure::Independent`, `HeightForWidth`, or `WidthForHeight` for intrinsic content such as a chart or embedded view. Use `TreeAdapter::measure_content` or `LayoutTree::solve_layout_with_content_measure` to supply the content-box dimensions. The callback receives the requested axis, any resolved orthogonal content-box dimension required by the mode, and any explicit pixel maximums. Keru adds padding and applies size constraints after measurement. When both text and custom callbacks are needed, use `LayoutTree::solve_layout_with_measurers`. Register changes with `register_content_change` or `mark_content_changed` when content changes independently of layout parameters.
+
+Call `set_pixel_scale(Some(PixelScale::ONE))` on `LayoutData` or `LayoutTree` for whole-pixel output. Use `PixelScale::try_from(device_scale)` to validate a device scale for a higher-density grid. Keru snaps absolute edges and derives local rectangles from those same edges, so shared boundaries stay aligned. Measurements and positioning use unrounded dimensions. Pass `None` to disable rounding.
+
+Pixel snapping uses the CPU features reported usable by Rust. On x86-64, the scale-1.0 path rounds all four edges in binary32. Builds with SSE4.1 enabled use packed floating-point truncation. Portable x86-64 builds reuse the packed kernel for powers of two with normal binary32 reciprocals and can use AVX-512, AVX2, or SSE2 at other scales. When AVX2 is enabled for the whole build, the scaled AVX kernels can inline. Enabling both AVX2 and FMA selects the fused kernel when both features are usable. Other architectures use the scalar implementation. Rust 1.89 or newer is required to compile the AVX-512 kernel. [Dispatch and arithmetic proofs](proofs/README.md)
+
+Stack placement groups in-flow leaf rectangles when a runtime-dispatched AVX kernel can round them together. Each batch fits on the stack, shares the scale constants, and publishes rectangles in sibling order. AVX-512 rounds two complete rectangles per vector.
+
+## Incremental Relayout
+
+The `LayoutTree` API tracks edits automatically. In a cycle-free tree, changing a size or content queues its dependent sizes. Inserting, removing, moving, or reordering children rebuilds the affected sizing dependencies. For example, moving a label between two fixed-size panels can reuse the measurements in other panels. Reordering independently sized siblings can reuse every measurement while updating their positions.
+
+With a custom `TreeAdapter`, call `register_child_attached(child)?` after insertion. It reads the new parent from the updated links and returns an error for a root or detached child. Report a removal or same-parent reorder with `register_children_change(parent)`. For a move, call `register_children_change(old_parent)` and `register_child_attached(child)?` after updating both parents’ links. Use `register_node_change` for parameter changes and `register_content_change` for intrinsic content changes. If the location of a structural edit is unknown, call `register_structural_change()`. Custom adapters start saving node order and parameters when they use incremental solving, retain output rectangles, or call a host measurement function. Full solves on other adapters skip this bookkeeping. If the first unlocalized edit follows such a full solve, the solver seeds independent pixel sizes from the live tree and rebuilds the remaining dependencies. Later unlocalized edits can compare directly with the saved tree, including when the root changes. `LayoutTree` records edits as they happen and skips the topology snapshot.
+
+Measurement results must be repeatable for the same node, constraints, and content. Report content changes so the solver can invalidate reused measurements. Callbacks can update private caches or logs while keeping the current solve's layout inputs stable.
+
+Adapters that use Verus can implement `measurement::Measurer` to prove that their executable measurement code returns the same bits for the same inputs. The contract supports mutable caches and runs without a verifier dependency in ordinary Rust builds. [Downstream measurement verification](proofs/README.md#verify-a-downstream-measurer)
+
+When `LayoutTree` appends or removes unbounded `Fill` leaves at the end of a stack, it can update the shared dimension while retaining independent cross-axis measurements. If gaps or fixed-size siblings already consume all available space, repeated tail edits can also preserve all earlier rectangles in a start-aligned stack.
+
+Structural edits can be batched with a resize, a content change, or a change to a sizing cycle. For general edits, the solver walks the live tree to locate affected regions. Shared fill sizes, grid cells, wrap lines, and collapsed block margins can carry the work up to the root. Within those regions, it reuses independent leaf sizes, measurements with matching constraints, and unchanged subtrees behind fixed-size boundaries.
+
+`LayoutTree` also skips placement in unaffected branches. Resizing the viewport or changing the pixel scale refreshes output across the tree. Custom adapters receive all output rectangles by default and can opt into partial writes with `retains_output_rects()`. Explicit invalidation requests a full solve, and `solve_layout_incremental_checked` verifies the sizing results and the complete ordered absolute and local view against the engine’s canonical full solve.
+
+The proof suite compares the ordered absolute and local rectangles of a retained view with a fresh full build across successive edits. It also checks the production grid search, Fill compaction, sibling traversal and pixel snapping. The verification guide describes which paths share verified Rust code and which still depend on a model of the adapter or solver. [Layout proofs](proofs/README.md)
+
+Without structural edits, placement-only changes in wrapping and block layouts reuse measured sizes. Changes to sizing inputs in these layouts can request a full solve to rebuild the flow data. Disable the `incremental` feature to omit change tracking and use full solves through `TreeAdapter`.
+
+
+## FAQ
+
+- **Is this the same as the Cassowary constraint solving algorithm?**
+
+    No, it's different. This algorithm doesn't model all dependencies as constraints, doesn't use the simplex method, or anything like that.
+
+
+## Screenshots
+
+![Layout example](https://raw.githubusercontent.com/kekelp/keru_layout/main/examples/example.svg "Svg output for the layout in `example.rs`")
+
+*SVG output of the `example.rs` example*

@@ -1,0 +1,163 @@
+workload	engine	mean_ms	mean_ci95_low_ms	mean_ci95_high_ms	samples	iterations_per_sample
+expand_with_max_constraint	Backer	0.52097468	0.48118024	0.56423550	10	114
+expand_with_max_constraint	Cephal	1.04586862	1.03015373	1.05719909	10	100
+expand_with_max_constraint	Clay	0.58666181	0.58336140	0.59037037	10	170
+expand_with_max_constraint	Keru current	0.15675251	0.15509219	0.15825447	10	623
+expand_with_max_constraint	Keru pre-structural	0.22764751	0.22664130	0.22861115	10	416
+expand_with_max_constraint	Keru published 0.1.0	0.30621605	0.30089843	0.31334748	10	328
+expand_with_max_constraint	Morphorm	0.88160032	0.84171964	0.92901384	10	118
+expand_with_max_constraint	Ply	0.62708933	0.61589050	0.63646502	10	167
+expand_with_max_constraint	Taffy 0.3	1.41134403	1.38141919	1.44292848	10	67
+expand_with_max_constraint	Taffy main	1.72675897	1.72494456	1.72875599	10	57
+expand_with_max_constraint	Torin	0.26418489	0.25785621	0.27061411	10	385
+expand_with_max_constraint	Yoga	2.32258475	2.21753338	2.47121487	10	43
+expand_with_max_constraint	hooke	1.09980423	1.09556834	1.10473663	10	88
+expand_with_max_constraint	ui_layout	1.87977459	1.77429655	2.00517527	10	43
+expand_with_min_constraint	Backer	0.47293720	0.47170617	0.47452107	10	129
+expand_with_min_constraint	Cephal	0.96876165	0.96599382	0.97187054	10	104
+expand_with_min_constraint	Clay	0.89668648	0.85815733	0.95822917	10	113
+expand_with_min_constraint	Keru current	0.14983281	0.14937954	0.15029589	10	647
+expand_with_min_constraint	Keru pre-structural	0.22439267	0.22303692	0.22578499	10	448
+expand_with_min_constraint	Keru published 0.1.0	0.30638246	0.30495047	0.30814916	10	326
+expand_with_min_constraint	Morphorm	0.83148643	0.82193429	0.84391588	10	111
+expand_with_min_constraint	Ply	0.75699510	0.73192011	0.78044459	10	120
+expand_with_min_constraint	Taffy 0.3	1.54906899	1.50149800	1.60852911	10	66
+expand_with_min_constraint	Taffy main	2.22760021	2.07616654	2.40161097	10	50
+expand_with_min_constraint	Torin	0.28624420	0.26057232	0.31990571	10	385
+expand_with_min_constraint	Yoga	2.15920321	2.14009674	2.18250596	10	45
+expand_with_min_constraint	hooke	1.16302832	1.12324733	1.21272161	10	92
+expand_with_min_constraint	ui_layout	1.71385668	1.65182160	1.78638150	10	46
+fit_nesting	Backer	16.39073542	15.94019481	17.05824148	10	4
+fit_nesting	Cephal	13.22746946	12.63165850	13.96418443	10	7
+fit_nesting	Clay	26.87666598	26.31918137	27.50717737	10	4
+fit_nesting	Keru current	5.57218838	5.48853271	5.67144754	10	19
+fit_nesting	Keru pre-structural	8.05038990	7.90637532	8.20991306	10	13
+fit_nesting	Keru published 0.1.0	14.46561437	14.36000510	14.58139347	10	7
+fit_nesting	Morphorm	74.30192325	73.18286865	75.47884160	10	2
+fit_nesting	Ply	44.48687300	44.11333795	44.87424424	10	3
+fit_nesting	Taffy 0.3	165.76995430	164.26978728	167.29902877	10	1
+fit_nesting	Taffy main	42.44585220	41.96532637	42.98270903	10	3
+fit_nesting	Torin	28.37581715	28.02543521	28.69747117	10	4
+fit_nesting	Yoga	127.87530670	126.91371887	128.84471326	10	1
+fit_nesting	hooke	23.04638252	22.78918301	23.31922327	10	4
+fit_nesting	ui_layout	103.15410760	101.87217590	104.83146040	10	1
+flex_expand_equal_weights	Backer	1.95697857	1.90936807	2.00090135	10	31
+flex_expand_equal_weights	Cephal	1.41887140	1.37177136	1.46759312	10	74
+flex_expand_equal_weights	Clay	3.24790823	3.21386509	3.28996038	10	32
+flex_expand_equal_weights	Keru current	0.43975248	0.43147394	0.44984639	10	235
+flex_expand_equal_weights	Keru pre-structural	1.38136200	1.34334199	1.42145888	10	74
+flex_expand_equal_weights	Keru published 0.1.0	1.46202171	1.43130878	1.49381147	10	65
+flex_expand_equal_weights	Morphorm	1.58522287	1.56866197	1.60446014	10	65
+flex_expand_equal_weights	Ply	6.01408552	5.98199746	6.04346449	10	17
+flex_expand_equal_weights	Taffy 0.3	5.39387544	5.34215945	5.44507412	10	17
+flex_expand_equal_weights	Taffy main	5.49274055	5.33918162	5.66030273	10	16
+flex_expand_equal_weights	Torin	1.35506492	1.33233387	1.38130902	10	73
+flex_expand_equal_weights	Yoga	11.45821542	11.40354666	11.51768876	10	9
+flex_expand_equal_weights	hooke	1.71705104	1.69367070	1.74515722	10	49
+flex_expand_equal_weights	ui_layout	9.66323769	9.46213523	9.88135409	10	8
+flex_expand_weights	Cephal	3.85588289	3.80637212	3.90731125	10	26
+flex_expand_weights	Keru current	0.45691581	0.45292629	0.46084853	10	209
+flex_expand_weights	Keru pre-structural	0.96456475	0.96152372	0.96769642	10	100
+flex_expand_weights	Keru published 0.1.0	1.30591320	1.28745617	1.33264000	10	78
+flex_expand_weights	Morphorm	1.79936455	1.75477568	1.86054063	10	59
+flex_expand_weights	Ply	6.39675622	6.29041349	6.50746518	10	16
+flex_expand_weights	Taffy 0.3	9.99942920	9.86894422	10.16177393	10	10
+flex_expand_weights	Taffy main	11.34734480	11.15887522	11.53555339	10	9
+flex_expand_weights	Torin	1.54648140	1.40807037	1.72494833	10	53
+flex_expand_weights	Yoga	14.20738591	13.87437369	14.56483429	10	7
+flex_expand_weights	hooke	3.12181855	3.05366870	3.19129622	10	30
+flex_expand_weights	ui_layout	13.18012567	12.58133228	13.98370215	10	6
+nested_vertical_stack	Backer	1.28806359	1.27090655	1.30797168	10	46
+nested_vertical_stack	Cephal	1.01015977	1.00088250	1.01969905	10	99
+nested_vertical_stack	Clay	2.00670653	1.94077281	2.10465486	10	51
+nested_vertical_stack	Keru current	0.20537492	0.20337745	0.20776022	10	476
+nested_vertical_stack	Keru pre-structural	0.50668448	0.50136952	0.51530670	10	192
+nested_vertical_stack	Keru published 0.1.0	0.88400268	0.87593067	0.89641245	10	114
+nested_vertical_stack	Morphorm	0.85997586	0.85508921	0.86406658	10	117
+nested_vertical_stack	Ply	2.38472769	2.31189724	2.45818544	10	39
+nested_vertical_stack	Taffy 0.3	3.58939407	3.34687513	3.80329059	10	25
+nested_vertical_stack	Taffy main	3.31793831	3.16094117	3.48519585	10	26
+nested_vertical_stack	Torin	0.56715164	0.55605357	0.57899830	10	178
+nested_vertical_stack	Yoga	7.15854959	7.07512106	7.24445046	10	14
+nested_vertical_stack	hooke	1.13606109	1.10059114	1.17530852	10	83
+nested_vertical_stack	ui_layout	6.34153972	6.20294290	6.48467080	10	13
+padding_and_margin	Cephal	0.01232310	0.01213661	0.01249939	10	7198
+padding_and_margin	Keru current	0.00443358	0.00422115	0.00466441	10	16908
+padding_and_margin	Keru pre-structural	0.00661104	0.00658079	0.00663629	10	12472
+padding_and_margin	Taffy 0.3	0.02186113	0.02123645	0.02257219	10	4165
+padding_and_margin	Taffy main	0.02371113	0.02329280	0.02415988	10	3803
+padding_and_margin	Torin	0.00640342	0.00630870	0.00650533	10	12223
+padding_and_margin	Yoga	0.07096957	0.07010847	0.07182542	10	1348
+padding_and_margin	hooke	0.01298511	0.01245594	0.01363261	10	7262
+padding_and_margin	ui_layout	0.04628669	0.04518111	0.04740209	10	1622
+percentage_and_ratio	Cephal	1.76969251	1.75190403	1.80042500	10	58
+percentage_and_ratio	Clay	2.99216593	2.97573042	3.00740522	10	34
+percentage_and_ratio	Keru current	0.24365561	0.23111400	0.25840559	10	420
+percentage_and_ratio	Keru pre-structural	0.66996271	0.66900059	0.67115668	10	148
+percentage_and_ratio	Keru published 0.1.0	0.88582356	0.86331652	0.92112766	10	111
+percentage_and_ratio	Morphorm	0.98761075	0.96624814	1.01188434	10	104
+percentage_and_ratio	Ply	3.61676578	3.51971997	3.71264898	10	27
+percentage_and_ratio	Taffy 0.3	2.68820749	2.63356237	2.75670283	10	29
+percentage_and_ratio	Taffy main	3.56538941	3.43376039	3.69594726	10	27
+percentage_and_ratio	Yoga	7.54112450	7.41116468	7.67800262	10	14
+percentage_and_ratio	hooke	1.24568207	1.23112490	1.26489256	10	76
+perpendicular_expand_with_wrap	Cephal	1.39010766	1.35120736	1.46129664	10	76
+perpendicular_expand_with_wrap	Keru current	0.82063739	0.80526879	0.83952085	10	110
+perpendicular_expand_with_wrap	Keru pre-structural	0.81202989	0.80963091	0.81432433	10	123
+perpendicular_expand_with_wrap	Morphorm	2.17520028	2.00486502	2.44137225	10	48
+perpendicular_expand_with_wrap	Ply	6.30314437	5.90824421	6.73394760	10	19
+perpendicular_expand_with_wrap	Taffy 0.3	4.95051638	4.68441207	5.23650662	10	21
+perpendicular_expand_with_wrap	Taffy main	5.64378452	5.34923417	5.98938036	10	17
+perpendicular_expand_with_wrap	Torin	1.14956647	1.11408419	1.18920172	10	89
+perpendicular_expand_with_wrap	Yoga	87.18359180	85.53212340	89.37240460	10	2
+perpendicular_expand_with_wrap	hooke	2.11571185	2.07557198	2.16224360	10	45
+perpendicular_expand_with_wrap	ui_layout	9.21422694	8.97214649	9.50986100	10	9
+pixels_with_min_expand_constraint	Cephal	11.24245163	10.75202196	11.85199398	10	9
+pixels_with_min_expand_constraint	Keru current	2.76101056	2.65572543	2.88062648	10	37
+pixels_with_min_expand_constraint	Keru pre-structural	2.30117116	2.29602795	2.30743693	10	44
+pixels_with_min_expand_constraint	Keru published 0.1.0	3.42734072	3.37776344	3.49383901	10	29
+pixels_with_min_expand_constraint	Morphorm	6.28462649	6.08829883	6.47148583	10	16
+pixels_with_min_expand_constraint	Taffy 0.3	26.40673687	25.81857105	27.17753630	10	4
+pixels_with_min_expand_constraint	Taffy main	33.63438250	32.57300207	34.78711717	10	3
+pixels_with_min_expand_constraint	Torin	4.38211955	4.30130139	4.46543420	10	21
+pixels_with_min_expand_constraint	Yoga	27.49422500	27.29902807	27.67885091	10	4
+pixels_with_min_expand_constraint	hooke	15.98308338	15.63886537	16.32142363	10	6
+pixels_with_min_expand_constraint	ui_layout	36.93346295	34.23543458	40.00197706	10	2
+wide_no_wrap_simple_few	Backer	0.13189255	0.13078165	0.13378597	10	457
+wide_no_wrap_simple_few	Cephal	0.10041450	0.09769861	0.10522494	10	994
+wide_no_wrap_simple_few	Clay	0.16918976	0.16804063	0.17036722	10	591
+wide_no_wrap_simple_few	Keru current	0.01317412	0.01236733	0.01406861	10	6750
+wide_no_wrap_simple_few	Keru pre-structural	0.01135906	0.01131199	0.01142940	10	7786
+wide_no_wrap_simple_few	Keru published 0.1.0	0.06559389	0.06502197	0.06624114	10	1503
+wide_no_wrap_simple_few	Morphorm	0.08414368	0.08376572	0.08454652	10	1164
+wide_no_wrap_simple_few	Ply	0.18269043	0.18126849	0.18398030	10	534
+wide_no_wrap_simple_few	Taffy 0.3	0.15824079	0.15354889	0.16676282	10	597
+wide_no_wrap_simple_few	Taffy main	0.25184292	0.25057796	0.25290082	10	374
+wide_no_wrap_simple_few	Torin	0.04792311	0.04778980	0.04806445	10	1965
+wide_no_wrap_simple_few	Yoga	0.47187536	0.46862259	0.47680369	10	205
+wide_no_wrap_simple_few	hooke	0.12670484	0.12595683	0.12775983	10	747
+wide_no_wrap_simple_few	ui_layout	0.35855371	0.35419798	0.36267694	10	189
+wide_no_wrap_simple_many	Backer	18.80292235	18.64493935	18.97036012	10	4
+wide_no_wrap_simple_many	Cephal	15.42156333	15.16281546	15.65254577	10	7
+wide_no_wrap_simple_many	Clay	21.00142442	20.12318834	22.37333340	10	5
+wide_no_wrap_simple_many	Keru current	2.81803871	2.73688914	2.92290414	10	35
+wide_no_wrap_simple_many	Keru pre-structural	2.35551607	2.33652585	2.37592277	10	41
+wide_no_wrap_simple_many	Keru published 0.1.0	9.29673676	9.09649849	9.52448571	10	12
+wide_no_wrap_simple_many	Morphorm	9.12825738	8.95411699	9.30266595	10	11
+wide_no_wrap_simple_many	Taffy 0.3	34.73789890	34.60250140	34.87050732	10	3
+wide_no_wrap_simple_many	Taffy main	44.55019007	41.83706580	48.26106170	10	3
+wide_no_wrap_simple_many	Torin	14.33278491	13.94208216	14.78301647	10	7
+wide_no_wrap_simple_many	Yoga	52.50739895	52.25386411	52.81012635	10	2
+wide_no_wrap_simple_many	hooke	18.41199554	17.77780668	19.06261428	10	5
+wide_no_wrap_simple_many	ui_layout	59.20943930	58.69219025	59.85718690	10	2
+wide_wrapping	Cephal	1.07583531	1.06354851	1.09017029	10	99
+wide_wrapping	Keru current	0.62339305	0.59395055	0.65174872	10	155
+wide_wrapping	Keru pre-structural	0.57095566	0.56937097	0.57259835	10	178
+wide_wrapping	Morphorm	0.81391207	0.79757272	0.84094241	10	125
+wide_wrapping	Ply	4.58106598	4.51548859	4.64039406	10	21
+wide_wrapping	Taffy 0.3	3.11078967	3.05353282	3.17842438	10	27
+wide_wrapping	Taffy main	3.16273177	3.04957739	3.27883767	10	26
+wide_wrapping	Torin	0.83624326	0.82316650	0.85017554	10	117
+wide_wrapping	Yoga	25.27833513	25.17366202	25.37494855	10	4
+wide_wrapping	hooke	1.28361437	1.26019388	1.31066445	10	71
+wide_wrapping	ui_layout	8.07542496	7.92204487	8.27008549	10	10

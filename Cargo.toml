@@ -1,0 +1,34 @@
+[package]
+name = "keru_layout"
+description = "UI layout library"
+license = "MIT"
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/kekelp/keru_layout"
+readme = "README.md"
+categories = ["gui"]
+keywords = ["gui", "ui", "layout"]
+rust-version = "1.88"
+exclude = [
+    "examples/example.svg",
+]
+
+[features]
+default = ["incremental"]
+incremental = ["dep:arrayvec", "dep:memchr"]
+
+[dependencies]
+slotmap = "1.0"
+arrayvec = { version = "0.7", default-features = false, optional = true }
+memchr = { version = "2.7", optional = true }
+
+[dev-dependencies]
+rand = "0.9"
+
+[[test]]
+name = "incremental_fuzz"
+required-features = ["incremental"]
+
+[[example]]
+name = "example"
+required-features = ["incremental"]
