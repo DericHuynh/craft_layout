@@ -1,0 +1,154 @@
+--- a/src/layout_tree.rs
++++ b/src/layout_tree.rs
+@@ -1387,3 +1387,110 @@
+         assert_eq!(query(&mut tree, new_node.key(), 0.0, true, 5), (52, 1));
+     }
+ }
++
++
++// Scratch-only export of dependencies from the production request dispatcher.
++use crate::solve::{Kind as TraceKind, SOLVED as TRACE_SOLVED, N_SLOTS as TRACE_N_SLOTS, slot_index as trace_slot_index};
++use crate::solve::sizing_requests as trace_requests;
++
++struct TraceRequestCollector<'a, Source> {
++    source: &'a Source,
++    requests: &'a mut Vec<trace_requests::Request<NodeKey>>,
++}
++
++impl<Source: trace_requests::RequestSource<Id = NodeKey>> trace_requests::RequestModel
++    for TraceRequestCollector<'_, Source>
++{
++    type Id = NodeKey;
++    type Source = Source;
++}
++
++impl<Source: trace_requests::RequestSource<Id = NodeKey>> trace_requests::RequestAccess
++    for TraceRequestCollector<'_, Source>
++{
++    fn source(&self) -> &Source { self.source }
++
++    fn emit(&mut self, request: trace_requests::Request<NodeKey>) {
++        self.requests.push(request);
++    }
++}
++
++fn trace_stable_slot(identity: u64, axis: Axis, kind: TraceKind) -> u64 {
++    incarnation(identity)
++        .checked_mul(TRACE_N_SLOTS as u64)
++        .and_then(|base| base.checked_add(trace_slot_index(axis, kind) as u64))
++        .expect("fixture's stable slot IDs fit in u64")
++}
++
++impl<T> LayoutTree<T> {
++    #[doc(hidden)]
++    pub fn write_topology_trace(&mut self, output: &mut impl std::io::Write) -> std::io::Result<()> {
++        use std::collections::BTreeMap;
++        use TraceKind::{EvenShare, Final, Flow, Max, Min, Regular};
++
++        fn zero<D, I>(_: NodeId, _: Option<&mut D>, _: I) -> Xy<f32> { Xy::new_symm(0.0) }
++
++        let has_cycle = self.layout_data.has_cycle;
++        let mut vertices = BTreeMap::new();
++        for (key, node) in &self.nodes {
++            if node.params.disabled { continue; }
++            let mut insert = |axis: Axis, kind: TraceKind| {
++                if node.layout.flags.check_state(axis, kind) == TRACE_SOLVED {
++                    let rank = node.layout.levels[trace_slot_index(axis, kind)];
++                    let id = trace_stable_slot(node.identity, axis, kind);
++                    vertices.insert(id, (trace_requests::target(key, axis == Axis::Y, kind), rank));
++                }
++            };
++            for axis in [Axis::X, Axis::Y] {
++                for kind in [Regular, Min, Max, Final] {
++                    insert(axis, kind);
++                }
++            }
++            match node.params.children_layout {
++                ChildrenLayout::Stack { axis, .. } => insert(axis, EvenShare),
++                ChildrenLayout::Wrap { axis, .. } => {
++                    insert(axis, EvenShare);
++                    insert(axis.other(), Flow);
++                }
++                ChildrenLayout::Block => insert(Axis::Y, Flow),
++                _ => {}
++            }
++        }
++
++        let adapter = Adapter::new(self, zero::<T, Option<f32>>, zero::<T, ContentMeasureInput>);
++        let mut dependencies = Vec::new();
++        let mut edges = Vec::new();
++        let mut omitted = 0;
++        for (&reader, &(request, _)) in &vertices {
++            let _ = trace_requests::request_inputs(
++                TraceRequestCollector { source: &adapter, requests: &mut dependencies },
++                request,
++            );
++            for dependency in dependencies.drain(..) {
++                let node = &adapter.tree.nodes[dependency.node];
++                let producer = trace_stable_slot(node.identity, dependency.axis(), dependency.kind);
++                if vertices.contains_key(&producer) {
++                    edges.push((producer, reader));
++                } else {
++                    omitted += 1;
++                }
++            }
++        }
++        edges.sort_unstable();
++        edges.dedup();
++        let rank_not_forward = edges.iter().filter(|&&(from, to)| vertices[&from].1 >= vertices[&to].1).count();
++        writeln!(output, "# engine_cycle={has_cycle} omitted_dependencies={omitted} rank_not_forward={rank_not_forward}")?;
++        if std::env::var_os("LAYOUT_TRACE_RANKS").is_some() {
++            for (&id, &(_, rank)) in &vertices {
++                writeln!(output, "# rank\t{id}\t{rank}")?;
++            }
++        }
++        for id in vertices.keys() {
++            writeln!(output, "v\t{id}")?;
++        }
++        for (from, to) in edges {
++            writeln!(output, "e\t{from}\t{to}")?;
++        }
++        Ok(())
++    }
++}
+--- a/benches/real_workloads/main.rs
++++ b/benches/real_workloads/main.rs
+@@ -212,11 +212,31 @@
+ }
+ 
+ fn main() -> ExitCode {
+-    match execute() {
+-        Ok(()) => ExitCode::SUCCESS,
+-        Err(error) => {
+-            eprintln!("{error}\n{USAGE}");
+-            ExitCode::FAILURE
++    use std::io::{BufWriter, Write};
++
++    let directory = std::env::var_os("LAYOUT_TRACE_DIRECTORY").unwrap();
++    let directory = std::path::Path::new(&directory);
++    let edits = std::env::var("LAYOUT_TRACE_EDITS").unwrap_or("24".into()).parse::<usize>().unwrap();
++    for (mut incremental, mut full) in cases().zip(cases()) {
++        let path = directory.join(incremental.name.replace('/', "_") + ".tsv");
++        let mut output = BufWriter::new(std::fs::File::create(&path).unwrap());
++        incremental.layout();
++        full.layout();
++        verify(&incremental, &full, "trace initial");
++        writeln!(output, "frame\t0").unwrap();
++        incremental.tree.write_topology_trace(&mut output).unwrap();
++        for frame in 0..edits {
++            incremental.apply_frame(frame);
++            full.apply_frame(frame);
++            full.tree.invalidate();
++            incremental.layout();
++            full.layout();
++            verify(&incremental, &full, &format!("trace edit {frame}"));
++            writeln!(output, "frame\t{}", frame + 1).unwrap();
++            incremental.tree.write_topology_trace(&mut output).unwrap();
+         }
+-    }
+-}
++        output.flush().unwrap();
++        println!("{}: {} edits", path.display(), edits);
++    }
++    ExitCode::SUCCESS
++}
