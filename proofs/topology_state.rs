@@ -1,6 +1,10 @@
 //! Exact in-place updates to the retained preorder records.
 #[path = "../src/topology/state.rs"]
 pub(crate) mod kernel;
+#[path = "../src/topology/reconcile.rs"]
+mod reconcile;
+#[path = "../src/topology/tracked.rs"]
+mod tracked;
 
 use vstd::prelude::*;
 use kernel::{PriorNode, PriorStyle};

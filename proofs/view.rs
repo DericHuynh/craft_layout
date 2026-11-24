@@ -5,6 +5,9 @@ use vstd::prelude::*;
 pub mod fill;
 pub mod dependencies;
 pub mod queue_view;
+pub mod sizing_tape;
+pub mod ranked_full;
+pub mod frame_equivalence;
 pub mod queue_storage;
 pub mod history;
 pub mod numeric_frame;
@@ -26,14 +29,28 @@ pub mod leaf;
 pub mod measurement_contract;
 pub mod traversal;
 pub mod tree_walk;
+#[path = "../src/vec_memory.rs"]
+mod vec_memory;
 #[path = "../src/work_stack.rs"]
 mod work_stack;
 #[path = "../src/placement_walk.rs"]
 mod placement_walk;
+#[path = "../src/placement_adapter.rs"]
+mod placement_adapter;
+#[path = "../src/prepare_walk.rs"]
+mod prepare_walk;
+#[path = "../src/layout_tree/text_measure_cache.rs"]
+mod text_measure_cache;
 #[path = "../src/layout_tree/text_windows.rs"]
 pub mod text_windows;
+#[path = "../src/layout_tree/svg_control.rs"]
+mod svg_control;
 #[path = "../src/layout_tree/structural_guard.rs"]
 mod owned_guard;
+#[path = "../src/layout_tree/output.rs"]
+mod owned_output;
+#[path = "../src/layout_tree/records.rs"]
+mod owned_records;
 pub mod fixed_leaf_cache;
 pub mod topology_state;
 pub mod stack_line;
@@ -58,7 +75,35 @@ pub mod checked_view;
 mod publication;
 pub mod grid;
 pub mod structural;
+#[path = "../src/layout_tree/stack_tail.rs"]
+mod stack_tail;
+pub(crate) use cycles::kernel as cycle_rules;
+pub(crate) use fill::budget as fill_budget;
+pub(crate) use structural::kernel as structural_changes;
 pub mod placement;
+use placement::geometry::{Anchor, Arrange, Pos, WindowOverflow};
+#[path = "../src/declarations.rs"]
+mod declarations;
+#[path = "../src/node_flags.rs"]
+mod node_flags;
+#[path = "../src/node_data.rs"]
+mod node_data;
+#[path = "../src/prepare_frame.rs"]
+mod prepare_frame;
+#[path = "../src/prepare_leaf.rs"]
+mod prepare_leaf;
+#[path = "../src/prepare_nodes.rs"]
+mod prepare_nodes;
+#[path = "../src/sizing_pass.rs"]
+mod sizing_pass;
+#[path = "../src/sizing_fill.rs"]
+mod sizing_fill;
+#[path = "../src/packed_stack_leaf.rs"]
+mod packed_stack_leaf;
+#[path = "../src/full_layout.rs"]
+mod full_layout;
+#[path = "../src/layout_tree/solve_frame.rs"]
+mod owned_solve_frame;
 pub mod placement_complete;
 pub mod pixel_dispatch;
 pub mod invalidation;

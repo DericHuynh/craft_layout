@@ -28,35 +28,35 @@ impl Summary {
 
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.is_empty()))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.is_empty(), no_unwind))]
     pub(crate) fn is_empty(self) -> bool {
         self.0 == 0
     }
 
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.is_ready()))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.is_ready(), no_unwind))]
     pub(crate) fn is_ready(self) -> bool {
         self.0 & READY != 0
     }
 
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.in_flow()))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.in_flow(), no_unwind))]
     pub(crate) fn in_flow(self) -> bool {
         self.0 & IN_FLOW != 0
     }
 
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.spans()))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.spans(), no_unwind))]
     pub(crate) fn spans(self) -> bool {
         self.0 & SPANS != 0
     }
 
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.stack_start()))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.stack_start(), no_unwind))]
     pub(crate) fn stack_start(self) -> bool {
         self.0 & STACK_START != 0
     }
@@ -66,6 +66,7 @@ impl Summary {
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(summary =>
     ensures summary.describes(free, spans, simple_start),
+    no_unwind
 ))]
 pub(crate) fn record(free: bool, spans: bool, simple_start: bool) -> Summary {
     let bits = if free {
@@ -92,7 +93,7 @@ pub(crate) fn record(free: bool, spans: bool, simple_start: bool) -> Summary {
 
 /// Eligibility requires exactly four solved slots and only the fixed-leaf marker.
 #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-#[cfg_attr(verus_keep_ghost, verus_spec(returns registered_flags(marker, solved)))]
+#[cfg_attr(verus_keep_ghost, verus_spec(returns registered_flags(marker, solved), no_unwind))]
 pub(crate) const fn registered_flags(marker: u32, solved: u32) -> u32 {
     marker | solved | (solved << 2) | (solved << 4) | (solved << 6)
 }
@@ -101,6 +102,7 @@ pub(crate) const fn registered_flags(marker: u32, solved: u32) -> u32 {
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(
     ensures *final(flags) == (*old(flags) & !fixed_marker), final(summary).is_empty(),
+    no_unwind
 ))]
 pub(crate) fn invalidate(flags: &mut u32, fixed_marker: u32, summary: &mut Summary) {
     *flags &= !fixed_marker;
@@ -112,11 +114,13 @@ pub(crate) fn invalidate(flags: &mut u32, fixed_marker: u32, summary: &mut Summa
 #[cfg_attr(verus_keep_ghost, verus_spec(reused =>
     ensures reused == matches_fixed_pixels(flags, fixed, *flow),
         *final(mark) == (if reused { StructuralChange::Clean } else { *old(mark) }),
+    no_unwind
 ))]
 pub(crate) fn reuse_registered(
     flags: u32, fixed: u32, flow: &[u32; 2], mark: &mut StructuralChange,
 ) -> bool {
-    if flags != fixed || *flow != [0; 2] { return false; }
+    let [first, second] = *flow;
+    if flags != fixed || first != 0 || second != 0 { return false; }
     if !matches!(*mark, StructuralChange::Clean) {
         *mark = StructuralChange::Clean;
     }

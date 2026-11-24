@@ -207,6 +207,29 @@ pub open spec fn ordered_view(nodes: Seq<PlaceNode>, placed: Placements) -> Seq<
     Seq::new(nodes.len(), |i:int| (nodes[i].key, placed[nodes[i].key].result.output))
 }
 
+/// Placement compares all the words it can actually read, including producer
+/// side state and the inherited results of earlier placement steps.
+pub proof fn same_words_give_same_placement(nodes: Seq<PlaceNode>, a: Storage, b: Storage, draw: Draw)
+    requires forall |i: int, j: int| 0 <= i < nodes.len() && 0 <= j < nodes[i].inputs.len() ==> {
+        let read = #[trigger] nodes[i].inputs[j];
+        a[read.producer][read.word] == b[read.producer][read.word]
+    },
+    ensures place_frame(nodes, a, draw) == place_frame(nodes, b, draw),
+    decreases nodes.len(),
+{
+    if nodes.len() != 0 {
+        let prior = nodes.drop_last();
+        assert forall |i: int, j: int| 0 <= i < prior.len() && 0 <= j < prior[i].inputs.len() implies {
+            let read = #[trigger] prior[i].inputs[j];
+            a[read.producer][read.word] == b[read.producer][read.word]
+        } by { assert(prior[i] == nodes[i]); }
+        same_words_give_same_placement(prior, a, b, draw);
+        let last = nodes.last();
+        assert(last == nodes[nodes.len() - 1]);
+        assert(words(a, last) =~= words(b, last));
+    }
+}
+
 /// The same producer reads and placement rule sequence lead to the same
 /// absolute and local geometry throughout the region, including children
 /// placed from an already published parent frame.

@@ -22,11 +22,11 @@ impl ScalarModel for f32 {}
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait Scalar: ScalarModel {
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::sum(self, other)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::sum(self, other), no_unwind))]
     fn add(self, other: Self) -> Self;
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::difference(self, other)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::difference(self, other), no_unwind))]
     fn sub(self, other: Self) -> Self;
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::zero(self)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::zero(self), no_unwind))]
     fn is_zero(self) -> bool;
 }
 
@@ -42,7 +42,7 @@ impl Scalar for f32 {
 
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
-#[cfg_attr(verus_keep_ghost, verus_spec(returns adjusted(size, margin)))]
+#[cfg_attr(verus_keep_ghost, verus_spec(returns adjusted(size, margin), no_unwind))]
 pub fn with_margin<F: Scalar>(size: F, margin: F) -> F {
     if margin.is_zero() { size } else { size.add(margin) }
 }
@@ -51,7 +51,7 @@ pub fn with_margin<F: Scalar>(size: F, margin: F) -> F {
 /// the trailing margin and gap into the item's advance before adding its start.
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
-#[cfg_attr(verus_keep_ghost, verus_spec(returns advance(start, size, trailing, gap)))]
+#[cfg_attr(verus_keep_ghost, verus_spec(returns advance(start, size, trailing, gap), no_unwind))]
 pub fn after_item<F: Scalar>(start: F, size: F, trailing: F, gap: F) -> F {
     start.add(with_margin(size, trailing).add(gap))
 }
@@ -60,6 +60,7 @@ pub fn after_item<F: Scalar>(start: F, size: F, trailing: F, gap: F) -> F {
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(edges =>
     ensures (edges, *final(cursor)) == full_step(*old(cursor), flipped, range, size, margin, gap),
+    no_unwind
 ))]
 pub fn place<F: Scalar>(cursor: &mut F, flipped: bool, range: [F; 2], size: F, margin: [F; 2], gap: F) -> [F; 2] {
     let (leading, trailing) = if flipped { (margin[1], margin[0]) } else { (margin[0], margin[1]) };
@@ -77,6 +78,7 @@ pub fn place<F: Scalar>(cursor: &mut F, flipped: bool, range: [F; 2], size: F, m
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(edges =>
     ensures (edges, *final(cursor)) == start_step(*old(cursor), cross_start, horizontal, size, gap),
+    no_unwind
 ))]
 pub fn place_start<F: Scalar>(cursor: &mut F, cross_start: F, horizontal: bool, size: [F; 2], gap: F) -> [[F; 2]; 2] {
     let (x, y, main_size) = if horizontal { (*cursor, cross_start, size[0]) } else { (cross_start, *cursor, size[1]) };
@@ -90,3 +92,12 @@ pub fn place_start<F: Scalar>(cursor: &mut F, cross_start: F, horizontal: bool, 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == count + 1, no_unwind))]
 pub fn evenly_spaced_gaps(count: u32) -> u64 { count as u64 + 1 }
+
+/// Count the gaps between children without underflow for an empty line.
+#[inline]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if count > 0 { (count - 1) as u32 } else { 0u32 },
+    no_unwind
+))]
+pub fn between_gaps(count: u32) -> u32 { count.saturating_sub(1) }

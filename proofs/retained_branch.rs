@@ -1,7 +1,7 @@
 //! Verify every accepted node of the actual retained fixed-size branch walk.
 use vstd::prelude::*;
 #[path = "../src/retained_branch.rs"]
-mod kernel;
+pub(crate) mod kernel;
 use kernel::CachedBranch;
 
 verus! {

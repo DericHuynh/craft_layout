@@ -75,7 +75,10 @@ def translate(rhs):
         return 'F64', f'(fp.{op[1:]} RNE {args})'
     if match := re.fullmatch(r'select i1 (\S+), double (\S+), double (\S+)', rhs):
         return 'F64', '(ite ' + ' '.join(map(operand, match.groups())) + ')'
-    if match := re.fullmatch(r'(?:tail )?call double @llvm\.(fabs|copysign|round)\.f64\(double (\S+?)(?:, double (\S+))?\)', rhs):
+    if match := re.fullmatch(
+        r'(?:tail )?call (?:noundef )?double @llvm\.(fabs|copysign|round)\.f64'
+        r'\(double (?:noundef )?(\S+?)(?:, double (?:noundef )?(\S+))?\)', rhs
+    ):
         op = {'fabs': 'fp.abs', 'copysign': 'copysign', 'round': 'fp.roundToIntegral RNA'}[match[1]]
         args = ' '.join(operand(arg) for arg in match.groups()[1:] if arg is not None)
         return 'F64', f'({op} {args})'

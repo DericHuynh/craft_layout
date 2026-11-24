@@ -13,6 +13,8 @@ use vstd::prelude::*;
 pub struct WrapLine<I, M = f32> {
     pub next: Option<I>,
     pub count: u32,
+    // The line summary proof also records the accumulated main extent.
+    #[allow(dead_code)]
     pub main: M,
     pub cross: M,
     pub has_fill: bool,
@@ -43,51 +45,70 @@ pub trait LineSource: LineModel {
     #[cfg_attr(verus_keep_ghost, verus_spec(out =>
         requires present(self.items(), id),
         ensures out == indexed(self.items(), id).in_flow,
+        no_unwind
     ))]
     fn in_flow(&self, id: Self::Id) -> bool;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(out =>
         requires present(self.items(), id),
         ensures out == indexed(self.items(), id).marked,
+        no_unwind
     ))]
     fn marked(&self, id: Self::Id) -> bool;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(out =>
         requires present(self.items(), id),
         ensures out == indexed(self.items(), id).fill,
+        no_unwind
     ))]
     fn fills(&self, id: Self::Id) -> bool;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(out =>
         requires present(self.items(), id),
         ensures out == at(self.items(), index(self.items(), id) + 1),
+        no_unwind
     ))]
     fn sibling(&self, id: Self::Id) -> Option<Self::Id>;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(out =>
         requires present(self.items(), id),
         ensures out == if base { indexed(self.items(), id).base } else { indexed(self.items(), id).main },
+        no_unwind
     ))]
     fn extent(&self, id: Self::Id, base: bool) -> Self::Metric;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(out =>
         requires present(self.items(), id),
         ensures out == indexed(self.items(), id).cross,
+        no_unwind
     ))]
     fn cross_extent(&self, id: Self::Id) -> Self::Metric;
 
-    #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == self.zero()))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == self.zero(), no_unwind))]
     fn empty_extent(&self) -> Self::Metric;
 
-    #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == self.summed(main, extent)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == self.summed(main, extent), no_unwind))]
     fn append_extent(&self, main: Self::Metric, extent: Self::Metric) -> Self::Metric;
 
-    #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == self.cross_max(cross, extent)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == self.cross_max(cross, extent), no_unwind))]
     fn max_cross(&self, cross: Self::Metric, extent: Self::Metric) -> Self::Metric;
 
-    #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == self.overflows(main, limit)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == self.overflows(main, limit), no_unwind))]
     fn exceeds_limit(&self, main: Self::Metric, limit: Self::Metric) -> bool;
 }
+
+/// Keep the binary32 additions in the same order in both line producers.
+#[inline(always)]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+pub(crate) fn extend_main(main: f32, spacing: f32, extent: f32) -> f32 {
+    main + spacing + extent
+}
+
+#[inline(always)]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+pub(crate) fn beyond_limit(main: f32, limit: f32) -> bool { main > limit }
 
 /// Fresh sizing tests the margin-inclusive, pre-Fill main extent. Replay
 /// ignores the fitting limit and uses the marked starts and resolved main sizes.
@@ -96,6 +117,7 @@ pub trait LineSource: LineModel {
 #[cfg_attr(verus_keep_ghost, verus_spec(line =>
     requires valid_chain(source.items()), start == at(source.items(), 0),
     ensures scanned(source, limit, line),
+    no_unwind
 ))]
 pub(crate) fn scan_line<S: LineSource>(source: &S, mut start: Option<S::Id>, limit: Option<S::Metric>) -> WrapLine<S::Id, S::Metric> {
     let mut count = 0u32;
@@ -113,10 +135,10 @@ pub(crate) fn scan_line<S: LineSource>(source: &S, mut start: Option<S::Id>, lim
             cross == summary(source, limit, consumed@).cross,
             has_fill == summary(source, limit, consumed@).has_fill,
             forall |j: int| 0 <= j < consumed@ ==> !#[trigger] stop_at(source, limit, j),
+        ensures start.is_none(),
         decreases source.items().len() - consumed@,
     ))]
-    while start.is_some() {
-        let child = start.unwrap();
+    while let Some(child) = start {
         #[cfg(verus_keep_ghost)]
         proof! { locate(source.items(), consumed@, child); }
         if source.in_flow(child) {

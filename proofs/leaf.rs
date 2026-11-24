@@ -3,7 +3,7 @@ use super::dependencies::{self, Part, Edge, Source, rules as dependency_rules};
 use dependency_rules::Form;
 use vstd::prelude::*;
 #[path = "../src/leaf_retention.rs"]
-mod kernel;
+pub(crate) mod kernel;
 use kernel::LeafInput;
 
 verus! {

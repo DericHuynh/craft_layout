@@ -12,6 +12,8 @@ pub enum StructuralChange {
     /// This node has a new parent. Its own style and intrinsic content are unchanged.
     Moved,
     Subtree,
+    /// An owned Grid child shown again after a visibility-only change.
+    DormantGrid,
     /// A clean, fixed-size region skipped during the current structural measurement.
     Retained,
 }
@@ -19,22 +21,22 @@ pub enum StructuralChange {
 impl StructuralChange {
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.with_move()))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.with_move(), no_unwind))]
     pub fn with_move(self) -> Self {
         match self {
             Self::Clean => Self::Moved,
-            Self::Children => Self::Subtree,
+            Self::Children | Self::DormantGrid => Self::Subtree,
             mark => mark,
         }
     }
 
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.with_children()))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.with_children(), no_unwind))]
     pub fn with_children(self) -> Self {
         match self {
             Self::Clean => Self::Children,
-            Self::Moved => Self::Subtree,
+            Self::Moved | Self::DormantGrid => Self::Subtree,
             mark => mark,
         }
     }
@@ -43,7 +45,7 @@ impl StructuralChange {
 /// Decide which cached measurements may survive attachment to the live parent.
 #[inline]
 #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-#[cfg_attr(verus_keep_ghost, verus_spec(returns parent_change(prior, current, reusable)))]
+#[cfg_attr(verus_keep_ghost, verus_spec(returns parent_change(prior, current, reusable), no_unwind))]
 pub fn parent_change(prior: Option<usize>, current: Option<usize>, reusable: bool) -> StructuralChange {
     match prior {
         Some(old) if matches!(current, Some(new) if new == old) => StructuralChange::Clean,
@@ -69,8 +71,10 @@ impl<I: Copy> Clone for TailDelta<I> {
 
 #[inline]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
-#[cfg_attr(verus_keep_ghost, verus_spec(r => ensures
-    r.first_added == None, r.added == 0, r.removed == 0))]
+#[cfg_attr(verus_keep_ghost, verus_spec(r =>
+    ensures r.first_added == None, r.added == 0, r.removed == 0,
+    no_unwind
+))]
 pub fn empty_delta<I: Copy>() -> TailDelta<I> {
     TailDelta { first_added: None, added: 0, removed: 0 }
 }
@@ -78,7 +82,10 @@ pub fn empty_delta<I: Copy>() -> TailDelta<I> {
 impl<I: Copy> TailDelta<I> {
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify)]
-    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures r == record_spec(self, id, inserting)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures r == record_spec(self, id, inserting),
+        no_unwind
+    ))]
     pub fn record(self, id: I, inserting: bool) -> Option<Self> {
         if inserting {
             Some(Self {
@@ -96,9 +103,11 @@ impl<I: Copy> TailDelta<I> {
 
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify)]
-    #[cfg_attr(verus_keep_ghost, verus_spec(r => ensures
-        r.is_some() == (self.removed <= old && old as int - self.removed + self.added <= u32::MAX),
-        r.is_some() ==> r.unwrap() as int == old as int - self.removed + self.added))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(r =>
+        ensures r.is_some() == (self.removed <= old && old as int - self.removed + self.added <= u32::MAX),
+            r.is_some() ==> r.unwrap() as int == old as int - self.removed + self.added,
+        no_unwind
+    ))]
     pub fn update_count(self, old: u32) -> Option<u32> {
         old.checked_sub(self.removed)?.checked_add(self.added)
     }
@@ -158,6 +167,7 @@ verus! {
 /// Tracks the next direct child of an old preorder subtree during live reconciliation.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Clone, Copy)]
+#[cfg_attr(not(verus_keep_ghost), derive(Debug))]
 pub struct ChildCursor {
     pub expected: usize,
     pub changed: bool,
@@ -166,7 +176,7 @@ pub struct ChildCursor {
 impl ChildCursor {
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.observe(old_identity, following)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.observe(old_identity, following), no_unwind))]
     pub fn observe(self, old_identity: Option<usize>, following: Option<usize>) -> Self {
         match following {
             Some(expected) => Self {
@@ -179,7 +189,7 @@ impl ChildCursor {
 
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.needs_invalidation(end)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.needs_invalidation(end), no_unwind))]
     pub fn needs_invalidation(self, end: usize) -> bool {
         self.changed || self.expected != end
     }
@@ -189,7 +199,7 @@ impl ChildCursor {
 /// A bitwise positive-zero cached share survives a proven exhausted budget.
 #[inline]
 #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-#[cfg_attr(verus_keep_ghost, verus_spec(returns tail_can_reuse(exhausted, old_share, independent)))]
+#[cfg_attr(verus_keep_ghost, verus_spec(returns tail_can_reuse(exhausted, old_share, independent), no_unwind))]
 pub fn tail_can_reuse(exhausted: bool, old_share: u32, independent: bool) -> bool {
     independent || (exhausted && old_share == 0)
 }
@@ -197,7 +207,7 @@ pub fn tail_can_reuse(exhausted: bool, old_share: u32, independent: bool) -> boo
 /// Start alignment with unmodified output scale lets surviving siblings retain their rectangles.
 #[inline]
 #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-#[cfg_attr(verus_keep_ghost, verus_spec(returns tail_replaces_prefix(old_share, new_share, scale_changed, start)))]
+#[cfg_attr(verus_keep_ghost, verus_spec(returns tail_replaces_prefix(old_share, new_share, scale_changed, start), no_unwind))]
 pub fn tail_replaces_prefix(old_share: u32, new_share: u32, scale_changed: bool, start: bool) -> bool {
     old_share != new_share || scale_changed || !start
 }

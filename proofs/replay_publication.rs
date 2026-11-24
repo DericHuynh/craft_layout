@@ -70,6 +70,81 @@ pub open spec fn commit(nodes:Seq<PlaceNode>, measured:Storage, draw:Draw,
     }
 }
 
+/// The actual callback stream may contain only a subset of the visible
+/// rectangles. Replay its writes on the original host storage.
+pub open spec fn apply_rows(host: Outputs, rows: Seq<(Key, Geometry)>) -> Outputs
+    decreases rows.len(),
+{
+    if rows.len() == 0 { host } else {
+        let (key, value) = rows.last();
+        apply_rows(host, rows.drop_last()).insert(key, value)
+    }
+}
+
+pub open spec fn placement_rows(
+    nodes: Seq<PlaceNode>, sizing: Storage, draw: Draw, issued: spec_fn(Key) -> bool,
+) -> Seq<(Key, Geometry)>
+    decreases nodes.len(),
+{
+    if nodes.len() == 0 { Seq::empty() } else {
+        let prior = placement_rows(nodes.drop_last(), sizing, draw, issued);
+        let key = nodes.last().key;
+        if issued(key) {
+            prior.push((key, replay_view::place_frame(nodes, sizing, draw)[key].result.output))
+        } else { prior }
+    }
+}
+
+pub proof fn placement_rows_commit(
+    nodes: Seq<PlaceNode>, sizing: Storage, draw: Draw, plan: spec_fn(Key) -> Work, host: Outputs,
+)
+    ensures apply_rows(host, placement_rows(nodes, sizing, draw, |key: Key| writes(plan(key))))
+        == commit(nodes, sizing, draw, plan, host),
+    decreases nodes.len(),
+{
+    if nodes.len() > 0 {
+        let prefix = nodes.drop_last();
+        let key = nodes.last().key;
+        let issued = |key: Key| writes(plan(key));
+        placement_rows_commit(prefix, sizing, draw, plan, host);
+        if issued(key) {
+            let row = (key, replay_view::place_frame(nodes, sizing, draw)[key].result.output);
+            let rows = placement_rows(prefix, sizing, draw, issued);
+            assert(rows.push(row).drop_last() =~= rows);
+        }
+    }
+}
+
+pub proof fn full_placement_rows_are_the_visible_view(nodes: Seq<PlaceNode>, sizing: Storage, draw: Draw)
+    requires forall |i: int, j: int| 0 <= i < j < nodes.len()
+        ==> (#[trigger] nodes[i]).key != (#[trigger] nodes[j]).key,
+    ensures placement_rows(nodes, sizing, draw, |_: Key| true)
+        == replay_view::ordered_view(nodes, replay_view::place_frame(nodes, sizing, draw)),
+    decreases nodes.len(),
+{
+    if nodes.len() > 0 {
+        let prefix = nodes.drop_last();
+        let view = replay_view::place_frame(nodes, sizing, draw);
+        let previous = replay_view::place_frame(prefix, sizing, draw);
+        let last = nodes.last().key;
+        assert(last == nodes[nodes.len() - 1].key);
+        assert forall |i: int, j: int| 0 <= i < j < prefix.len()
+            implies (#[trigger] prefix[i]).key != (#[trigger] prefix[j]).key by {
+            assert(prefix[i] == nodes[i] && prefix[j] == nodes[j]);
+        }
+        full_placement_rows_are_the_visible_view(prefix, sizing, draw);
+        assert(replay_view::ordered_view(nodes, view)
+            =~= replay_view::ordered_view(prefix, previous).push((last, view[last].result.output))) by {
+            assert forall |i: int| 0 <= i < prefix.len()
+                implies view[#[trigger] nodes[i].key] == previous[prefix[i].key] by {
+                assert(nodes[i].key != last && prefix[i] == nodes[i]);
+            }
+        }
+    } else {
+        assert(replay_view::ordered_view(nodes, replay_view::place_frame(nodes, sizing, draw)) =~= Seq::empty());
+    }
+}
+
 proof fn omitted_record_stays_unchanged(nodes:Seq<PlaceNode>, measured:Storage, draw:Draw,
     plan:spec_fn(Key) -> Work, host:Outputs, key:Key)
     requires !writes(plan(key)),
@@ -82,12 +157,91 @@ proof fn omitted_record_stays_unchanged(nodes:Seq<PlaceNode>, measured:Storage, 
     }
 }
 
-/// Each skipped record has exactly the same local declarations, measured
-/// words and inherited frames as before. Each requested write reaches the host
-/// by the production placement marks. No equality of rendered bits is assumed.
+/// Both a fully written view and a retained view use the same local placement
+/// recipes. For a skipped record the earlier recipe must have the same inputs.
+pub proof fn sizing_and_placement_publish_fresh_view(
+    nodes: Seq<PlaceNode>, incremental: Storage, full: Storage, draw: Draw,
+    plan: spec_fn(Key) -> Work, previous: Placements, host: Outputs,
+)
+    requires
+        forall |i:int,j:int| 0 <= i < j < nodes.len()
+            ==> (#[trigger] nodes[i]).key != (#[trigger] nodes[j]).key,
+        sound(previous,draw), retained_outputs_are_sound(previous,host),
+        forall |i:int,j:int| 0 <= i < nodes.len() && 0 <= j < nodes[i].inputs.len() ==> {
+            let producer = (#[trigger] nodes[i].inputs[j]).producer;
+            incremental.contains_key(producer) && full.contains_key(producer)
+                && incremental[producer] == full[producer]
+        },
+        forall |i:int| 0 <= i < nodes.len() ==> ({
+            let k = (#[trigger] nodes[i]).key;
+            let now = replay_view::place_frame(nodes, full, draw);
+            &&& valid_route(plan(k))
+            &&& !requested(plan(k)) ==> previous.contains_key(k) && local_input_matches(previous[k],now[k])
+        }),
+    ensures ({
+        let after = commit(nodes, incremental, draw, plan, host);
+        let fresh = replay_view::place_frame(nodes, full, draw);
+        &&& retained_outputs_are_sound(fresh,after)
+        &&& retained_view::emitted_view(Seq::new(nodes.len(),|i:int| nodes[i].key),after)
+            == replay_view::ordered_view(nodes,fresh)
+    }),
+    decreases nodes.len(),
+{
+    let fresh = replay_view::place_frame(nodes,full,draw);
+    let output = commit(nodes,incremental,draw,plan,host);
+    canonical_records_are_sound(nodes,full,draw);
+    replay_view::same_words_give_same_placement(nodes, incremental, full, draw);
+    if nodes.len() > 0 {
+        let prefix = nodes.drop_last();
+        let current = nodes.last().key;
+        assert(nodes.last() == nodes[nodes.len()-1]);
+        let prior = replay_view::place_frame(prefix,full,draw);
+        canonical_records_are_sound(prefix,full,draw);
+        assert forall |i:int,j:int| 0 <= i < prefix.len() && 0 <= j < prefix[i].inputs.len() implies {
+            let producer = (#[trigger] prefix[i].inputs[j]).producer;
+            incremental.contains_key(producer) && full.contains_key(producer)
+                && incremental[producer] == full[producer]
+        } by { assert(prefix[i] == nodes[i]); }
+        assert forall |i:int,j:int| 0 <= i < j < prefix.len()
+            implies (#[trigger] prefix[i]).key != (#[trigger] prefix[j]).key by {
+            assert(prefix[i] == nodes[i] && prefix[j] == nodes[j]);
+        }
+        assert forall |i:int| 0 <= i < prefix.len() implies ({
+            let k = (#[trigger] prefix[i]).key;
+            &&& valid_route(plan(k))
+            &&& !requested(plan(k)) ==> previous.contains_key(k) && local_input_matches(previous[k],prior[k])
+        }) by {
+            assert(prefix[i] == nodes[i]);
+            assert(prefix[i].key != current);
+        }
+        sizing_and_placement_publish_fresh_view(prefix, incremental, full, draw, plan, previous, host);
+        requested_work_is_executed(plan(current));
+        if !writes(plan(current)) {
+            omitted_record_stays_unchanged(nodes,incremental,draw,plan,host,current);
+            assert(previous.contains_key(current));
+            assert(host[current] == fresh[current].result.output);
+        }
+        assert forall |k:Key| #[trigger] fresh.contains_key(k) implies
+            output.contains_key(k) && output[k] == fresh[k].result.output by {
+            if k != current { assert(prior.contains_key(k)); }
+        }
+    }
+    let order = Seq::new(nodes.len(),|i:int| nodes[i].key);
+    assert(retained_view::emitted_view(order,output) =~= replay_view::ordered_view(nodes,fresh)) by {
+        assert forall |i:int| 0 <= i < order.len()
+            implies output[#[trigger] order[i]] == fresh[order[i]].result.output by {
+            node_key_is_placed(nodes,i);
+            assert(order[i] == nodes[i].key);
+            assert(fresh.contains_key(order[i]));
+        }
+    }
+}
+
+/// Cyclic histories supply the words for the same publication theorem as the
+/// queue and tape. Their proof keeps each cut's ordered provisional reads.
 pub proof fn mixed_history_can_skip_unchanged_output(
-    history:Seq<Replay>, nodes:Seq<PlaceNode>, draw:Draw, plan:spec_fn(Key) -> Work,
-    previous:Placements, host:Outputs,
+    history: Seq<Replay>, nodes: Seq<PlaceNode>, draw: Draw, plan: spec_fn(Key) -> Work,
+    previous: Placements, host: Outputs,
 )
     requires
         replay_history::supported(history), history.len() > 0,
@@ -109,55 +263,17 @@ pub proof fn mixed_history_can_skip_unchanged_output(
         &&& retained_view::emitted_view(Seq::new(nodes.len(),|i:int| nodes[i].key),after)
             == replay_view::ordered_view(nodes,fresh)
     }),
-    decreases nodes.len(),
 {
     let incremental = replay_history::measured(history);
     let full = history.last().full_sizing();
-    let fresh = replay_view::place_frame(nodes,full,draw);
-    let output = commit(nodes,incremental,draw,plan,host);
-    canonical_records_are_sound(nodes,full,draw);
-    replay_history::retained_history_matches_the_fresh_view(history,nodes,draw);
-    if nodes.len() > 0 {
-        let prefix = nodes.drop_last();
-        let current = nodes.last().key;
-        assert(nodes.last() == nodes[nodes.len()-1]);
-        let prior = replay_view::place_frame(prefix,full,draw);
-        canonical_records_are_sound(prefix,full,draw);
-        assert forall |i:int,j:int| 0 <= i < prefix.len() && 0 <= j < prefix[i].inputs.len() implies
-            0 <= (#[trigger] prefix[i].inputs[j]).producer < history.last().n by { assert(prefix[i] == nodes[i]); }
-        assert forall |i:int,j:int| 0 <= i < j < prefix.len()
-            implies (#[trigger] prefix[i]).key != (#[trigger] prefix[j]).key by {
-            assert(prefix[i] == nodes[i] && prefix[j] == nodes[j]);
-        }
-        assert forall |i:int| 0 <= i < prefix.len() implies ({
-            let k = (#[trigger] prefix[i]).key;
-            &&& valid_route(plan(k))
-            &&& !requested(plan(k)) ==> previous.contains_key(k) && local_input_matches(previous[k],prior[k])
-        }) by {
-            assert(prefix[i] == nodes[i]);
-            assert(prefix[i].key != current);
-        }
-        mixed_history_can_skip_unchanged_output(history,prefix,draw,plan,previous,host);
-        requested_work_is_executed(plan(current));
-        if !writes(plan(current)) {
-            omitted_record_stays_unchanged(nodes,incremental,draw,plan,host,current);
-            assert(previous.contains_key(current));
-            assert(host[current] == fresh[current].result.output);
-        }
-        assert forall |k:Key| #[trigger] fresh.contains_key(k) implies
-            output.contains_key(k) && output[k] == fresh[k].result.output by {
-            if k != current { assert(prior.contains_key(k)); }
-        }
+    assert forall |i: int, j: int| 0 <= i < nodes.len() && 0 <= j < nodes[i].inputs.len() implies {
+        let producer = (#[trigger] nodes[i].inputs[j]).producer;
+        incremental.contains_key(producer) && full.contains_key(producer)
+            && incremental[producer] == full[producer]
+    } by {
+        replay_history::every_producer_after_edits_is_exact(history, nodes[i].inputs[j].producer);
     }
-    let order = Seq::new(nodes.len(),|i:int| nodes[i].key);
-    assert(retained_view::emitted_view(order,output) =~= replay_view::ordered_view(nodes,fresh)) by {
-        assert forall |i:int| 0 <= i < order.len()
-            implies output[#[trigger] order[i]] == fresh[order[i]].result.output by {
-            node_key_is_placed(nodes,i);
-            assert(order[i] == nodes[i].key);
-            assert(fresh.contains_key(order[i]));
-        }
-    }
+    sizing_and_placement_publish_fresh_view(nodes, incremental, full, draw, plan, previous, host);
 }
 
 pub struct Frame {

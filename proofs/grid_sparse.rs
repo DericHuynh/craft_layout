@@ -5,7 +5,7 @@ use vstd::prelude::*;
 
 verus! {
 
-pub open spec fn valid_rectangle(rect: Occupied, max_row: u64) -> bool {
+pub open spec fn valid_rectangle(rect: Occupied, max_row: u128) -> bool {
     rect.rows.0 < rect.rows.1 <= max_row && rect.cols.0 < rect.cols.1
 }
 
@@ -37,7 +37,93 @@ pub open spec fn sparse_board(rects: Seq<Occupied>) -> Board {
         && rects[i].cols.0 <= p.1 < rects[i].cols.1)
 }
 
-proof fn fit_equivalence(rects:Seq<Occupied>, max_row:u64, p:Cell, h:int, w:int)
+/// The rectangle list represents the same board update as the packed
+/// search, independent of the list capacity and the expired scan prefix.
+pub proof fn sparse_board_adds(rects: Seq<Occupied>, rect: Occupied, cell: Cell, h: int, w: int)
+    requires rect.rows.0 == cell.0, rect.rows.1 == cell.0 + h,
+        rect.cols.0 == cell.1, rect.cols.1 == cell.1 + w,
+    ensures sparse_board(rects.push(rect)) == place(sparse_board(rects), cell, h, w),
+{
+    let before = sparse_board(rects);
+    let after = sparse_board(rects.push(rect));
+    assert forall |p: Cell| #[trigger] after.contains(p) == place(before, cell, h, w).contains(p) by {
+        if after.contains(p) {
+            let i = choose |i: int| 0 <= i < rects.push(rect).len()
+                && (#[trigger] rects.push(rect)[i]).rows.0 <= p.0 < rects.push(rect)[i].rows.1
+                && rects.push(rect)[i].cols.0 <= p.1 < rects.push(rect)[i].cols.1;
+            if i == rects.len() {
+                assert(covers(cell, h, w, p));
+            } else {
+                assert(rects.push(rect)[i] == rects[i]);
+                assert(before.contains(p));
+            }
+        }
+        if before.contains(p) {
+            let i = choose |i: int| 0 <= i < rects.len()
+                && (#[trigger] rects[i]).rows.0 <= p.0 < rects[i].rows.1
+                && rects[i].cols.0 <= p.1 < rects[i].cols.1;
+            assert(rects.push(rect)[i] == rects[i]);
+            assert(after.contains(p));
+        }
+        if covers(cell, h, w, p) {
+            assert(rects.push(rect)[rects.len() as int] == rect);
+            assert(after.contains(p));
+        }
+    }
+    assert(after =~= place(before, cell, h, w));
+}
+
+pub open spec fn expires_before(rect: Occupied, start: Cell) -> bool {
+    rect.rows.1 <= start.0 || (rect.rows.1 == start.0 + 1 && rect.cols.1 <= start.1)
+}
+
+pub proof fn expiry_keeps(rect: Occupied, prior: Cell, next: Cell)
+    requires expires_before(rect, prior), !before(next, prior),
+    ensures expires_before(rect, next),
+{}
+
+pub proof fn expired_prefix_preserves_first_fit(rects: Seq<Occupied>, prefix: int, columns: int,
+    h: int, w: int, start: Cell, result: Cell)
+    requires 0 <= prefix <= rects.len(),
+        forall |i: int| 0 <= i < prefix ==> #[trigger] expires_before(rects[i], start),
+        first_fit(sparse_board(rects.subrange(prefix, rects.len() as int)), columns, h, w, start, result),
+    ensures first_fit(sparse_board(rects), columns, h, w, start, result),
+{
+    let tail = rects.subrange(prefix, rects.len() as int);
+    let board = sparse_board(rects);
+    let live = sparse_board(tail);
+    assert forall |q: Cell| !before(q,start) implies #[trigger] board.contains(q) == live.contains(q) by {
+        if board.contains(q) {
+            let i = choose |i: int| 0 <= i < rects.len()
+                && (#[trigger] rects[i]).rows.0 <= q.0 < rects[i].rows.1
+                && rects[i].cols.0 <= q.1 < rects[i].cols.1;
+            if i < prefix {
+                assert(expires_before(rects[i], start));
+                assert(before(q, start));
+            }
+            assert(i >= prefix && tail[i - prefix] == rects[i]);
+        }
+        if live.contains(q) {
+            let i = choose |i: int| 0 <= i < tail.len()
+                && (#[trigger] tail[i]).rows.0 <= q.0 < tail[i].rows.1
+                && tail[i].cols.0 <= q.1 < tail[i].cols.1;
+            assert(rects[i + prefix] == tail[i]);
+        }
+    }
+    assert forall |q: Cell| #[trigger] board.contains(q) implies !covers(result,h,w,q) by {
+        if covers(result,h,w,q) {
+            assert(live.contains(q));
+        }
+    }
+    assert forall |p:Cell| legal(p,columns,w) && !before(p,start) && before(p,result)
+        implies !#[trigger] fits(board,p,h,w) by {
+        assert(!fits(live,p,h,w));
+        let q = choose |q: Cell| #[trigger] live.contains(q) && covers(p,h,w,q);
+        assert(board.contains(q));
+    }
+}
+
+proof fn fit_equivalence(rects:Seq<Occupied>, max_row:u128, p:Cell, h:int, w:int)
     requires h>0, w>0,
         forall |i:int| 0 <= i < rects.len() ==> #[trigger] valid_rectangle(rects[i],max_row),
     ensures clear_at(rects,p.0,p.1,h,w) == fits(sparse_board(rects),p,h,w),
@@ -62,7 +148,7 @@ proof fn fit_equivalence(rects:Seq<Occupied>, max_row:u64, p:Cell, h:int, w:int)
     }
 }
 
-pub proof fn sparse_is_first_fit(rects:Seq<Occupied>, max_row:u64, columns:int, h:int, w:int,
+pub proof fn sparse_is_first_fit(rects:Seq<Occupied>, max_row:u128, columns:int, h:int, w:int,
     start:Cell, result:Cell)
     requires h>0, w>0, first_sparse_fit(rects,columns,h,w,start,result),
         forall |i:int| 0 <= i < rects.len() ==> #[trigger] valid_rectangle(rects[i],max_row),

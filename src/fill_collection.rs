@@ -23,15 +23,15 @@ impl NumericModel for f32 {}
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait Numeric: NumericModel {
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::zero_bits()))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::zero_bits(), no_unwind))]
     fn zero() -> Self;
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::sum(self,other)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::sum(self,other), no_unwind))]
     fn add(self, other: Self) -> Self;
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::charge(self,other)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::charge(self,other), no_unwind))]
     fn subtract(self, other: Self) -> Self;
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::clamp_nonnegative(self)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::clamp_nonnegative(self), no_unwind))]
     fn nonnegative(self) -> Self;
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::max_weight(old,weight)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns Self::max_weight(old,weight), no_unwind))]
     fn unconstrained(old: Option<Self>, weight: Self) -> Self;
 }
 
@@ -74,7 +74,7 @@ pub struct FillCollection<F: Copy = f32> {
 impl<F: Numeric> FillCollection<F> {
     #[inline(always)]
     #[cfg_attr(verus_keep_ghost, verus_verify)]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns fresh(budget)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns fresh(budget), no_unwind))]
     pub fn new(budget: F) -> Self {
         Self {
             budget,
@@ -87,6 +87,7 @@ impl<F: Numeric> FillCollection<F> {
     #[cfg_attr(verus_keep_ghost, verus_verify)]
     #[cfg_attr(verus_keep_ghost, verus_spec(
         ensures *final(self) == charge(*old(self),F::sum(start,end)),
+        no_unwind
     ))]
     pub fn margin(&mut self, start: F, end: F) {
         self.budget = self.budget.subtract(start.add(end));
@@ -94,28 +95,28 @@ impl<F: Numeric> FillCollection<F> {
 
     #[inline(always)]
     #[cfg_attr(verus_keep_ghost, verus_verify)]
-    #[cfg_attr(verus_keep_ghost, verus_spec(ensures *final(self) == charge(*old(self),size)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(ensures *final(self) == charge(*old(self),size), no_unwind))]
     pub fn fixed(&mut self, size: F) {
         self.budget = self.budget.subtract(size);
     }
 
     #[inline(always)]
     #[cfg_attr(verus_keep_ghost, verus_verify)]
-    #[cfg_attr(verus_keep_ghost, verus_spec(ensures *final(self) == add_weight(*old(self),weight)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(ensures *final(self) == add_weight(*old(self),weight), no_unwind))]
     pub fn weight(&mut self, weight: F) {
         self.weight = self.weight.add(weight);
     }
 
     #[inline(always)]
     #[cfg_attr(verus_keep_ghost, verus_verify)]
-    #[cfg_attr(verus_keep_ghost, verus_spec(ensures *final(self) == record_worst(*old(self),weight)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(ensures *final(self) == record_worst(*old(self),weight), no_unwind))]
     pub fn mark_unconstrained(&mut self, weight: F) {
         self.worst = Some(F::unconstrained(self.worst, weight));
     }
 
     #[inline(always)]
     #[cfg_attr(verus_keep_ghost, verus_verify)]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns finish(self)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns finish(self), no_unwind))]
     pub fn finish(self) -> (F, F, Option<F>) {
         (self.budget.nonnegative(), self.weight, self.worst)
     }
@@ -123,7 +124,7 @@ impl<F: Numeric> FillCollection<F> {
 
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-#[cfg_attr(verus_keep_ghost, verus_spec(returns has_constraint(content,min,max)))]
-pub fn has_constraint<F>(content: Option<F>, min: Option<F>, max: Option<F>) -> bool {
+#[cfg_attr(verus_keep_ghost, verus_spec(returns has_constraint(content,min,max), no_unwind))]
+pub fn has_constraint<F: Copy>(content: Option<F>, min: Option<F>, max: Option<F>) -> bool {
     content.is_some() || min.is_some() || max.is_some()
 }

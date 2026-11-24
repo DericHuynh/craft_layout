@@ -5,12 +5,42 @@ use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use super::{bit, runs_of, extend_runs};
 
+/// Bit counts are the scanner's only target primitives. The native instance
+/// uses the total Rust integer intrinsics, which count all 64 zeros for zero.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+pub(super) trait ZeroCounts {
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures out as int == vstd::std_specs::bits::u64_leading_zeros(word),
+        no_unwind
+    ))]
+    fn leading(word: u64) -> u32;
+
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures out == vstd::std_specs::bits::u64_trailing_zeros(word),
+        no_unwind
+    ))]
+    fn trailing(word: u64) -> u32;
+}
+
+#[cfg(not(verus_keep_ghost))]
+pub(super) struct IntrinsicZeroCounts;
+
+#[cfg(not(verus_keep_ghost))]
+impl ZeroCounts for IntrinsicZeroCounts {
+    #[inline(always)]
+    fn leading(word: u64) -> u32 { word.leading_zeros() }
+
+    #[inline(always)]
+    fn trailing(word: u64) -> u32 { word.trailing_zeros() }
+}
+
 /// Bit i of the result marks a run of `span` open cells starting at i.
 #[inline]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(result =>
     requires 1 <= span <= 64,
-    ensures runs_of(result, open, span as int)
+    ensures runs_of(result, open, span as int),
+    no_unwind
 ))]
 pub fn open_grid_starts(open: u64, span: u32) -> u64 {
     let mut runs = open;
@@ -37,6 +67,7 @@ pub fn open_grid_starts(open: u64, span: u32) -> u64 {
 #[cfg_attr(verus_keep_ghost, verus_spec(result =>
     requires start < 64, end < 64,
     ensures forall |i: u32| i < 64 ==> #[trigger] bit(result, i as int) == (start <= i <= end),
+    no_unwind
 ))]
 pub fn word_range(start: u32, end: u32) -> u64 {
     #[cfg(verus_keep_ghost)]
@@ -58,11 +89,12 @@ pub fn word_range(start: u32, end: u32) -> u64 {
     requires collisions != 0, collisions & occupied == collisions,
     ensures
         super::collision_run(occupied, collisions, next),
+    no_unwind
 ))]
-pub fn after_collision(occupied: u64, collisions: u64) -> u32 {
-    let last = 63 - collisions.leading_zeros();
+pub fn after_collision<C: ZeroCounts>(occupied: u64, collisions: u64) -> u32 {
+    let last = 63 - C::leading(collisions);
     let free = !occupied & (u64::MAX << last);
-    let next = free.trailing_zeros();
+    let next = C::trailing(free);
     #[cfg(verus_keep_ghost)]
     proof! {
         assert(bit(collisions,last as int));
@@ -96,11 +128,12 @@ pub fn after_collision(occupied: u64, collisions: u64) -> u32 {
     ensures pos <= next <= 64,
         next < 64 ==> super::open_range(!blocked, next as int, span as int),
         forall |i:int| pos <= i < next ==> !#[trigger] super::open_range(!blocked, i, span as int),
+    no_unwind
 ))]
-pub fn first_word_start(blocked: u64, pos: u32, span: u32) -> u32 {
+pub fn first_word_start<C: ZeroCounts>(blocked: u64, pos: u32, span: u32) -> u32 {
     let runs = open_grid_starts(!blocked, span);
     let starts = runs & (u64::MAX << pos);
-    let next = starts.trailing_zeros();
+    let next = C::trailing(starts);
     #[cfg(verus_keep_ghost)]
     proof! {
         assert forall |j:u32| j < 64 implies #[trigger] bit(starts,j as int)
@@ -128,8 +161,9 @@ pub fn first_word_start(blocked: u64, pos: u32, span: u32) -> u32 {
     requires 1 <= span <= 64,
     ensures super::first_word_run(open.0, next.0, span),
         super::first_word_run(open.1, next.1, span),
+    no_unwind
 ))]
-pub fn first_pair_starts(open: (u64, u64), span: u32) -> (u32, u32) {
+pub fn first_pair_starts<C: ZeroCounts>(open: (u64, u64), span: u32) -> (u32, u32) {
     let (mut left, mut right) = open;
     let mut length = 1u32;
     #[cfg(verus_keep_ghost)]
@@ -151,7 +185,7 @@ pub fn first_pair_starts(open: (u64, u64), span: u32) -> (u32, u32) {
     proof! { extend_runs(open.0, left, length, remainder); extend_runs(open.1, right, length, remainder); }
     left &= left >> remainder;
     right &= right >> remainder;
-    let next = (left.trailing_zeros(), right.trailing_zeros());
+    let next = (C::trailing(left), C::trailing(right));
     #[cfg(verus_keep_ghost)]
     proof! {
         if next.0 < 64 { assert(bit(left, next.0 as int)); }
@@ -174,6 +208,7 @@ pub fn first_pair_starts(open: (u64, u64), span: u32) -> (u32, u32) {
 #[cfg_attr(verus_keep_ghost, verus_spec(result =>
     ensures forall |j:u32| j < 64 ==> #[trigger] bit(result,j as int)
         == (bit(word,j as int) || bit(mask,j as int)),
+    no_unwind
 ))]
 pub fn union(word: u64, mask: u64) -> u64 {
     #[cfg(verus_keep_ghost)]
@@ -199,8 +234,9 @@ pub fn union(word: u64, mask: u64) -> u64 {
         Some((word, next)) => first <= word <= last && super::collision_run(row@[word as int],
             super::overlap(row@[word as int], word as int, first as int, last as int, start_mask, end_mask), next),
     },
+    no_unwind
 ))]
-pub fn probe_row(row: &[u64], first: usize, last: usize, start_mask: u64, end_mask: u64) -> Option<(usize, u32)> {
+pub fn probe_row<C: ZeroCounts>(row: &[u64], first: usize, last: usize, start_mask: u64, end_mask: u64) -> Option<(usize, u32)> {
     let first_bits = if first == last {
         row[first] & start_mask & end_mask
     } else {
@@ -208,7 +244,7 @@ pub fn probe_row(row: &[u64], first: usize, last: usize, start_mask: u64, end_ma
         if end_bits != 0 {
             #[cfg(verus_keep_ghost)]
             proof! { let v=row[last as int]; assert(((v & end_mask) & v) == (v & end_mask)) by(bit_vector); }
-            return Some((last, after_collision(row[last], end_bits)));
+            return Some((last, after_collision::<C>(row[last], end_bits)));
         }
         let mut word = last;
         #[cfg_attr(verus_keep_ghost, verus_spec(
@@ -223,7 +259,7 @@ pub fn probe_row(row: &[u64], first: usize, last: usize, start_mask: u64, end_ma
             if bits != 0 {
                 #[cfg(verus_keep_ghost)]
                 proof! { assert((bits & bits) == bits) by(bit_vector); }
-                return Some((word, after_collision(bits, bits)));
+                return Some((word, after_collision::<C>(bits, bits)));
             }
         }
         row[first] & start_mask
@@ -235,7 +271,7 @@ pub fn probe_row(row: &[u64], first: usize, last: usize, start_mask: u64, end_ma
             assert((occupied & start_mask & end_mask) & occupied == (occupied & start_mask & end_mask)) by(bit_vector);
             assert((occupied & start_mask) & occupied == (occupied & start_mask)) by(bit_vector);
         }
-        Some((first, after_collision(row[first], first_bits)))
+        Some((first, after_collision::<C>(row[first], first_bits)))
     } else {
         None
     }
@@ -249,6 +285,7 @@ pub fn probe_row(row: &[u64], first: usize, last: usize, start_mask: u64, end_ma
     ensures final(row)@.len() == old(row)@.len(),
         forall |i:int| 0 <= i < final(row)@.len() ==> #[trigger] final(row)@[i] ==
             (old(row)@[i] | super::mark_mask(i,first as int,last as int,start_mask,end_mask)),
+    no_unwind
 ))]
 pub fn occupy_row(row: &mut [u64], first: usize, last: usize, start_mask: u64, end_mask: u64) {
     #[cfg(verus_keep_ghost)]

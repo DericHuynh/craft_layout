@@ -36,12 +36,7 @@ impl<T: SameInput> SameInput for Option<T> {
 
 impl SameInput for Size {
     fn same_input(&self, other: &Self) -> bool {
-        use Size::*;
-        match (self, other) {
-            (Pixels(a), Pixels(b)) | (Frac(a), Frac(b)) | (AspectRatio(a), AspectRatio(b)) => a.same_input(b),
-            (Fill, Fill) | (FitContent, FitContent) | (Auto, Auto) => true,
-            _ => false,
-        }
+        super::registration_rules::same_size::<crate::placement_geometry::RustFloat>(Some(*self), Some(*other))
     }
 }
 

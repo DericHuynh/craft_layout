@@ -4,6 +4,133 @@ use keru_layout::*;
 
 const WINDOW: Xy<f32> = Xy::new(640.0, 480.0);
 
+#[test]
+fn fixed_fill_group_matches_the_general_path_on_both_axes() {
+    for axis in [Axis::X, Axis::Y] {
+        let make_tree = |disabled_child| {
+            let mut tree = LayoutTree::<()>::new();
+            let root = tree.root();
+            tree.update_node_params(&root, LayoutParams {
+                size: Xy::new(Size::Pixels(320.0), Size::Pixels(96.0)),
+                children_layout: ChildrenLayout::Stack { axis, arrange: Arrange::Start, spacing: 0.0 },
+                ..LayoutParams::DEFAULT
+            }).unwrap();
+            let children = [16_777_216.0, 1.0, 2.0, 4096.0].map(|fill_weight| {
+                tree.add_node(&root, LayoutParams { fill_weight, ..LayoutParams::DEFAULT }).unwrap()
+            });
+            if disabled_child {
+                tree.add_node(&root, LayoutParams { disabled: true, ..LayoutParams::DEFAULT }).unwrap();
+            }
+            (tree, children)
+        };
+        let (mut fast, fast_children) = make_tree(false);
+        let (mut general, general_children) = make_tree(true);
+        for weight in [1.0, 8.0] {
+            for (tree, child) in [(&mut fast, &fast_children[1]), (&mut general, &general_children[1])] {
+                tree.update_node_params(child, LayoutParams { fill_weight: weight, ..LayoutParams::DEFAULT }).unwrap();
+                tree.solve_layout(WINDOW);
+                assert!(tree.warnings().is_empty());
+            }
+            for (a, b) in fast_children.iter().zip(&general_children) {
+                let a = fast.layout(a).unwrap();
+                let b = general.layout(b).unwrap();
+                assert_eq!(a.x.map(f32::to_bits), b.x.map(f32::to_bits));
+                assert_eq!(a.y.map(f32::to_bits), b.y.map(f32::to_bits));
+            }
+        }
+    }
+}
+
+#[test]
+fn warm_unit_fill_rechecks_current_count_and_weights() {
+    let make = |disabled_child| {
+        let mut tree = LayoutTree::<()>::new();
+        let root = tree.root();
+        tree.update_node_params(&root, LayoutParams {
+            size: Xy::new(Size::Pixels(320.0), Size::Pixels(96.0)),
+            children_layout: ChildrenLayout::Stack { axis: Axis::X, arrange: Arrange::Start, spacing: 0.0 },
+            ..LayoutParams::DEFAULT
+        }).unwrap();
+        let children = (0..128).map(|_| tree.add_node(&root, LayoutParams::DEFAULT).unwrap()).collect::<Vec<_>>();
+        if disabled_child {
+            tree.add_node(&root, LayoutParams { disabled: true, ..LayoutParams::DEFAULT }).unwrap();
+        }
+        (tree, root, children)
+    };
+    let (mut fast, fast_root, mut fast_ids) = make(false);
+    let (mut general, general_root, mut general_ids) = make(true);
+    for frame in 0..4 {
+        for (tree, root, children) in [(&mut fast, &fast_root, &mut fast_ids), (&mut general, &general_root, &mut general_ids)] {
+            if frame == 2 {
+                children.push(tree.add_node(root, LayoutParams::DEFAULT).unwrap());
+            }
+            if frame == 3 {
+                tree.update_node_params(&children[83], LayoutParams { fill_weight: 2.0, ..LayoutParams::DEFAULT }).unwrap();
+            }
+            tree.invalidate();
+            tree.solve_layout(WINDOW);
+            assert!(tree.warnings().is_empty());
+        }
+        for (fast_id, general_id) in fast_ids.iter().zip(&general_ids) {
+            let a = fast.layout(fast_id).unwrap();
+            let b = general.layout(general_id).unwrap();
+            assert_eq!(a.x.map(f32::to_bits), b.x.map(f32::to_bits));
+            assert_eq!(a.y.map(f32::to_bits), b.y.map(f32::to_bits));
+        }
+    }
+}
+
+#[test]
+fn warm_fill_pair_rechecks_the_current_siblings() {
+    for axis in [Axis::X, Axis::Y] {
+        let make = |disabled_child| {
+            let mut tree = LayoutTree::<()>::new();
+            let root = tree.root();
+            let panel = tree.add_node(&root, LayoutParams {
+                size: Xy::new(Size::Pixels(103.25), Size::Pixels(85.5)),
+                position: Xy::new_symm(Pos::Start),
+                children_layout: ChildrenLayout::Stack { axis, arrange: Arrange::Start, spacing: 0.0 },
+                ..LayoutParams::DEFAULT
+            }).unwrap();
+            let children = [1.0, 2.25].map(|fill_weight| {
+                tree.add_node(&panel, LayoutParams {
+                    fill_weight,
+                    position: Xy::new_symm(Pos::Start),
+                    ..LayoutParams::DEFAULT
+                }).unwrap()
+            });
+            if disabled_child {
+                tree.add_node(&panel, LayoutParams { disabled: true, ..LayoutParams::DEFAULT }).unwrap();
+            }
+            (tree, panel, children)
+        };
+        let (mut fast, fast_panel, fast_children) = make(false);
+        let (mut general, general_panel, general_children) = make(true);
+        for frame in 0..4 {
+            for (tree, panel, children) in [(&mut fast, &fast_panel, &fast_children), (&mut general, &general_panel, &general_children)] {
+                if frame == 2 {
+                    tree.update_node_params(&children[1], LayoutParams {
+                        fill_weight: 13.25,
+                        position: Xy::new_symm(Pos::Start),
+                        ..LayoutParams::DEFAULT
+                    }).unwrap();
+                } else if frame == 3 {
+                    tree.add_node(panel, LayoutParams::DEFAULT).unwrap();
+                }
+                tree.invalidate();
+                tree.solve_layout(WINDOW);
+                assert!(tree.warnings().is_empty());
+            }
+            for (a, b) in fast_children.iter().zip(&general_children) {
+                let a = fast.layout(a).unwrap();
+                let b = general.layout(b).unwrap();
+                assert_eq!(a.x.map(f32::to_bits), b.x.map(f32::to_bits));
+                assert_eq!(a.y.map(f32::to_bits), b.y.map(f32::to_bits));
+            }
+        }
+    }
+}
+
 fn row() -> LayoutParams {
     LayoutParams {
         size: Xy::new(Size::Pixels(180.0), Size::Pixels(80.0)),

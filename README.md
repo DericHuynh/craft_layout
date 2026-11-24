@@ -26,6 +26,10 @@ In short, the idea of this library is to consider the resulting graph of depende
 
 - Debuggability: almost all layout systems can express cyclic dependencies between elements, but in a traditional tree-based algorithm, this will result in a silently "broken" or inconsistent layout. With this algorithm, we can give the user a clear warning and an accurate list of the nodes that were stuck in cycles.
 
+## Benchmarks
+
+Run `cargo bench --bench real_workloads` for browser, Linux compositor, and CAD layout scenarios. The suite measures full and incremental layout over the same edit sequences. [Workloads and measurement method](benchmarks/real_workloads/README.md)
+
 ## Usage
 
 `keru_layout` has a trait-based API similar to Taffy's low-level API.
@@ -114,11 +118,15 @@ When `LayoutTree` appends or removes unbounded `Fill` leaves at the end of a sta
 
 Structural edits can be batched with a resize, a content change, or a change to a sizing cycle. For general edits, the solver walks the live tree to locate affected regions. Shared fill sizes, grid cells, wrap lines, and collapsed block margins can carry the work up to the root. Within those regions, it reuses independent leaf sizes, measurements with matching constraints, and unchanged subtrees behind fixed-size boundaries.
 
-`LayoutTree` also skips placement in unaffected branches. Resizing the viewport or changing the pixel scale refreshes output across the tree. Custom adapters receive all output rectangles by default and can opt into partial writes with `retains_output_rects()`. Explicit invalidation requests a full solve, and `solve_layout_incremental_checked` verifies the sizing results and the complete ordered absolute and local view against the engine’s canonical full solve.
+`LayoutTree` can retain the last layout on idle frames with the same viewport and scale. Position, anchor, origin flip, and overflow edits can go directly to placement. Numeric sizing changes mark the affected branch and any in-flow siblings whose positions depend on it. Placement retains the output of unaffected branches. Resizing the viewport or changing the pixel scale refreshes output across the tree. Custom adapters receive all output rectangles by default and can opt into partial writes with `retains_output_rects()`. `solve_layout_incremental_checked` compares the sizing words and the complete ordered absolute and local view when a candidate is available. It always publishes the engine’s canonical full result.
+
+Numeric edits budget ranked sizing work by distinct affected nodes, with a separate hard limit on slot computations. Repeated viewport edits can reuse a bounded dependency schedule when the edit inputs and dependency shape match. A numeric Width-grid edit can reuse its cell assignments when the ordered items and normalized column count agree. Placement uses the current grid rectangle.
 
 The proof suite compares the ordered absolute and local rectangles of a retained view with a fresh full build across successive edits. It also checks the production grid search, Fill compaction, sibling traversal and pixel snapping. The verification guide describes which paths share verified Rust code and which still depend on a model of the adapter or solver. [Layout proofs](proofs/README.md)
 
-Without structural edits, placement-only changes in wrapping and block layouts reuse measured sizes. Changes to sizing inputs in these layouts can request a full solve to rebuild the flow data. Disable the `incremental` feature to omit change tracking and use full solves through `TreeAdapter`.
+Placement-only changes in wrapping and block layouts reuse measured sizes. Flow replay rebuilds line and margin data and retains clean measurements when their inputs still match. Eligible Block trees compute widths from parent to child and fold heights and margins in sibling order. When a Width grid's track size can be resolved early, preparation uses that size to resolve its children and reuse independent branches. Re-enabling a child can reuse its saved sizing when its declarations, visible descendants, and track width still agree.
+
+Large batches can use root replay if edit intake reaches its limit before sizing starts. Full solves handle the initial frame, explicit invalidation, and work that cannot safely reuse prior sizing. `LayoutTree` keeps a bounded cache of wrapped text heights for matching width bits. Report content edits or call `invalidate()` when the measurer changes. Disable the `incremental` feature to omit change tracking and use full solves through `TreeAdapter`.
 
 
 ## FAQ

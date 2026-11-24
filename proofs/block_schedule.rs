@@ -37,12 +37,14 @@ pub proof fn locate<I>(list: Seq<Child<I>>, index: nat, id: I)
 
 pub fn begin_scan() -> (cursor: Ghost<nat>)
     ensures cursor@ == 0,
+    no_unwind
 {
     Ghost(0nat)
 }
 
 pub fn step_scan(cursor: Ghost<nat>) -> (next: Ghost<nat>)
     ensures next@ == cursor@ + 1,
+    no_unwind
 {
     Ghost(cursor@+1)
 }

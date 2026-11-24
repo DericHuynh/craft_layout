@@ -1,0 +1,162 @@
+--- a/benchmarks/arewelayoutyet/adapter.rs
++++ b/benchmarks/arewelayoutyet/adapter.rs
+@@ -80,52 +80,69 @@
+     1 + node.children.iter().map(count).sum::<usize>()
+ }
+ 
+-struct Node {
+-    parent: u32,
+-    first_child: Option<u32>,
+-    last_child: Option<u32>,
+-    next_sibling: Option<u32>,
+-    params: LayoutParams,
+-    layout: NodeLayoutData,
+-    rect: XyRect,
++#[derive(Clone, Copy)]
++struct Links {
++    first_child: u32,
++    next_sibling: u32,
++}
++
++// Only the root uses ID zero. Child and sibling links never point there.
++#[inline]
++fn linked(node: u32) -> Option<u32> {
++    if node == 0 { None } else { Some(node) }
+ }
+ 
+ struct Tree {
+-    nodes: Vec<Node>,
++    parents: Vec<u32>,
++    links: Vec<Links>,
++    params: Vec<LayoutParams>,
++    records: Vec<NodeLayoutData>,
++    rectangles: Vec<XyRect>,
+     layout: LayoutData<u32>,
+ }
+ 
+ impl Tree {
++    fn new(capacity: usize) -> Self {
++        Self {
++            parents: Vec::with_capacity(capacity),
++            links: Vec::with_capacity(capacity),
++            params: Vec::with_capacity(capacity),
++            records: Vec::with_capacity(capacity),
++            rectangles: Vec::with_capacity(capacity),
++            layout: LayoutData::new(),
++        }
++    }
++
++    fn len(&self) -> usize { self.links.len() }
++
+     fn push(&mut self, parent: u32, params: LayoutParams) -> Option<u32> {
+-        let id = u32::try_from(self.nodes.len()).ok()?;
+-        self.nodes.push(Node {
+-            parent,
+-            first_child: None,
+-            last_child: None,
+-            next_sibling: None,
+-            params,
+-            layout: NodeLayoutData::new(),
+-            rect: Xy::new_symm([0.0; 2]),
+-        });
++        let id = u32::try_from(self.len()).ok()?;
++        self.parents.push(parent);
++        self.links.push(Links { first_child: 0, next_sibling: 0 });
++        self.params.push(params);
++        self.records.push(NodeLayoutData::new());
++        self.rectangles.push(Xy::new_symm([0.0; 2]));
+         Some(id)
+     }
+ 
+-    fn add(&mut self, parent: u32, template: &LayoutNode, parent_axis: Option<Axis>) -> Option<()> {
++    fn add(&mut self, parent: u32, template: &LayoutNode, parent_axis: Option<Axis>) -> Option<u32> {
+         let id = self.push(parent, params(template, parent_axis)?)?;
+-        let parent = parent as usize;
+-        if let Some(previous) = self.nodes[parent].last_child {
+-            self.nodes[previous as usize].next_sibling = Some(id);
+-        } else {
+-            self.nodes[parent].first_child = Some(id);
+-        }
+-        self.nodes[parent].last_child = Some(id);
+-
+         let axis = axis(template);
++        let mut previous = None;
+         for child in &template.children {
+-            self.add(id, child, Some(axis))?;
++            let child = self.add(id, child, Some(axis))?;
++            if let Some(previous) = previous {
++                self.links_mut(previous).next_sibling = child;
++            } else {
++                self.links_mut(id).first_child = child;
++            }
++            previous = Some(child);
+         }
+-        Some(())
++        Some(id)
+     }
++
++    #[inline]
++    fn links_mut(&mut self, node: u32) -> &mut Links { &mut self.links[node as usize] }
+ }
+ 
+ impl TreeAdapter for Tree {
+@@ -134,18 +151,18 @@
+     fn root(&self) -> u32 { 0 }
+ 
+     fn parent(&self, node: u32) -> Option<u32> {
+-        (node != 0).then(|| self.nodes[node as usize].parent)
++        (node != 0).then(|| self.parents[node as usize])
+     }
+ 
+-    fn first_child(&self, node: u32) -> Option<u32> { self.nodes[node as usize].first_child }
+-    fn next_sibling(&self, node: u32) -> Option<u32> { self.nodes[node as usize].next_sibling }
+-    fn node_layout_params(&self, node: u32) -> &LayoutParams { &self.nodes[node as usize].params }
+-    fn node_layout_data(&self, node: u32) -> &NodeLayoutData { &self.nodes[node as usize].layout }
+-    fn node_layout_data_mut(&mut self, node: u32) -> &mut NodeLayoutData { &mut self.nodes[node as usize].layout }
++    fn first_child(&self, node: u32) -> Option<u32> { linked(self.links[node as usize].first_child) }
++    fn next_sibling(&self, node: u32) -> Option<u32> { linked(self.links[node as usize].next_sibling) }
++    fn node_layout_params(&self, node: u32) -> &LayoutParams { &self.params[node as usize] }
++    fn node_layout_data(&self, node: u32) -> &NodeLayoutData { &self.records[node as usize] }
++    fn node_layout_data_mut(&mut self, node: u32) -> &mut NodeLayoutData { &mut self.records[node as usize] }
+     fn layout_data(&mut self) -> &mut LayoutData<u32> { &mut self.layout }
+ 
+     fn write_output_rect(&mut self, node: u32, rect: XyRect, _local: XyRect) {
+-        self.nodes[node as usize].rect = rect;
++        self.rectangles[node as usize] = rect;
+     }
+ }
+ 
+@@ -156,9 +173,10 @@
+ 
+ impl KeruLayoutTree {
+     pub fn new(template: &LayoutNode, width: f32, height: f32) -> Option<Self> {
+-        let mut tree = Tree { nodes: Vec::with_capacity(count(template) + 1), layout: LayoutData::new() };
++        let mut tree = Tree::new(count(template) + 1);
+         tree.push(0, LayoutParams::DEFAULT)?;
+-        tree.add(0, template, None)?;
++        let child = tree.add(0, template, None)?;
++        tree.links_mut(0).first_child = child;
+         Some(Self { tree, window: Xy::new(width, height) })
+     }
+ 
+@@ -167,16 +185,16 @@
+ 
+     pub fn compute_layout(&mut self) {
+         self.tree.solve_layout(self.window);
+-        std::hint::black_box(&self.tree.nodes);
++        std::hint::black_box(&self.tree);
+     }
+ 
+-    pub fn node_count(&self) -> usize { self.tree.nodes.len() - 1 }
++    pub fn node_count(&self) -> usize { self.tree.len() - 1 }
+ 
+     /// Check every absolute edge word, including signed zero, outside the timer.
+     pub fn geometry_hash(&self) -> u64 {
+         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+-        for node in &self.tree.nodes {
+-            for edge in node.rect.x.into_iter().chain(node.rect.y) {
++        for rect in &self.tree.rectangles {
++            for edge in rect.x.into_iter().chain(rect.y) {
+                 hash ^= u64::from(edge.to_bits());
+                 hash = hash.wrapping_mul(0x100_0000_01b3);
+             }

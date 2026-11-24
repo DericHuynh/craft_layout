@@ -1,0 +1,162 @@
+--- a/benches/pangui_pairs.rs
++++ b/benches/pangui_pairs.rs
+@@ -2,8 +2,6 @@
+ //! (<https://www.pangui.io/blog/05-layout-rework-and-benchmarks/>).
+ //!
+ //! Each file in the `pangui` directory is one benchmark, written in PanGUI's benchmark template format.
+-use criterion::measurement::WallTime;
+-use criterion::{criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion};
+ use rand::Rng;
+ use std::path::Path;
+ use taffy::prelude::*;
+@@ -12,7 +10,7 @@
+ use taffy_benchmarks::pangui_template::{
+     parse_test_case, BenchmarkSize, FlowDirection, LayoutNode, SizeMode, WrapMode,
+ };
+-use taffy_benchmarks::{bench_layout, benchmark_group, BuildTree, BuildTreeExt, GenStyle, TaffyTreeBuilder};
++use taffy_benchmarks::{BuildTree, BuildTreeExt, GenStyle, TaffyTreeBuilder};
+ 
+ #[cfg(feature = "backer")]
+ use taffy_benchmarks::backer_helpers::BackerTree;
+@@ -212,7 +210,7 @@
+ 
+ /// Benchmark the layout libraries which have their own translation of the templates, rather than from a Taffy style.
+ #[allow(unused_variables)]
+-fn benchmark_native_libraries(group: &mut BenchmarkGroup<WallTime>, name: &str, root: &LayoutNode) {
++fn benchmark_native_libraries(group: &mut PairGroup<'_>, name: &str, root: &LayoutNode) {
+     let (width, height) = (root_size(&root.width), root_size(&root.height));
+ 
+     #[cfg(feature = "backer")]
+@@ -262,14 +260,14 @@
+     #[cfg(feature = "clay")]
+     if let Some(mut tree) = ClayTree::new(root, width, height) {
+         group.bench_function(BenchmarkId::new(name, "Clay"), |b| {
+-            taffy_benchmarks::iter_timed(b, || tree.layout_duration())
++            iter_timed(b, || tree.layout_duration())
+         });
+     }
+ 
+     #[cfg(feature = "ply")]
+     if let Some(mut tree) = PlyTree::new(root, width, height) {
+         group.bench_function(BenchmarkId::new(name, "Ply"), |b| {
+-            taffy_benchmarks::iter_timed(b, || tree.layout_duration())
++            iter_timed(b, || tree.layout_duration())
+         });
+     }
+ 
+@@ -314,14 +312,109 @@
+         .collect()
+ }
+ 
+-fn pangui_benchmarks(c: &mut Criterion) {
+-    let mut group = benchmark_group(c, "PanGUI");
++
++use std::time::{Duration, Instant};
++
++const SAMPLES: usize = 21;
++const BATCH_NS: u128 = 4_000_000;
++
++struct BenchmarkId<'a> {
++    name: &'a str,
++    engine: &'a str,
++}
++impl<'a> BenchmarkId<'a> {
++    fn new(name: &'a str, engine: &'a str) -> Self { Self { name, engine } }
++}
++
++struct PairGroup<'a> {
++    root: &'a LayoutNode,
++    filter: Option<&'a str>,
++    warm_batches: bool,
++}
++
++impl PairGroup<'_> {
++    fn bench_function(&mut self, id: BenchmarkId<'_>, run: impl FnOnce(&mut PairBencher<'_>)) {
++        if id.engine == "keru_layout"
++            || self.filter.is_some_and(|value| !format!("{}/{}", id.name, id.engine).contains(value))
++        {
++            return;
++        }
++        let width = root_size(&self.root.width);
++        let height = root_size(&self.root.height);
++        if let Some(reference) = KeruLayoutTree::new(self.root, width, height) {
++            run(&mut PairBencher { id, reference, warm_batches: self.warm_batches });
++        }
++    }
++}
++
++struct PairBencher<'a> {
++    id: BenchmarkId<'a>,
++    reference: KeruLayoutTree,
++    warm_batches: bool,
++}
++
++fn timed_reference(reference: &mut KeruLayoutTree) -> Duration {
++    reference.mark_all_dirty();
++    let start = Instant::now();
++    reference.compute_layout();
++    start.elapsed()
++}
++
++fn batch(run: &mut impl FnMut() -> Duration, iterations: usize, warm: bool) -> f64 {
++    if warm { let _ = run(); }
++    let elapsed: Duration = (0..iterations).map(|_| run()).sum();
++    elapsed.as_nanos() as f64 / iterations as f64
++}
++
++fn iterations(run: &mut impl FnMut() -> Duration) -> usize {
++    let mut warm = [0; 5];
++    for elapsed in &mut warm {
++        *elapsed = run().as_nanos().max(1);
++    }
++    warm.sort_unstable();
++    (BATCH_NS / warm[2]).clamp(1, 20_000) as usize
++}
++
++fn iter_timed(bencher: &mut PairBencher<'_>, mut peer: impl FnMut() -> Duration) {
++    let mut reference = || timed_reference(&mut bencher.reference);
++    let peer_iterations = iterations(&mut peer);
++    let reference_iterations = iterations(&mut reference);
++    let warm = bencher.warm_batches;
++    for sample in 0..SAMPLES {
++        let (keru, other) = if sample % 2 == 0 {
++            (batch(&mut reference, reference_iterations, warm), batch(&mut peer, peer_iterations, warm))
++        } else {
++            let other = batch(&mut peer, peer_iterations, warm);
++            (batch(&mut reference, reference_iterations, warm), other)
++        };
++        println!("{}\t{}\t{}\t{}\t{}\t{}", bencher.id.name, bencher.id.engine,
++                 sample, keru, other, other / keru);
++    }
++}
++
++fn bench_layout<T>(
++    bencher: &mut PairBencher<'_>,
++    tree: &mut Option<T>,
++    build: impl FnOnce() -> T,
++    mut invalidate: impl FnMut(&mut T),
++    mut layout: impl FnMut(&mut T),
++) {
++    let tree = tree.get_or_insert_with(build);
++    iter_timed(bencher, || {
++        invalidate(tree);
++        let start = Instant::now();
++        layout(tree);
++        start.elapsed()
++    });
++}
++
++fn main() {
++    let filter = std::env::var("PANGUI_FILTER").ok();
++    let warm_batches = std::env::var_os("PANGUI_WARM_BATCHES").is_some();
++    println!("workload\tengine\tsample\tkeru_ns\tpeer_ns\tpeer_over_keru");
+     for (name, root) in templates() {
++        let mut group = PairGroup { root: &root, filter: filter.as_deref(), warm_batches };
+         benchmark_native_libraries(&mut group, name.as_str(), &root);
+         benchmark_each_library!(group, name.as_str(), root);
+     }
+-    group.finish();
+ }
+-
+-criterion_group!(name = benches; config = taffy_benchmarks::criterion_config(); targets = pangui_benchmarks);
+-criterion_main!(benches);

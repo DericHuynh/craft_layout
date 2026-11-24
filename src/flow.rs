@@ -2,8 +2,7 @@ use crate::*;
 
 #[path = "block_flow.rs"]
 mod block_flow;
-pub(crate) use block_flow::{BlockFlow, BlockMargins};
-use block_flow::BlockItem;
+pub(crate) use block_flow::{BlockFlow, BlockItem, BlockMargins, Scalar as BlockScalar, edge_adjoins, implicit_edges, item_adjoins};
 
 #[inline]
 pub(crate) fn margins(params: &LayoutParams, axis: Axis) -> [f32; 2] {
@@ -12,31 +11,31 @@ pub(crate) fn margins(params: &LayoutParams, axis: Axis) -> [f32; 2] {
 
 pub(crate) use crate::place::stack_line::with_margin;
 
-impl BlockItem {
-    pub(crate) fn new(params: &LayoutParams, layout: &NodeLayoutData, nested: Option<BlockMargins>) -> Self {
-        let [top, bottom] = margins(params, Y);
-        let size = layout.size().y;
-        let adjoins = size == 0.0 && block_can_collapse(params)
-            && params.padding.y == [0.0; 2]
-            && params.min_size.y.is_none_or(|size| size == Size::Pixels(0.0) || size == Size::Frac(0.0));
-        Self::from_edges(top, bottom, size, adjoins, layout.n_placed_children == 0, nested)
-    }
-}
-
-fn block_can_collapse(params: &LayoutParams) -> bool {
+pub(crate) fn block_can_collapse(params: &LayoutParams) -> bool {
     params.text == TextContent::None && params.image.is_none() && params.content_measure == ContentMeasure::None
 }
 
+pub(crate) fn zero_minimum(params: &LayoutParams) -> bool {
+    matches!(params.min_size.y, None | Some(Size::Pixels(0.0) | Size::Frac(0.0)))
+}
+
 #[path = "wrap_lines.rs"]
-mod wrap_lines;
-use wrap_lines::{LineModel, LineSource, WrapLine, scan_line};
+pub(crate) mod wrap_lines;
+use wrap_lines::{LineModel, LineSource};
 #[path = "wrap_metrics.rs"]
 pub(crate) mod wrap_metrics;
 
-struct SolverLine<'a, T: ?Sized, const MARKS_READY: bool> {
+pub(crate) struct SolverLine<'a, T: ?Sized, const MARKS_READY: bool> {
     tree: &'a T,
     axis: Axis,
     spacing: f32,
+}
+
+impl<'a, T: ?Sized, const MARKS_READY: bool> SolverLine<'a, T, MARKS_READY> {
+    #[inline(always)]
+    pub(crate) fn new(tree: &'a T, axis: Axis, spacing: f32) -> Self {
+        Self { tree, axis, spacing }
+    }
 }
 
 impl<T: Solve + ?Sized, const MARKS_READY: bool> LineModel for SolverLine<'_, T, MARKS_READY> {
@@ -88,20 +87,24 @@ impl<T: Solve + ?Sized, const MARKS_READY: bool> LineSource for SolverLine<'_, T
     fn empty_extent(&self) -> f32 { 0.0 }
 
     #[inline]
-    fn append_extent(&self, main: f32, extent: f32) -> f32 { main + self.spacing + extent }
+    fn append_extent(&self, main: f32, extent: f32) -> f32 { wrap_lines::extend_main(main, self.spacing, extent) }
 
     #[inline]
     fn max_cross(&self, cross: f32, extent: f32) -> f32 { cross.max(extent) }
 
     #[inline]
-    fn exceeds_limit(&self, main: f32, limit: f32) -> bool { main > limit }
+    fn exceeds_limit(&self, main: f32, limit: f32) -> bool { wrap_lines::beyond_limit(main, limit) }
 }
 
-impl<T: TreeAdapter + ?Sized> wrap_metrics::CacheModel for T {
+pub(crate) struct WrapRecords<'a, T: ?Sized> {
+    pub(crate) tree: &'a mut T,
+}
+
+impl<T: TreeAdapter + ?Sized> wrap_metrics::CacheModel for WrapRecords<'_, T> {
     type Id = T::NodeId;
 }
 
-impl<T: TreeAdapter + ?Sized> wrap_metrics::LineCache for T {
+impl<T: TreeAdapter + ?Sized> wrap_metrics::LineCache for WrapRecords<'_, T> {
     #[inline]
     fn same_cursor(&self, next: Option<Self::Id>, stop: Option<Self::Id>) -> bool {
         next == stop
@@ -109,39 +112,17 @@ impl<T: TreeAdapter + ?Sized> wrap_metrics::LineCache for T {
 
     #[inline]
     fn row(&self, child: Self::Id) -> (Option<Self::Id>, bool) {
-        let params = self.node_layout_params(child);
-        (self.next_sibling(child), !params.disabled && !params.free_placement)
+        let params = self.tree.node_layout_params(child);
+        (self.tree.next_sibling(child), !params.disabled && !params.free_placement)
     }
 
     #[inline]
     fn set_line_bits(&mut self, child: Self::Id, metric: wrap_metrics::Metric, bits: u32) {
-        self.node_layout_data_mut(child).set_wrap_metric(metric, bits);
+        self.tree.node_layout_data_mut(child).set_wrap_metric(metric, bits);
     }
 }
 
-pub(crate) trait Flow: Solve {
-    /// With an available size, find a break using each child's size before Fill. Otherwise
-    /// reuse the saved break and read the resolved dimensions for measurement or placement.
-    fn wrap_line<const MARKS_READY: bool>(&self, next: Option<Self::NodeId>, axis: Axis, available: Option<f32>, spacing: f32) -> WrapLine<Self::NodeId> {
-        scan_line(&SolverLine::<_, MARKS_READY> { tree: self, axis, spacing }, next, available)
-    }
-
-    fn block_flow(&self, i: Self::NodeId) -> BlockFlow {
-        let params = self.node_layout_params(i);
-        let margins_adjoin = self.node_layout_data(i).flags.is_block_item() && block_can_collapse(params);
-        BlockFlow::from_edges(
-            margins_adjoin && params.padding.y[0] == 0.0,
-            margins_adjoin && params.padding.y[1] == 0.0
-                && self.read_size(i, Y, Kind::Regular) == Some(Size::FitContent)
-                && params.min_size.y.is_none_or(|size| size == Size::Pixels(0.0) || size == Size::Frac(0.0)),
-        )
-    }
-
-    fn block_item(&mut self, i: Self::NodeId) -> BlockItem {
-        let index = self.node_layout_data(i).block_margin_index();
-        let nested = index.map(|index| margin_storage::read_margin(&self.layout_data().block_margins, index));
-        BlockItem::new(self.node_layout_params(i), self.node_layout_data(i), nested)
-    }
+impl<T: TreeAdapter + ?Sized> wrap_metrics::LineRecordAccess for WrapRecords<'_, T> {
+    #[inline(always)]
+    fn finish(self) {}
 }
-
-impl<T: TreeAdapter + ?Sized> Flow for T {}

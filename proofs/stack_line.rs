@@ -3,6 +3,7 @@ use vstd::prelude::*;
 #[path = "../src/stack_line.rs"]
 mod kernel;
 use kernel::{Scalar, ScalarModel};
+pub(crate) use kernel::{between_gaps, evenly_spaced_gaps};
 
 verus! {
 

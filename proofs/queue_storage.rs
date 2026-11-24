@@ -1,6 +1,16 @@
 use vstd::prelude::*;
 #[path = "../src/queue_storage.rs"]
 mod kernel;
+#[path = "../src/incremental/numeric.rs"]
+pub(crate) mod numeric;
+#[path = "../src/incremental/intake.rs"]
+pub(crate) mod intake;
+#[path = "../src/incremental/tape.rs"]
+pub(crate) mod tape;
+#[path = "../src/incremental/tape_plan.rs"]
+pub(crate) mod tape_plan;
+#[path = "../src/incremental/readers.rs"]
+pub(crate) mod readers;
 verus! {
 #[allow(non_snake_case)]
 pub open spec fn BucketCount() -> int { 65536 }
@@ -152,6 +162,7 @@ pub open spec fn roots<T>(q:&WorkQueue<T>)->Heads {
 pub open spec fn physical<T>(q:&WorkQueue<T>) -> bool {
     &&& q.first_level as int + q.heads.len() <= BucketCount()
     &&& q.cursor <= q.heads.len()
+    &&& if q.started { q.cursor < q.heads.len() } else { q.cursor == 0 }
     &&& q.free <= q.entries.len()
     &&& forall|i:int| 0<=i<q.heads.len() ==> #[trigger] q.heads[i] <= q.entries.len()
     &&& forall|r:int| r < q.first_level as int + q.cursor ==> #[trigger] rank(q,r)==0
@@ -164,6 +175,8 @@ pub open spec fn did_push<T>(a:&WorkQueue<T>,b:&WorkQueue<T>,r:u16,v:T)->bool {
     &&& forall|pos:int| #[trigger] rank(b,pos) == (if pos==r as int {e} else {rank(a,pos) as int})
     &&& b.first_level as int + b.heads.len() <= BucketCount()
     &&& b.cursor <= b.heads.len()
+    &&& b.cursor == a.cursor && b.started == a.started
+    &&& b.started ==> b.cursor < b.heads.len() && b.first_level == a.first_level
     &&& forall|pos:int| pos < b.first_level as int + b.cursor ==> #[trigger] rank(b,pos)==0
 }
 pub open spec fn did_pop<T>(a:&WorkQueue<T>,b:&WorkQueue<T>,v:Option<T>)->bool {
@@ -178,15 +191,19 @@ pub open spec fn did_pop<T>(a:&WorkQueue<T>,b:&WorkQueue<T>,v:Option<T>)->bool {
         &&& b.entries@==a.entries@.update(e-1,(value,a.free))
         &&& forall|p:int| #[trigger] rank(b,p) == (if p==r {a.entries[e-1].1} else {rank(a,p)})
         &&& b.first_level==a.first_level && b.heads.len()==a.heads.len() && b.cursor<b.heads.len()
+        &&& b.started && a.cursor <= b.cursor
     } else {
         &&& forall|r:int| #[trigger] rank(a,r)==0
-        &&& b.heads.len()==0 && b.entries.len()==0 && b.free==0 && b.cursor==0
+        &&& b.heads.len()==0 && b.entries.len()==0 && b.free==0 && b.cursor==0 && !b.started
     }
 }
 
 
 pub open spec fn represented<T>(q:&WorkQueue<T>,w:Chains)->bool {
     physical(q) && valid(q.entries@,roots(q),w)
+}
+pub open spec fn well_formed<T>(q:&WorkQueue<T>)->bool {
+    exists |w: Chains| #[trigger] represented(q,w)
 }
 pub open spec fn payloads<T>(q:&WorkQueue<T>,w:Chains,r:int)->Seq<T> {
     Seq::new(w(r).len(),|i:int| q.entries[w(r)[i]-1].0)
@@ -210,7 +227,7 @@ proof fn valid_roots_in_bounds<T>(q:&WorkQueue<T>,w:Chains)
 
 pub open spec fn no_entries()->Chains { |_:int| Seq::<usize>::empty() }
 pub proof fn empty_queue_is_represented<T>(q:&WorkQueue<T>)
-    requires q.entries.len()==0 && q.heads.len()==0 && q.free==0 && q.cursor==0,
+    requires q.entries.len()==0 && q.heads.len()==0 && q.free==0 && q.cursor==0 && !q.started,
     ensures represented(q,no_entries()),
 {}
 
@@ -314,5 +331,29 @@ pub proof fn pop_removes_lowest<T>(a:&WorkQueue<T>,b:&WorkQueue<T>,v:Option<T>,w
     }
 }
 
+/// In a ranked non-flow frame, an unread dependency has a queued entry.
+/// Once the production queue pops the lowest available rank, all declared
+/// lower-rank reads of that slot can use their already resolved values.
+pub proof fn popped_slot_inputs_are_resolved<T>(
+    before: &WorkQueue<T>, after: &WorkQueue<T>, selected: T, w: Chains,
+    ranks: spec_fn(T) -> u16, inputs: Seq<T>, resolved: spec_fn(T) -> bool,
+)
+    requires
+        represented(before, w), did_pop(before, after, Some(selected)),
+        ranks(selected) == after.first_level as int + after.cursor,
+        forall |i: int| 0 <= i < inputs.len() ==> ranks(#[trigger] inputs[i]) < ranks(selected),
+        forall |i: int| 0 <= i < inputs.len() && !resolved(#[trigger] inputs[i]) ==>
+            payloads(before, w, ranks(inputs[i]) as int).contains(inputs[i]),
+    ensures forall |i: int| 0 <= i < inputs.len() ==> resolved(#[trigger] inputs[i]),
+{
+    pop_removes_lowest(before, after, Some(selected), w);
+    assert forall |i: int| 0 <= i < inputs.len() implies resolved(#[trigger] inputs[i]) by {
+        if !resolved(inputs[i]) {
+            let rank = ranks(inputs[i]) as int;
+            assert(payloads(before, w, rank).len() == 0);
+            assert(payloads(before, w, rank).contains(inputs[i]));
+        }
+    }
+}
 
 }

@@ -1,6 +1,5 @@
 use std::ops::Range;
 
-use super::ascii_space;
 #[cfg(target_arch = "x86_64")]
 use super::{LineWidths, Xy};
 #[cfg(target_arch = "x86_64")]
@@ -8,17 +7,26 @@ use std::arch::x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
 mod mixed;
-#[cfg(target_arch = "x86_64")]
 #[path = "text_windows.rs"]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(super) mod windows;
+use windows::ascii_space;
+#[cfg(target_arch = "x86_64")]
+use windows::boundaries::{WordWidths, WrappedWords, emit_boundary_words, finish_word, pop_lane16, tail_mask16, tail_mask32};
+#[cfg(target_arch = "x86_64")]
+use windows::native::{load_avx, load_sse2};
 #[cfg(target_arch = "x86_64")]
 pub(super) use mixed::measure_mixed_avx2;
+#[cfg(target_arch = "x86_64")]
+pub(super) use windows::boundaries::NativeBitLanes;
+#[cfg(target_arch = "x86_64")]
+pub(super) use windows::text_avx2_supported;
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-pub(super) fn next_window16(bytes: &[u8], cursor: usize) -> Option<(&[u8; 16], usize)> {
-    let (start, count) = windows::window16(bytes.len(), cursor)?;
-    Some((bytes.get(start..)?.first_chunk()?, count))
+pub(super) fn next_window16<'text>(bytes: &'text [u8], cursor: &mut usize) -> Option<(&'text [u8; 16], usize, usize)> {
+    let (block, start, count) = windows::take_window16(bytes, cursor)?;
+    Some((block.first_chunk()?, start, count))
 }
 
 /// Yields byte ranges of non-whitespace runs. The input is known to be ASCII.
@@ -51,21 +59,19 @@ impl<'text> AsciiWords<'text> {
     #[inline]
     fn boundary(&mut self) -> usize {
         while self.transitions == 0 {
-            let Some((block, count)) = next_window16(self.bytes, self.cursor) else {
+            let Some((block, start, count)) = next_window16(self.bytes, &mut self.cursor) else {
                 // The input end is both a word's optional final boundary and
                 // the sentinel indicating that no further word starts.
                 return self.bytes.len();
             };
-            self.block_start = self.cursor;
-            let spaces = whitespace_mask(block) >> (16 - count);
-            self.transitions = spaces ^ ((spaces << 1) | self.previous_space);
-            self.transitions &= windows::low_lanes16(count);
-            self.previous_space = spaces >> (count - 1);
-            self.cursor += count;
+            self.block_start = start;
+            let spaces = tail_mask16(whitespace_mask(block), count);
+            let (_, previous, transitions) = windows::transitions16(spaces as u32, self.previous_space, count);
+            self.previous_space = previous;
+            self.transitions = transitions;
         }
-        let offset = self.transitions.trailing_zeros() as usize;
-        self.transitions &= self.transitions - 1;
-        self.block_start + offset
+        let offset = pop_lane16::<NativeBitLanes>(&mut self.transitions);
+        self.block_start.saturating_add(offset as usize)
     }
 }
 
@@ -80,11 +86,12 @@ impl Iterator for AsciiWords<'_> {
             return (start < self.bytes.len()).then(|| start..self.boundary());
         }
 
-        let remaining = &self.bytes[self.cursor..];
+        let remaining = self.bytes.get(self.cursor..)?;
         let start = remaining.iter().position(|&byte| !ascii_space(byte))?;
-        let word = &remaining[start..];
+        let word = remaining.get(start..)?;
         let end = word.iter().position(|&byte| ascii_space(byte)).unwrap_or(word.len());
-        let range = (self.cursor + start)..(self.cursor + start + end);
+        let start = self.cursor.checked_add(start)?;
+        let range = start..start.checked_add(end)?;
         self.cursor = range.end;
         Some(range)
     }
@@ -93,53 +100,26 @@ impl Iterator for AsciiWords<'_> {
 // Measurements consume every word. Scan each block once and pass its complete
 // word lengths directly to the wrapping calculation.
 #[cfg(target_arch = "x86_64")]
-pub(super) fn for_each_ascii_word_width(bytes: &[u8], last: &[u8; 16], mut word: impl FnMut(usize)) {
-    let (blocks, tail) = bytes.as_chunks::<16>();
+pub(super) fn for_each_ascii_word_width<W: WordWidths>(bytes: &[u8], last: &[u8; 16], words: &mut W) {
+    let (prefix, tail) = windows::partition_windows::<16>(bytes, false);
+    let mut rest = prefix;
     let mut previous_space = 1u16;
     let mut word_start = 0;
-    for (block_index, block) in blocks.iter().enumerate() {
-        let base = block_index * 16;
+    while let Some((block, base)) = windows::take_full_window::<16>(&mut rest, prefix.len()) {
+        let Some(block) = block.first_chunk::<16>() else { return; };
         let spaces = whitespace_mask(block);
-        emit_words(spaces ^ ((spaces << 1) | previous_space), previous_space, base, &mut word_start, &mut word);
+        let boundaries = spaces ^ ((spaces << 1) | previous_space);
+        emit_boundary_words::<NativeBitLanes, _>(boundaries as u32, previous_space == 0, base, 16, &mut word_start, words);
         previous_space = spaces >> 15;
     }
     if !tail.is_empty() {
         // The last window overlaps bytes already visited. Shift them out.
-        let spaces = whitespace_mask(last) >> (16 - tail.len());
-        let boundaries = (spaces ^ ((spaces << 1) | previous_space)) & (u16::MAX >> (16 - tail.len()));
-        emit_words(boundaries, previous_space, blocks.len() * 16, &mut word_start, &mut word);
-        previous_space = spaces >> (tail.len() - 1);
+        let spaces = tail_mask16(whitespace_mask(last), tail.len());
+        let (_, previous, boundaries) = windows::transitions16(spaces as u32, previous_space, tail.len());
+        emit_boundary_words::<NativeBitLanes, _>(boundaries as u32, previous_space == 0, prefix.len(), tail.len(), &mut word_start, words);
+        previous_space = previous;
     }
-    if previous_space == 0 {
-        word(bytes.len() - word_start);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn emit_words(mut boundaries: u16, previous_space: u16, base: usize, word_start: &mut usize, mut word: impl FnMut(usize)) {
-    if boundaries != 0 && previous_space == 0 {
-        // The first boundary closes a word that started in an earlier block.
-        let end = base + boundaries.trailing_zeros() as usize;
-        boundaries &= boundaries - 1;
-        word(end - *word_start);
-    }
-    while boundaries != 0 {
-        *word_start = base + boundaries.trailing_zeros() as usize;
-        boundaries &= boundaries - 1;
-        if boundaries != 0 {
-            let end = base + boundaries.trailing_zeros() as usize;
-            boundaries &= boundaries - 1;
-            word(end - *word_start);
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-struct WrappedWords {
-    previous_space: u32,
-    word_start: usize,
-    lines: LineWidths,
+    finish_word(words, u32::from(previous_space), word_start, bytes.len());
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -148,59 +128,9 @@ impl WrappedWords {
         Self { previous_space: 1, word_start: 0, lines }
     }
 
-    #[inline(always)]
-    fn block(&mut self, spaces: u32, count: usize, base: usize) {
-        let previous = (spaces << 1) | self.previous_space;
-        let ends = spaces & !previous;
-        // Count letters up to the last completed word and one separator per
-        // word, except before the first word of a line. If this whole prefix
-        // fits, its individual words cannot cause a line break.
-        if ends != 0 {
-            let last_end = 31 - ends.leading_zeros();
-            let letters = ((1u32 << last_end) - 1) & !spaces;
-            let carry = if self.previous_space == 0 { base - self.word_start } else { 0 };
-            let first_line = usize::from(self.lines.current == 0);
-            let joined = self.lines.current + letters.count_ones() as usize + carry
-                + ends.count_ones() as usize - first_line;
-            if joined <= self.lines.max {
-                self.lines.count += first_line;
-                self.lines.current = joined;
-                self.lines.longest = self.lines.longest.max(joined);
-                self.previous_space = spaces >> (count - 1);
-                // The only unfinished word, if any, follows the last space.
-                self.word_start = base + (32 - spaces.leading_zeros()) as usize;
-                return;
-            }
-        }
-
-        let boundaries = (spaces ^ previous) & (u32::MAX >> (32 - count));
-        self.emit_words(boundaries, base);
-        self.previous_space = spaces >> (count - 1);
-    }
-
-    #[inline(always)]
-    fn emit_words(&mut self, mut boundaries: u32, base: usize) {
-        if boundaries != 0 && self.previous_space == 0 {
-            let end = base + boundaries.trailing_zeros() as usize;
-            boundaries &= boundaries - 1;
-            self.lines.add_word(end - self.word_start);
-        }
-        while boundaries != 0 {
-            self.word_start = base + boundaries.trailing_zeros() as usize;
-            boundaries &= boundaries - 1;
-            if boundaries != 0 {
-                let end = base + boundaries.trailing_zeros() as usize;
-                boundaries &= boundaries - 1;
-                self.lines.add_word(end - self.word_start);
-            }
-        }
-    }
-
     #[inline]
     fn finish(mut self, len: usize) -> Xy<f32> {
-        if self.previous_space == 0 {
-            self.lines.add_word(len - self.word_start);
-        }
+        finish_word(&mut self.lines, self.previous_space, self.word_start, len);
         self.lines.size()
     }
 }
@@ -217,26 +147,25 @@ pub(super) unsafe fn measure_wrapped_avx2(
 ) -> Xy<f32> {
     let mut scan = WrappedWords::new(lines);
     let Some(last) = bytes.last_chunk::<32>() else {
-        // SAFETY: Each array supplies a full 16-byte load.
-        let window = unsafe {
-            let first = _mm_loadu_si128(first.as_ptr().cast());
-            let last = _mm_loadu_si128(last16.as_ptr().cast());
-            _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(first), last)
-        };
+        let first = load_sse2(first);
+        let last = load_sse2(last16);
+        let window = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(first), last);
         let raw = _mm256_movemask_epi8(whitespace_avx2(window)) as u32;
         // Keep the low lane and move only new bytes from the high lane after it.
         let low_lane = u32::from(u16::MAX);
-        let spaces = (raw & low_lane) | ((raw >> (32 - bytes.len())) & !low_lane);
-        scan.block(spaces, bytes.len(), 0);
+        let spaces = (raw & low_lane) | (tail_mask32(raw, bytes.len()) & !low_lane);
+        scan.block::<NativeBitLanes>(spaces, bytes.len(), 0);
         return scan.finish(bytes.len());
     };
     // Reserve the last byte so there is always a final window to consume.
-    let (blocks, tail) = bytes[..bytes.len() - 1].as_chunks::<32>();
-    for (index, block) in blocks.iter().enumerate() {
-        scan.block(whitespace_mask_avx2(block), 32, index * 32);
+    let (prefix, tail) = windows::partition_windows::<32>(bytes, true);
+    let mut rest = prefix;
+    while let Some((block, base)) = windows::take_full_window::<32>(&mut rest, prefix.len()) {
+        let Some(block) = block.first_chunk::<32>() else { return scan.finish(base); };
+        scan.block::<NativeBitLanes>(whitespace_mask_avx2(block), 32, base);
     }
-    let count = tail.len() + 1;
-    scan.block(whitespace_mask_avx2(last) >> (32 - count), count, blocks.len() * 32);
+    let count = tail.len();
+    scan.block::<NativeBitLanes>(tail_mask32(whitespace_mask_avx2(last), count), count, prefix.len());
     scan.finish(bytes.len())
 }
 
@@ -244,8 +173,7 @@ pub(super) unsafe fn measure_wrapped_avx2(
 #[inline]
 #[target_feature(enable = "avx2")]
 fn whitespace_mask_avx2(block: &[u8; 32]) -> u32 {
-    // SAFETY: The array supplies a full vector load.
-    let input = unsafe { _mm256_loadu_si256(block.as_ptr().cast()) };
+    let input = load_avx(block);
     _mm256_movemask_epi8(whitespace_avx2(input)) as u32
 }
 
@@ -268,8 +196,8 @@ pub(super) fn whitespace_avx2(input: __m256i) -> __m256i {
 #[inline]
 fn whitespace_mask(bytes: &[u8; 16]) -> u16 {
     use std::arch::x86_64::*;
-    // SSE2 is available on x86-64 and the array supplies a full 16-byte load.
-    unsafe { _mm_movemask_epi8(whitespace_bytes(_mm_loadu_si128(bytes.as_ptr().cast()))) as u16 }
+    // SAFETY: SSE2 is available on x86-64.
+    unsafe { _mm_movemask_epi8(whitespace_bytes(load_sse2(bytes))) as u16 }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -289,6 +217,14 @@ pub(super) fn whitespace_bytes(bytes: std::arch::x86_64::__m128i) -> std::arch::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    struct CheckWidths<W>(W);
+
+    #[cfg(target_arch = "x86_64")]
+    impl<W: FnMut(usize)> WordWidths for CheckWidths<W> {
+        fn width(&mut self, width: usize) { (self.0)(width); }
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
@@ -322,9 +258,9 @@ mod tests {
                 #[cfg(target_arch = "x86_64")]
                 if let Some(last) = text.as_bytes().last_chunk::<16>() {
                     let mut expected = text.split_whitespace().map(str::len);
-                    for_each_ascii_word_width(text.as_bytes(), last, |actual| {
+                    for_each_ascii_word_width(text.as_bytes(), last, &mut CheckWidths(|actual| {
                         assert_eq!(Some(actual), expected.next(), "byte {byte}, length {end}");
-                    });
+                    }));
                     assert_eq!(expected.next(), None);
                 }
             }

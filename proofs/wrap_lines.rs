@@ -2,7 +2,7 @@
 use vstd::prelude::*;
 
 #[path = "../src/wrap_lines.rs"]
-mod kernel;
+pub(crate) mod kernel;
 use kernel::{LineSource, WrapLine};
 
 verus! {
@@ -203,12 +203,14 @@ pub proof fn scan_replay_matches_sizing<F: LineSource, R: LineSource<Id=F::Id>>(
 
 pub fn start_scan() -> (out: Ghost<nat>)
     ensures out@ == 0,
+    no_unwind
 {
     Ghost(0nat)
 }
 
 pub fn advance(i: Ghost<nat>) -> (out: Ghost<nat>)
     ensures out@ == i@ + 1,
+    no_unwind
 {
     Ghost(i@ + 1)
 }

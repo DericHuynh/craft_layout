@@ -1,4 +1,25 @@
+use std::borrow::Borrow;
+
 use crate::*;
+#[cfg(any(test, not(target_arch = "x86_64")))]
+use crate::placement_geometry as geometry;
+use crate::placement_geometry::RustFloat;
+use crate::vec_memory::RustVec;
+#[cfg(feature = "incremental")]
+use crate::vec_memory::VecMemory;
+use crate::packed_stack_leaf::PreparedStackLeaf;
+
+#[path = "free_placement.rs"]
+mod free_placement;
+pub use free_placement::FreePlacementError;
+
+#[path = "placement_node.rs"]
+mod placement_node;
+#[path = "placement_modes.rs"]
+pub(crate) mod placement_modes;
+
+#[path = "placement_entry.rs"]
+pub(crate) mod placement_entry;
 
 #[path = "placement_walk.rs"]
 mod placement_walk;
@@ -6,266 +27,556 @@ mod placement_walk;
 #[path = "stack_line.rs"]
 pub(crate) mod stack_line;
 
-#[derive(Clone, Copy)]
-pub(crate) struct ParentFrame<'a> {
-    rect: XyRect,
-    output_origin: Xy<f32>,
-    padding: Xy<[f32; 2]>,
-    flipped: Xy<bool>,
-    snapper: Option<&'a Snapper>,
-}
-
-/// The parent has been visited. Its first child is next in preorder.
-#[derive(Clone, Copy)]
-pub(crate) struct Branch<I> {
-    parent: I,
-    first: I,
-    rect: XyRect,
-    origin: Xy<f32>,
-    partial: bool,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct Siblings<'a, I> {
-    next: Option<I>,
-    frame: ParentFrame<'a>,
-    partial: bool,
-    mode: SiblingMode<I>,
-}
-
-#[derive(Clone, Copy)]
-enum SiblingMode<I> {
-    Free,
-    Stack { axis: Axis, position: f32, gap: f32, batch: bool },
-    Wrap(WrapCursor<I>),
-    Block(BlockFlow),
-    Grid { parent: I, spacing_x: f32, spacing_y: f32 },
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct WrapCursor<I> {
-    axis: Axis,
-    arrange: Arrange,
-    spacing: f32,
-    line_spacing: f32,
-    next_line: Option<I>,
-    cross_position: f32,
-    cross_edges: [f32; 2],
-    main_position: f32,
-    gap: f32,
-}
-
 #[path = "placement_batch.rs"]
 mod placement_batch;
 
-struct LeafBatch<'a, I> {
-    buffer: placement_batch::Buffer<I, [f32; 4]>,
-    snapper: &'a Snapper,
+struct NodeOutput<'tree, T: ?Sized, S, const UNSNAPPED: bool = false> {
+    fresh_placement: bool,
+    tree: &'tree mut T,
+    snapper: Option<S>,
 }
 
-impl<'a, I: Copy> LeafBatch<'a, I> {
-    fn new(first: I, snapper: &'a Snapper) -> Self {
-        Self { buffer: placement_batch::empty_buffer(first, [0.0; 4]), snapper }
+impl<T: ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn snapper(&self) -> Option<&Snapper> { if UNSNAPPED { None } else { self.snapper.as_ref().map(Borrow::borrow) } }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_node::NodeModel<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    type PublicationFloat = RustFloat;
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_node::NodeTarget<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn read_work(&self, _node: T::NodeId) -> Option<crate::placement_work::PlacementWork> {
+        #[cfg(feature = "incremental")]
+        { Some(crate::placement_adapter::read_work(self.tree, _node)) }
+        #[cfg(not(feature = "incremental"))]
+        { None }
+    }
+
+    #[inline(always)]
+    fn clear_work(&mut self, _node: T::NodeId) {
+        #[cfg(feature = "incremental")]
+        { crate::placement_adapter::clear_work(self.tree, _node); }
+    }
+
+    #[inline(always)]
+    fn snap(&self, [[left, right], [top, bottom]]: placement_node::Edges) -> placement_node::Edges {
+        match self.snapper() {
+            Some(snapper) => {
+                let [left, right, top, bottom] = snapper.snap([left, right, top, bottom]);
+                [[left, right], [top, bottom]]
+            }
+            None => [[left, right], [top, bottom]],
+        }
+    }
+
+    #[inline(always)]
+    fn subtract_edges(left: f32, right: f32) -> f32 { left - right }
+
+    #[inline(always)]
+    fn write(&mut self, node: T::NodeId, absolute: placement_node::Edges, local: placement_node::Edges) {
+        crate::placement_adapter::publish(self.tree, node, absolute, local);
+    }
+
+    #[inline(always)]
+    fn first_child(&self, node: T::NodeId) -> Option<T::NodeId> {
+        self.tree.first_child(node)
+    }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool>
+    placement_modes::FreePlacementInputs<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_modes::SiblingTarget<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn next_sibling(&self, id: T::NodeId) -> Option<T::NodeId> { self.tree.next_sibling(id) }
+
+    #[inline(always)]
+    fn disabled(&self, id: T::NodeId) -> bool { self.tree.node_layout_params(id).disabled }
+
+    #[inline(always)]
+    fn size(&self, id: T::NodeId) -> [f32; 2] {
+        crate::placement_adapter::size(self.tree, id)
+    }
+
+    #[inline(always)]
+    fn free_style(&self, id: T::NodeId) -> placement_modes::FreeStyle {
+        crate::placement_adapter::free_style(self.tree.node_layout_params(id))
+    }
+
+    #[inline(always)]
+    fn align_style(&self, id: T::NodeId) -> placement_modes::StackStyle {
+        crate::placement_adapter::stack_style::<RustFloat>(self.tree.node_layout_params(id))
+    }
+
+    #[inline(always)]
+    fn margins(&self, id: T::NodeId, x: bool) -> [f32; 2] {
+        margins(self.tree.node_layout_params(id), if x { X } else { Y })
+    }
+
+    #[inline(always)]
+    fn declaration(&self, id: T::NodeId, x: bool, kind: Kind) -> Option<Size> {
+        self.tree.read_size(id, if x { X } else { Y }, kind)
+    }
+
+    #[inline(always)]
+    fn window_size(&mut self, x: bool) -> f32 {
+        crate::placement_adapter::window_axis(&self.tree.layout_data().window_size, x)
+    }
+}
+
+impl placement_modes::StackDataModel for NodeLayoutData {}
+
+impl placement_modes::StackData for NodeLayoutData {
+    #[inline(always)]
+    fn stack_size(&self) -> [f32; 2] {
+        let size = self.size();
+        [size.x, size.y]
+    }
+
+    #[inline(always)]
+    fn cached_start(&self) -> bool {
+        #[cfg(feature = "incremental")]
+        { self.cached_stack_start() }
+        #[cfg(not(feature = "incremental"))]
+        { false }
+    }
+
+    #[inline(always)]
+    fn dirty(&self) -> bool {
+        #[cfg(feature = "incremental")]
+        { self.placement != PlacementWork::Clean }
+        #[cfg(not(feature = "incremental"))]
+        { false }
+    }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_batch::OutputModel<T::NodeId, [f32; 4]> for NodeOutput<'_, T, S, UNSNAPPED> {}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_batch::BatchTarget<T::NodeId, [f32; 4]> for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline]
+    fn snap(&mut self, edges: &mut [[f32; 4]]) {
+        if let Some(snapper) = self.snapper() { snapper.snap_many(edges); }
     }
 
     #[inline]
-    fn push<T: TreeAdapter<NodeId = I> + ?Sized>(&mut self, tree: &mut T, frame: &ParentFrame, id: I, rect: XyRect, dirty: bool) {
-        let edges = [rect.x[0], rect.x[1], rect.y[0], rect.y[1]];
-        if let Some(run) = self.buffer.push(id, edges, dirty) {
-            self.publish(tree, frame, run);
+    fn write(&mut self, node: T::NodeId, [left, right, top, bottom]: [f32; 4], dirty: bool, origin: [f32; 2]) {
+        placement_node::write_snapped(self, node, [[left, right], [top, bottom]], origin, dirty);
+    }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_modes::StackTarget<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    type Data = NodeLayoutData;
+
+    #[inline(always)]
+    fn stack_data(&self, id: T::NodeId) -> &Self::Data { self.tree.node_layout_data(id) }
+
+    #[inline(always)]
+    fn stack_params(&self, id: T::NodeId) -> &LayoutParams { self.tree.node_layout_params(id) }
+
+    #[inline(always)]
+    fn stack_align(params: &LayoutParams) -> placement_modes::StackStyle {
+        crate::placement_adapter::stack_style::<RustFloat>(params)
+    }
+
+    #[inline(always)]
+    fn prepared_styles(&self) -> bool {
+        #[cfg(feature = "incremental")]
+        { self.tree.retains_output_rects() }
+        #[cfg(not(feature = "incremental"))]
+        { false }
+    }
+
+    #[inline(always)]
+    fn snapping(&self) -> bool { !UNSNAPPED && self.snapper.is_some() }
+
+    #[inline(always)]
+    fn full_unsnapped(&self) -> bool { UNSNAPPED }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_modes::WrapTarget<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn ready_wrap_lines(&self, id: T::NodeId) -> bool {
+        #[cfg(feature = "incremental")]
+        {
+            self.fresh_placement && self.snapper().is_none()
+                && self.tree.node_layout_data(id).prepared_placement & NodeLayoutData::PREPARED_WRAP != 0
+        }
+        #[cfg(not(feature = "incremental"))]
+        { let _ = (self.fresh_placement, id); false }
+    }
+
+    #[inline(always)]
+    fn ready_wrap_start(&self, id: T::NodeId) -> bool {
+        #[cfg(feature = "incremental")]
+        { self.tree.node_layout_data(id).prepared_placement & NodeLayoutData::PREPARED_WRAP_START != 0 }
+        #[cfg(not(feature = "incremental"))]
+        { let _ = id; false }
+    }
+
+    #[inline(always)]
+    fn wrap_line_height(&self, id: T::NodeId) -> f32 {
+        f32::from_bits(self.tree.node_layout_data(id).parent_flow[1])
+    }
+
+    #[inline(always)]
+    fn same_cursor(&self, next: Option<T::NodeId>, id: T::NodeId) -> bool { next == Some(id) }
+
+    #[inline(always)]
+    fn wrap_in_flow(&self, id: T::NodeId) -> bool {
+        let params = self.tree.node_layout_params(id);
+        !params.disabled && !params.free_placement
+    }
+
+    #[inline(always)]
+    fn wrap_marked(&self, id: T::NodeId) -> bool { self.tree.node_layout_data(id).flags.starts_wrap_line() }
+
+    #[inline(always)]
+    fn wrap_slot(&self, id: T::NodeId, x: bool, kind: Kind) -> f32 {
+        self.tree.get_solved_value(id, if x { X } else { Y }, kind)
+    }
+
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_modes::BlockTarget<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    type Flow = BlockFlow;
+    type Item = BlockItem;
+    type Nested = BlockMargins;
+
+    #[inline(always)]
+    fn block_style(&self, id: T::NodeId) -> placement_modes::BlockStyle {
+        let params = self.tree.node_layout_params(id);
+        let [left, right] = params.margin.x;
+        placement_modes::BlockStyle {
+            free: params.free_placement,
+            inline_margin: [left.pixels(), right.pixels()], auto: [left == Margin::AUTO, right == Margin::AUTO],
         }
     }
 
-    fn flush<T: TreeAdapter<NodeId = I> + ?Sized>(&mut self, tree: &mut T, frame: &ParentFrame) {
-        let run = self.buffer.drain();
-        if run.len != 0 { self.publish(tree, frame, run); }
+    #[inline(always)]
+    fn margin_index(&self, id: T::NodeId) -> Option<usize> { self.tree.node_layout_data(id).block_margin_index::<RustFloat>() }
+
+    #[inline(always)]
+    fn nested_margin(&mut self, index: usize) -> Option<Self::Nested> {
+        margin_storage::read_margin(&self.tree.layout_data().block_margins, index)
     }
 
-    fn publish<T: TreeAdapter<NodeId = I> + ?Sized>(&mut self, tree: &mut T, frame: &ParentFrame, run: placement_batch::Run) {
-        let ids = run.ids(&self.buffer.ids);
-        let edges = run.edges(&mut self.buffer.edges);
-        self.snapper.snap_many(edges);
-        let parent = frame.output_origin;
+    #[inline(always)]
+    fn block_item_inputs(&self, id: T::NodeId) -> placement_modes::BlockItemInputs {
+        let params = self.tree.node_layout_params(id);
+        let layout = self.tree.node_layout_data(id);
+        placement_modes::BlockItemInputs {
+            bounds: placement_modes::BlockEdges {
+                padding: params.padding.y, collapse: block_can_collapse(params), zero_minimum: zero_minimum(params),
+            },
+            height: layout.size().y, margins: margins(params, Y), children_empty: !layout.has_in_flow_children(),
+        }
+    }
+
+    #[inline(always)]
+    fn block_from_edges([top, bottom]: [f32; 2], height: f32, adjoins: bool, children_empty: bool, nested: Option<Self::Nested>) -> Self::Item {
+        BlockItem::from_edges(top, bottom, height, adjoins, children_empty, nested)
+    }
+
+    #[inline(always)]
+    fn append_block(flow: &mut Self::Flow, item: Self::Item) -> f32 { flow.push(item) }
+
+    #[inline(always)]
+    fn block_parent_edges(&self, id: T::NodeId) -> placement_modes::BlockEdges {
+        let params = self.tree.node_layout_params(id);
+        placement_modes::BlockEdges {
+            padding: params.padding.y,
+            collapse: self.tree.node_layout_data(id).flags.is_block_item() && block_can_collapse(params),
+            zero_minimum: zero_minimum(params),
+        }
+    }
+
+    #[inline(always)]
+    fn block_from_parent(before: bool, after: bool) -> Self::Flow { BlockFlow::from_edges(before, after) }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_modes::GridTarget<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn grid_lines(&self, id: T::NodeId) -> [f32; 2] {
+        crate::placement_adapter::grid_lines(self.tree, id)
+    }
+
+    #[inline(always)]
+    fn grid_cell(&self, id: T::NodeId) -> [f32; 2] {
+        crate::placement_adapter::grid_cell(self.tree, id)
+    }
+
+    #[inline(always)]
+    fn grid_style(&self, id: T::NodeId) -> placement_modes::GridStyle {
+        crate::placement_adapter::grid_style::<RustFloat>(self.tree.node_layout_params(id))
+    }
+
+    #[inline(always)]
+    fn grid_start([x, y]: [f32; 2], [dx, dy]: [f32; 2], [cx, cy]: [f32; 2], [w, h]: [f32; 2]) -> placement_node::Edges {
+        let rect = grid_start_rect(Xy::new(x, y), Xy::new(dx, dy), Xy::new(cx, cy), Xy::new(w, h));
+        [rect.x, rect.y]
+    }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_modes::ParentTarget<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn ready_pair(&self, id: T::NodeId) -> bool {
         #[cfg(feature = "incremental")]
-        let mut dirty = run.dirty;
-        for (&node, &[left, right, top, bottom]) in ids.iter().zip(edges.iter()) {
-            #[cfg(feature = "incremental")]
-            {
-                if placement_batch::pop_dirty(&mut dirty) {
-                    tree.node_layout_data_mut(node).placement = PlacementWork::Clean;
+        {
+            self.fresh_placement && self.snapper().is_none()
+                && self.tree.node_layout_data(id).prepared_placement & NodeLayoutData::PREPARED_PAIR != 0
+        }
+        #[cfg(not(feature = "incremental"))]
+        { let _ = id; false }
+    }
+
+    #[inline(always)]
+    fn packed_leaf_span(&mut self, id: T::NodeId) -> Option<[usize; 2]> {
+        #[cfg(feature = "incremental")]
+        {
+            if !self.fresh_placement || self.snapper().is_some() { return None; }
+            let record = self.tree.node_layout_data(id);
+            let ready = NodeLayoutData::PREPARED_FIT_LEAVES | NodeLayoutData::PREPARED_WRAP_START;
+            if record.prepared_placement & ready == 0 { return None; }
+            let prepared = &mut self.tree.layout_data().packed_stack_leaves;
+            if prepared.next_parent() != Some(id) { return None; }
+            prepared.take_span()
+        }
+        #[cfg(not(feature = "incremental"))]
+        { let _ = id; None }
+    }
+
+    #[inline(always)]
+    fn take_uniform_leaves(&mut self, id: T::NodeId) -> Option<([f32; 2], Vec<T::NodeId>)> {
+        #[cfg(feature = "incremental")]
+        if self.fresh_placement && UNSNAPPED
+            && self.tree.node_layout_data(id).prepared_placement & NodeLayoutData::PREPARED_UNIFORM_LEAVES != 0
+        {
+            let workspace = &mut self.tree.layout_data().packed_stack_leaves;
+            if let Some((parent, size)) = workspace.uniform_run {
+                if parent == id {
+                    workspace.uniform_run = None;
+                    return Some((size, RustVec::take(&mut workspace.uniform_ids)));
                 }
             }
-            let rect = Xy::new([left, right], [top, bottom]);
-            let local = Xy::new([left - parent.x, right - parent.x], [top - parent.y, bottom - parent.y]);
-            tree.write_output_rect(node, rect, local);
+        }
+        let _ = id;
+        None
+    }
+
+    #[inline(always)]
+    fn recycle_uniform_leaves(&mut self, ids: Vec<T::NodeId>) {
+        #[cfg(feature = "incremental")]
+        { self.tree.layout_data().packed_stack_leaves.uniform_ids = ids; }
+        #[cfg(not(feature = "incremental"))]
+        { let _ = ids; }
+    }
+
+    #[inline(always)]
+    fn same_packed_id(&self, left: T::NodeId, right: T::NodeId) -> bool { left == right }
+
+    #[inline]
+    fn take_packed_leaves(&mut self) -> Vec<PreparedStackLeaf<T::NodeId>> {
+        #[cfg(feature = "incremental")]
+        { RustVec::take(&mut self.tree.layout_data().packed_stack_leaves.rows) }
+        #[cfg(not(feature = "incremental"))]
+        { Vec::new() }
+    }
+
+    #[inline]
+    fn put_packed_leaves(&mut self, rows: Vec<PreparedStackLeaf<T::NodeId>>) {
+        #[cfg(feature = "incremental")]
+        { self.tree.layout_data().packed_stack_leaves.rows = rows; }
+        #[cfg(not(feature = "incremental"))]
+        { let _ = rows; }
+    }
+
+    #[inline(always)]
+    fn parent_style(&self, id: T::NodeId) -> placement_modes::ParentStyle {
+        crate::placement_adapter::parent_style(self.tree.node_layout_params(id))
+    }
+
+    #[inline(always)]
+    fn free_placement(&self, id: T::NodeId) -> bool { self.tree.node_layout_params(id).free_placement }
+
+    #[inline(always)]
+    fn prefers_batch(&self) -> bool { self.snapper().is_some_and(Snapper::prefers_batch) }
+
+    #[inline(always)]
+    fn placed_children(&self, id: T::NodeId) -> u32 { self.tree.node_layout_data(id).n_placed_children }
+
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_modes::RootTarget<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn clear_scale_changed(&mut self) {
+        #[cfg(feature = "incremental")]
+        { self.tree.layout_data().placement_scale_changed = false; }
+    }
+
+    #[inline(always)]
+    fn root_id(&self) -> T::NodeId { self.tree.root() }
+
+    #[inline(always)]
+    fn pixel_scale(&mut self) -> Option<f32> { if UNSNAPPED { None } else { self.tree.layout_data().pixel_scale } }
+}
+
+impl<T: TreeAdapter + ?Sized, const UNSNAPPED: bool> placement_entry::RootPlacementTarget<T::NodeId> for NodeOutput<'_, T, Snapper, UNSNAPPED> {
+    #[inline(always)]
+    fn prepare_rounding(&mut self, scale: Option<f32>) { if !UNSNAPPED { self.snapper = scale.map(Snapper::new); } }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placement_entry::FreeTarget<T::NodeId> for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn mark_repositioned(&mut self, _node: T::NodeId) {
+        #[cfg(feature = "incremental")]
+        self.tree.node_layout_data_mut(_node).mark_placement_changed();
+    }
+}
+
+impl placement_modes::StackMath for RustFloat {
+    #[inline(always)]
+    fn negate(value: f32) -> f32 { -value }
+
+    #[inline(always)]
+    fn with_margin(x: f32, margin: f32) -> f32 { stack_line::with_margin(x, margin) }
+
+    #[inline(always)]
+    fn place(cursor: &mut f32, flipped: bool, range: [f32; 2], size: f32, margin: [f32; 2], gap: f32) -> [f32; 2] {
+        stack_line::place(cursor, flipped, range, size, margin, gap)
+    }
+
+    #[inline(always)]
+    fn place_start(cursor: &mut f32, cross_start: f32, x: bool, size: [f32; 2], gap: f32) -> placement_node::Edges {
+        stack_line::place_start(cursor, cross_start, x, size, gap)
+    }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn after_item(start: f32, size: f32, trailing: f32, gap: f32) -> f32 {
+        stack_line::after_item(start, size, trailing, gap)
+    }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> crate::tree_walk::LinkModel for NodeOutput<'_, T, S, UNSNAPPED> {
+    type Id = T::NodeId;
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> crate::tree_walk::AncestorLinks for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn following(&self, node: Self::Id) -> Option<Self::Id> { self.tree.next_sibling(node) }
+
+    #[inline(always)]
+    fn enclosing(&self, node: Self::Id) -> Option<Self::Id> { self.tree.parent(node) }
+
+    #[inline(always)]
+    fn same(&self, node: Self::Id, root: Self::Id) -> bool { node == root }
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> free_placement::PreflightModel for NodeOutput<'_, T, S, UNSNAPPED> {
+    type Axis = Axis;
+}
+
+impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> free_placement::PreflightHost for NodeOutput<'_, T, S, UNSNAPPED> {
+    #[inline(always)]
+    fn style(&self, node: Self::Id) -> free_placement::PreflightStyle<Self::Axis> {
+        let params = self.tree.node_layout_params(node);
+        free_placement::PreflightStyle {
+            disabled: params.disabled,
+            free: params.free_placement,
+            free_children: matches!(params.children_layout, ChildrenLayout::Free),
+            wrap_cross_axis: match params.children_layout {
+                ChildrenLayout::Wrap { axis, .. } => Some(axis.other()),
+                _ => None,
+            },
         }
     }
+
+    #[inline(always)]
+    fn first_child(&self, node: Self::Id) -> Option<Self::Id> { self.tree.first_child(node) }
+
+    #[inline(always)]
+    fn finals(&self, node: Self::Id) -> [u32; 2] {
+        let flags = self.tree.node_layout_data(node).flags;
+        [flags.check_state(X, Kind::Final), flags.check_state(Y, Kind::Final)]
+    }
+
+    #[inline(always)]
+    fn flex_declarations(&self, node: Self::Id, axis: Self::Axis) -> [Option<bool>; 3] {
+        DECLARED_SIZES.map(|kind| self.tree.read_size(node, axis, kind).map(|size| size.is_flex()))
+    }
+
+    #[inline(always)]
+    fn declared_states(&self, node: Self::Id, axis: Self::Axis) -> [u32; 3] {
+        let flags = self.tree.node_layout_data(node).flags;
+        DECLARED_SIZES.map(|kind| flags.check_state(axis, kind))
+    }
+}
+
+impl<T: Place + ?Sized> full_layout::Access for T {
+    #[cfg(feature = "incremental")]
+    type Change = (T::NodeId, NodeChange);
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn changes(&mut self) -> (&mut bool, &mut bool, &mut Vec<Self::Change>, &mut Vec<Self::Id>) {
+        let data = self.layout_data();
+        data.replay_pending = false;
+        data.numeric_tape.invalidate::<RustVec>();
+        data.numeric_wrap = None;
+        data.sizing_warned = false;
+        (&mut data.children_changed, &mut data.unknown_structure, &mut data.node_changes, &mut data.content_changes)
+    }
+
+    #[inline(always)]
+    fn place_full(&mut self) -> placement_entry::RootPlacement<T::NodeId> { self.place_nodes_with::<false>(true) }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn keeps_rectangles(&self) -> bool { self.retains_output_rects() }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn tracking_topology(&mut self) -> &mut bool { &mut self.layout_data().track_topology }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn save_topology(&mut self) { self.remember_topology(); }
 }
 
 /// The placement part of the layout. Every `TreeAdapter` gets it from the blanket impl.
 pub(crate) trait Place: Solve {
     fn solve_full<const REGISTERED_PIXELS: bool>(&mut self, window_size: Xy<f32>) {
-        #[cfg(feature = "incremental")]
-        self.layout_data().clear();
-        self.measure_sizes::<REGISTERED_PIXELS>(window_size);
-        self.place_nodes::<false>();
-        #[cfg(feature = "incremental")]
-        {
-            if self.retains_output_rects() { self.layout_data().track_topology = true; }
-            self.remember_topology();
-        }
+        full_layout::run::<_, RustVec, REGISTERED_PIXELS>(self, window_size);
     }
 
-    fn place_nodes<const PARTIAL: bool>(&mut self) {
-        #[cfg(feature = "incremental")]
-        { self.layout_data().placement_scale_changed = false; }
-        let root = self.root();
-        if self.node_layout_params(root).disabled { return; }
-        let size = self.node_layout_data(root).size();
-        let rect = Xy::new([0.0, size.x], [0.0, size.y]);
-        let snapper = self.layout_data().pixel_scale.map(Snapper::new);
-        self.place::<PARTIAL>(root, rect, Xy::new_symm(0.0), snapper.as_ref());
+    #[cfg(any(feature = "incremental", test))]
+    fn place_nodes<const PARTIAL: bool>(&mut self) -> placement_entry::RootPlacement<Self::NodeId> {
+        self.place_nodes_with::<PARTIAL>(false)
     }
 
-    fn place<const PARTIAL: bool>(&mut self, node: Self::NodeId, rect: XyRect, origin: Xy<f32>, snapper: Option<&Snapper>) {
-        if let Some(branch) = self.publish_node::<PARTIAL>(node, rect, origin, snapper) {
-            self.walk_placement(branch, snapper);
+    fn place_nodes_with<const PARTIAL: bool>(&mut self, fresh_placement: bool) -> placement_entry::RootPlacement<Self::NodeId> {
+        // Select the unrounded implementation once so each write can publish its edges directly.
+        if self.layout_data().pixel_scale.is_none() {
+            let mut target = NodeOutput::<_, _, true> { tree: self, snapper: None::<Snapper>, fresh_placement };
+            return placement_entry::root::<_, _, RustFloat, RustVec, 4, PARTIAL>(&mut target);
         }
-    }
-
-    /// Publish one node. Its children are visited by the outer work loop.
-    #[inline(always)]
-    fn publish_node<const PARTIAL: bool>(&mut self, node: Self::NodeId, rect: XyRect, parent_origin: Xy<f32>, snapper: Option<&Snapper>) -> Option<Branch<Self::NodeId>> {
-        #[cfg(feature = "incremental")]
-        let write = {
-            let work = self.node_layout_data(node).placement;
-            if !work.visits(!PARTIAL) { return None; }
-            if work != PlacementWork::Clean {
-                self.node_layout_data_mut(node).placement = PlacementWork::Clean;
-            }
-            work.writes(!PARTIAL)
-        };
-        #[cfg(not(feature = "incremental"))]
-        let write = true;
-
-        let output = snapper.map_or(rect, |snapper| snap_rect(rect, snapper));
-        if write {
-            let local = Xy::new(
-                [output.x[0] - parent_origin.x, output.x[1] - parent_origin.x],
-                [output.y[0] - parent_origin.y, output.y[1] - parent_origin.y],
-            );
-            self.write_output_rect(node, output, local);
-        }
-        let first = self.first_child(node)?;
-        Some(Branch {
-            parent: node, first, rect, origin: Xy::new(output.x[0], output.y[0]),
-            // A changed frame forces all its descendants to publish.
-            partial: PARTIAL && !write,
-        })
+        let mut target = NodeOutput::<_, _, false> { tree: self, snapper: None::<Snapper>, fresh_placement };
+        placement_entry::root::<_, _, RustFloat, RustVec, 4, PARTIAL>(&mut target)
     }
 
     #[cfg(feature = "incremental")]
     fn place_children<const PARTIAL: bool>(&mut self, parent: Self::NodeId, first: Self::NodeId, rect: XyRect, origin: Xy<f32>, snapper: Option<&Snapper>) {
-        self.walk_placement(Branch { parent, first, rect, origin, partial: PARTIAL }, snapper);
-    }
-
-    fn walk_placement(&mut self, start: Branch<Self::NodeId>, snapper: Option<&Snapper>) {
-        let mut pending = crate::work_stack::work_stack::<_, 4>(Vec::new());
-        let mut siblings = self.placement_cursor(start, snapper);
-        loop {
-            let branch = if siblings.partial {
-                self.place_siblings::<true>(&mut siblings)
-            } else {
-                self.place_siblings::<false>(&mut siblings)
-            };
-            let child = branch.map(|branch| self.placement_cursor(branch, snapper));
-            let Some(next) = placement_walk::next(&mut pending, child, &siblings, siblings.next.is_some()) else { return };
-            siblings = next;
-        }
-    }
-
-    fn placement_cursor<'a>(&self, branch: Branch<Self::NodeId>, snapper: Option<&'a Snapper>) -> Siblings<'a, Self::NodeId> {
-        let Branch { parent, first, rect, origin, partial } = branch;
-        let (layout, frame) = self.parent_frame(parent, rect, origin, snapper);
-        let mode = match layout {
-            ChildrenLayout::Free => SiblingMode::Free,
-            ChildrenLayout::Stack { axis, arrange, spacing } => {
-                let (position, gap) = self.stack_start(first, &frame, axis, arrange, spacing);
-                let batch = !partial && snapper.is_some_and(Snapper::prefers_batch)
-                    && self.node_layout_data(parent).n_placed_children >= placement_batch::CAPACITY as u32;
-                SiblingMode::Stack { axis, position, gap, batch }
-            }
-            ChildrenLayout::Wrap { axis, arrange, spacing, line_spacing } => SiblingMode::Wrap(WrapCursor {
-                axis, arrange, spacing, line_spacing, next_line: Some(first),
-                cross_position: inner_range(&frame, axis.other())[0],
-                cross_edges: [0.0; 2], main_position: 0.0, gap: 0.0,
-            }),
-            ChildrenLayout::Block => SiblingMode::Block(self.block_flow(parent)),
-            ChildrenLayout::Grid { spacing_x, spacing_y, .. } => SiblingMode::Grid { parent, spacing_x, spacing_y },
-        };
-        Siblings { next: Some(first), frame, partial, mode }
-    }
-
-    fn place_siblings<const PARTIAL: bool>(&mut self, siblings: &mut Siblings<Self::NodeId>) -> Option<Branch<Self::NodeId>> {
-        let Siblings { next, frame, mode, .. } = siblings;
-        match mode {
-            SiblingMode::Free => self.place_children_free::<PARTIAL>(next, frame),
-            SiblingMode::Block(flow) => self.place_children_block::<PARTIAL>(next, frame, flow),
-            SiblingMode::Wrap(line) => self.place_children_wrap::<PARTIAL>(next, frame, line),
-            SiblingMode::Grid { parent, spacing_x, spacing_y } =>
-                self.place_children_grid::<PARTIAL>(*parent, next, frame, *spacing_x, *spacing_y),
-            SiblingMode::Stack { axis, position, gap, batch } => {
-                if *batch {
-                    self.place_stack_items::<false, true>(next, frame, *axis, position, *gap)
-                } else {
-                    self.place_stack_items::<PARTIAL, false>(next, frame, *axis, position, *gap)
-                }
-            }
-        }
-    }
-
-    fn free_placement_parent(&self, node: Self::NodeId) -> Result<Self::NodeId, FreePlacementError> {
-        let root = self.root();
-        if node == root { return Err(FreePlacementError::Root); }
-        let parent = self.parent(node).ok_or(FreePlacementError::Detached)?;
-        let params = self.node_layout_params(node);
-        if params.disabled { return Err(FreePlacementError::Disabled); }
-
-        // Custom adapters can hide a subtree by disabling only its ancestor.
-        let mut ancestor = parent;
-        loop {
-            if self.node_layout_params(ancestor).disabled { return Err(FreePlacementError::Disabled); }
-            if ancestor == root { break; }
-            ancestor = self.parent(ancestor).ok_or(FreePlacementError::Detached)?;
-        }
-        if !params.free_placement && self.node_layout_params(parent).children_layout != ChildrenLayout::Free {
-            return Err(FreePlacementError::InFlow);
-        }
-        let mut next = Some(node);
-        while let Some(item) = next {
-            let visible = !self.node_layout_params(item).disabled;
-            if visible {
-                let flags = self.node_layout_data(item).flags;
-                if flags.check_state(X, Kind::Final) != SOLVED || flags.check_state(Y, Kind::Final) != SOLVED {
-                    return Err(FreePlacementError::Unsolved);
-                }
-            }
-            next = self.traversal_next(node, item, visible);
-        }
-        Ok(parent)
+        let mut target = NodeOutput::<_, _, false> { tree: self, snapper, fresh_placement: false };
+        placement_entry::children::<_, _, RustFloat, RustVec, 4, PARTIAL>(
+            &mut target, parent, first, [rect.x, rect.y], [origin.x, origin.y],
+        );
     }
 
     fn place_free_node(&mut self, node: Self::NodeId, parent_rect: XyRect) -> Result<(), FreePlacementError> {
-        let parent = self.free_placement_parent(node)?;
-        let snapper = self.layout_data().pixel_scale.map(Snapper::new);
-        let output = snapper.as_ref().map_or(parent_rect, |snapper| snap_rect(parent_rect, snapper));
-        let parent_origin = Xy::new(output.x[0], output.y[0]);
-        let (_, frame) = self.parent_frame(parent, parent_rect, parent_origin, snapper.as_ref());
-        let rect = self.free_child_rect(node, &frame, self.node_layout_data(node).size());
-        self.place::<false>(node, rect, frame.output_origin, frame.snapper);
-        #[cfg(feature = "incremental")]
-        self.node_layout_data_mut(node).mark_placement_changed();
-        Ok(())
+        let mut target = NodeOutput::<_, _, false> { tree: self, snapper: None::<Snapper>, fresh_placement: false };
+        placement_entry::free::<_, _, RustFloat, RustVec, 4>(&mut target, node, [parent_rect.x, parent_rect.y])
     }
 
     /// Place an appended leaf when the preceding stack items retain their sizes and
@@ -275,361 +586,9 @@ pub(crate) trait Place: Solve {
     fn place_appended_stack_leaf(&mut self, parent: Self::NodeId, child: Self::NodeId, parent_rect: XyRect,
         previous: Option<(Self::NodeId, XyRect)>) -> bool
     {
-        if self.layout_data().pixel_scale.is_some() || self.first_child(child).is_some() { return false; }
-        let origin = Xy::new(parent_rect.x[0], parent_rect.y[0]);
-        let (layout, frame) = self.parent_frame(parent, parent_rect, origin, None);
-        let ChildrenLayout::Stack { axis, arrange: Arrange::Start, spacing } = layout else { return false };
-        let params = self.node_layout_params(child);
-        if frame.flipped[axis] || params.disabled || params.free_placement { return false; }
-
-        let range = inner_range(&frame, axis);
-        let mut cursor = if let Some((sibling, rect)) = previous {
-            let sibling_params = self.node_layout_params(sibling);
-            if sibling_params.disabled || sibling_params.free_placement { return false; }
-            // Match place_in_line's addition order. Adding the gap to the cached
-            // trailing edge would round at a different step for fractional sizes.
-            let trailing = sibling_params.margin[axis][1].pixels();
-            stack_line::after_item(rect[axis][0], self.node_layout_data(sibling).size()[axis], trailing, spacing)
-        } else {
-            range[0]
-        };
-        let size = self.node_layout_data(child).size();
-        let rect = self.stack_item_rect(&frame, params, size, axis, &mut cursor, spacing);
-        self.publish_node::<false>(child, rect, origin, None);
-        true
-    }
-
-    #[inline(always)]
-    fn parent_frame<'a>(&self, i: Self::NodeId, rect: XyRect, output_origin: Xy<f32>, snapper: Option<&'a Snapper>) -> (ChildrenLayout, ParentFrame<'a>) {
-        let params = self.node_layout_params(i);
-        (params.children_layout, ParentFrame {
-            rect,
-            output_origin,
-            padding: params.padding,
-            flipped: params.children_origin_flipped,
-            snapper,
-        })
-    }
-
-    fn stack_start(&self, first: Self::NodeId, frame: &ParentFrame, main: Axis, arrange: Arrange, spacing: f32) -> (f32, f32) {
-        let (total_size, n) = if arrange == Arrange::Start {
-            (0.0, 0)
-        } else {
-            let mut n: u32 = 0;
-            let mut children_size = 0.0;
-            for_each_layout_child!(@from self, Some(first), child, {
-                if ! self.node_layout_params(child).free_placement {
-                    let [start, end] = margins(self.node_layout_params(child), main);
-                    children_size += with_margin(self.node_layout_data(child).size()[main], start + end);
-                    n = crate::solve::cycle_rules::add_count(n, 1);
-                }
-            });
-            let total = if n > 0 { children_size + spacing * (n - 1) as f32 } else { children_size };
-            (total, n)
-        };
-        line_start_and_gap(arrange, inner_range(frame, main), total_size, n, spacing)
-    }
-
-    fn place_stack_items<const PARTIAL: bool, const BATCH: bool>(&mut self, next: &mut Option<Self::NodeId>, frame: &ParentFrame, main: Axis, position: &mut f32, gap: f32) -> Option<Branch<Self::NodeId>> {
-        let cross = main.other();
-        let cross_start = inner_range(frame, cross)[0];
-        let forward = !frame.flipped.x && !frame.flipped.y;
-        let first = (*next)?;
-        // The cursor still advances in sibling order. Only rounding and output
-        // for leaf runs can be deferred, since adapter callbacks keep inputs stable.
-        let mut batch = if BATCH { frame.snapper.map(|snapper| LeafBatch::new(first, snapper)) } else { None };
-        #[cfg(feature = "incremental")]
-        // The owned tree supplies prepared styles. Adapters without retained
-        // output can skip checking for them in the sibling loop.
-        let use_prepared_styles = !PARTIAL && forward && self.retains_output_rects();
-        walk_siblings!(; (*next, child); {
-            let child_data = self.node_layout_data(child);
-            #[cfg(feature = "incremental")]
-            let cached = use_prepared_styles && child_data.cached_stack_start();
-            #[cfg(not(feature = "incremental"))]
-            let cached = false;
-            let params = (!cached).then(|| self.node_layout_params(child));
-        }; self.next_sibling(child); params.is_some_and(|p| p.disabled); {
-            let child_size = child_data.size();
-            let rect = match params {
-                Some(p) if p.free_placement => {
-                    if let Some(batch) = &mut batch { batch.flush(self, frame); }
-                    self.free_child_rect(child, frame, child_size)
-                }
-                _ => {
-                    let rect = match params {
-                        Some(p) if !forward || p.position[cross] != Pos::Start
-                            || p.margin != Xy::new_symm([Margin::ZERO; 2]) =>
-                            self.stack_item_rect(frame, p, child_size, main, position, gap),
-                        _ => {
-                            let [x, y] = stack_line::place_start(position, cross_start, main == X, [child_size.x, child_size.y], gap);
-                            Xy::new(x, y)
-                        }
-                    };
-                    if let Some(batch) = &mut batch {
-                        if self.first_child(child).is_none() {
-                            #[cfg(feature = "incremental")]
-                            let dirty = child_data.placement != PlacementWork::Clean;
-                            #[cfg(not(feature = "incremental"))]
-                            let dirty = false;
-                            batch.push(self, frame, child, rect, dirty);
-                            continue;
-                        }
-                        batch.flush(self, frame);
-                    }
-                    rect
-                }
-            };
-            if let Some(branch) = self.publish_node::<PARTIAL>(child, rect, frame.output_origin, frame.snapper) {
-                return Some(branch);
-            }
-        });
-        if let Some(batch) = &mut batch { batch.flush(self, frame); }
-        None
-    }
-
-    #[inline(always)]
-    fn stack_item_rect(&self, frame: &ParentFrame, params: &LayoutParams, size: Xy<f32>, main: Axis, cursor: &mut f32, gap: f32) -> XyRect {
-        let cross = main.other();
-        let mut rect = Xy::new_symm([0.0; 2]);
-        rect[cross] = self.resolve_pos_on_axis(frame, params, cross, size[cross], margins(params, cross));
-        rect[main] = place_in_line(frame, main, inner_range(frame, main), cursor, size[main], margins(params, main), gap);
-        rect
-    }
-
-    fn place_children_wrap<const PARTIAL: bool>(&mut self, next: &mut Option<Self::NodeId>, frame: &ParentFrame, cursor: &mut WrapCursor<Self::NodeId>) -> Option<Branch<Self::NodeId>> {
-        let axis = cursor.axis;
-        let cross = axis.other();
-        let main_range = inner_range(frame, axis);
-        let cross_range = inner_range(frame, cross);
-        while let Some(child) = *next {
-            if cursor.next_line == Some(child) {
-                let line = self.wrap_line::<true>(*next, axis, None, cursor.spacing);
-                (cursor.main_position, cursor.gap) = line_start_and_gap(cursor.arrange, main_range, line.main, line.count, cursor.spacing);
-                cursor.cross_edges = place_in_line(frame, cross, cross_range, &mut cursor.cross_position, line.cross, [0.0; 2], cursor.line_spacing);
-                cursor.next_line = line.next;
-            }
-            *next = self.next_sibling(child);
-            let params = self.node_layout_params(child);
-            if params.disabled { continue; }
-            let size = self.node_layout_data(child).size();
-            let rect = if params.free_placement {
-                self.free_child_rect(child, frame, size)
-            } else {
-                let mut line_frame = *frame;
-                line_frame.rect[cross] = cursor.cross_edges;
-                line_frame.padding[cross] = [0.0; 2];
-                let mut rect = Xy::new_symm([0.0; 2]);
-                rect[axis] = place_in_line(frame, axis, main_range, &mut cursor.main_position, size[axis], margins(params, axis), cursor.gap);
-                rect[cross] = self.resolve_pos_on_axis(&line_frame, params, cross, size[cross], margins(params, cross));
-                rect
-            };
-            if let Some(branch) = self.publish_node::<PARTIAL>(child, rect, frame.output_origin, frame.snapper) {
-                return Some(branch);
-            }
-        }
-        None
-    }
-
-    fn place_children_block<const PARTIAL: bool>(&mut self, next: &mut Option<Self::NodeId>, frame: &ParentFrame, flow: &mut BlockFlow) -> Option<Branch<Self::NodeId>> {
-        let [left, right] = inner_range(frame, X);
-        let [top, _] = inner_range(frame, Y);
-        walk_siblings!(; (*next, child); {}; self.next_sibling(child); self.node_layout_params(child).disabled; {
-            let params = self.node_layout_params(child);
-            let size = self.node_layout_data(child).size();
-            let rect = if params.free_placement {
-                self.free_child_rect(child, frame, size)
-            } else {
-                let [inline_left, inline_right] = params.margin.x;
-                let spare = (right - left - size.x - inline_left.pixels() - inline_right.pixels()).max(0.0);
-                let auto_count = usize::from(inline_left == Margin::AUTO) + usize::from(inline_right == Margin::AUTO);
-                let leading = if frame.flipped.x { inline_right } else { inline_left };
-                let leading = if leading == Margin::AUTO { spare / auto_count as f32 } else { leading.pixels() };
-                let inline = if frame.flipped.x {
-                    let end = right - leading;
-                    [end - size.x, end]
-                } else {
-                    let start = left + leading;
-                    [start, start + size.x]
-                };
-                let y = top + flow.push(self.block_item(child));
-                Xy::new(inline, [y, y + size.y])
-            };
-            if let Some(branch) = self.publish_node::<PARTIAL>(child, rect, frame.output_origin, frame.snapper) {
-                return Some(branch);
-            }
-        });
-        None
-    }
-
-    fn place_children_grid<const PARTIAL: bool>(&mut self, i: Self::NodeId, next: &mut Option<Self::NodeId>, frame: &ParentFrame, spacing_x: f32, spacing_y: f32) -> Option<Branch<Self::NodeId>> {
-        let lines = self.node_layout_data(i).grid_lines();
-
-        let spacing = Xy::new(spacing_x, spacing_y);
-        let size = self.node_layout_data(i).size();
-        let mut cell = Xy::new(0.0, 0.0);
-        for axis in [X, Y] {
-            let n = lines[axis];
-            let [pad_start, pad_end] = frame.padding[axis];
-            cell[axis] = ((size[axis] - pad_start - pad_end - spacing[axis] * (n - 1.0)) / n.max(1.0)).max(0.0);
-        }
-
-        let [left, _] = inner_range(frame, X);
-        let [top, _] = inner_range(frame, Y);
-        let step = Xy::new(cell.x + spacing_x, cell.y + spacing_y);
-        let forward = !frame.flipped.x && !frame.flipped.y;
-        walk_siblings!(; (*next, child); {}; self.next_sibling(child); self.node_layout_params(child).disabled; {
-            let child_size = self.node_layout_data(child).size();
-            let params = self.node_layout_params(child);
-            let rect = if params.free_placement {
-                self.free_child_rect(child, frame, child_size)
-            } else {
-                let child_cell = self.node_layout_data(child).grid_cell();
-                if forward && params.position == Xy::new_symm(Pos::Start)
-                    && params.margin == Xy::new_symm([Margin::ZERO; 2])
-                {
-                    grid_start_rect(Xy::new(left, top), step, child_cell, child_size)
-                } else {
-                    let span = params.grid_span;
-                    // The child is positioned inside the rect of its cells, as if the cells were its parent.
-                    let mut cell_frame = ParentFrame { rect: Xy::new_symm([0.0; 2]), padding: Xy::new_symm([0.0; 2]), ..*frame };
-                    for axis in [X, Y] {
-                        let span = f32::from(span[axis].max(1)).min(lines[axis].max(1.0));
-                        let offset = child_cell[axis] * (cell[axis] + spacing[axis]);
-                        let length = span * cell[axis] + (span - 1.0) * spacing[axis];
-                        cell_frame.rect[axis] = if ! frame.flipped[axis] {
-                            let start = frame.rect[axis][0] + frame.padding[axis][0] + offset;
-                            [start, start + length]
-                        } else {
-                            let end = frame.rect[axis][1] - frame.padding[axis][1] - offset;
-                            [end - length, end]
-                        };
-                    }
-                    let mut child_rect = Xy::new([0.0, 0.0], [0.0, 0.0]);
-                    for axis in [X, Y] {
-                        child_rect[axis] = self.resolve_pos_on_axis(&cell_frame, params, axis, child_size[axis], margins(params, axis));
-                    }
-                    child_rect
-                }
-            };
-            if let Some(branch) = self.publish_node::<PARTIAL>(child, rect, frame.output_origin, frame.snapper) {
-                return Some(branch);
-            }
-        });
-        None
-    }
-
-    #[inline(always)]
-    fn resolve_pos_on_axis(&self, frame: &ParentFrame, params: &LayoutParams, axis: Axis, child_size: f32, margin: [f32; 2]) -> [f32; 2] {
-        let [inner_start, inner_end] = inner_range(frame, axis);
-        let inner_start = with_margin(inner_start, margin[0]);
-        let inner_end = with_margin(inner_end, -margin[1]);
-        let flipped = frame.flipped[axis];
-
-        let place_at = |reference: f32| {
-            let anchor_frac = anchor_frac(params.anchor[axis]);
-            if ! flipped {
-                let low = reference - anchor_frac * child_size;
-                [low, low + child_size]
-            } else {
-                let high = reference + anchor_frac * child_size;
-                [high - child_size, high]
-            }
-        };
-
-        let origin_edge = if ! flipped { inner_start } else { inner_end };
-        let far_edge = if ! flipped { inner_end } else { inner_start };
-
-        match params.position[axis] {
-            Pos::Start => {
-                if ! flipped { [origin_edge, origin_edge + child_size] } else { [origin_edge - child_size, origin_edge] }
-            }
-            Pos::End => {
-                if ! flipped { [far_edge - child_size, far_edge] } else { [far_edge, far_edge + child_size] }
-            }
-            Pos::Pixels(pixels) => place_at(if ! flipped { origin_edge + pixels } else { origin_edge - pixels }),
-            Pos::Frac(frac) => {
-                let static_pos = frac * (inner_end - inner_start);
-                place_at(if ! flipped { origin_edge + static_pos } else { origin_edge - static_pos })
-            }
-            Pos::Center => centered_range(inner_start, inner_end, child_size),
-        }
-    }
-
-    #[inline(always)]
-    fn free_child_rect(&mut self, child: Self::NodeId, frame: &ParentFrame, child_size: Xy<f32>) -> XyRect {
-        let params = self.node_layout_params(child);
-        if params.position == Xy::new_symm(Pos::Center) && params.window_overflow == Xy::new_symm(WindowOverflow::Ignore) {
-            // Keeping both axes together lets the compiler vectorize the centered arithmetic.
-            Xy::new(
-                centered_range(frame.rect.x[0] + frame.padding.x[0], frame.rect.x[1] - frame.padding.x[1], child_size.x),
-                centered_range(frame.rect.y[0] + frame.padding.y[0], frame.rect.y[1] - frame.padding.y[1], child_size.y),
-            )
-        } else {
-            let overflow = params.window_overflow;
-            let anchors = params.anchor;
-            let mut rect = Xy::new(
-                self.resolve_pos_on_axis(frame, params, X, child_size.x, [0.0; 2]),
-                self.resolve_pos_on_axis(frame, params, Y, child_size.y, [0.0; 2]),
-            );
-            for axis in [X, Y] {
-                if overflow[axis] != WindowOverflow::Ignore {
-                    let window_size = self.layout_data().window_size[axis];
-                    rect[axis] = self.apply_window_overflow(window_size, overflow[axis], frame.flipped[axis], anchors[axis], rect[axis]);
-                }
-            }
-            rect
-        }
-    }
-
-    fn apply_window_overflow(&self, win_high: f32, behavior: WindowOverflow, flipped: bool, anchor: Anchor, rect: [f32; 2]) -> [f32; 2] {
-        let win_low = 0.0;
-        let [lo, hi] = rect;
-        let size = hi - lo;
-
-        // If the node is larger than the window, just give up.
-        if size >= (win_high - win_low) {
-            return [win_low, win_low + size];
-        }
-
-        let mut out = rect;
-        if behavior == WindowOverflow::Flip {
-            // The anchor point (in absolute coords) is the point that should stay fixed, e.g. the cursor.
-            let anchor_frac = anchor_frac(anchor);
-            let a = if ! flipped { lo + anchor_frac * size } else { hi - anchor_frac * size };
-
-            let reflected = [2.0 * a - hi, 2.0 * a - lo];
-            let should_reflect = hi > win_high && reflected[0] >= win_low || lo < win_low && reflected[1] <= win_high;
-            if should_reflect {
-                out = reflected;
-            }
-        }
-
-        // Clamp (also the fallback when a flip wouldn't fit either).
-        let [mut lo, mut hi] = out;
-        let size = hi - lo;
-        if hi > win_high {
-            hi = win_high;
-            lo = hi - size;
-        }
-        if lo < win_low {
-            lo = win_low;
-            hi = lo + size;
-        }
-        [lo, hi]
-    }
-
-    fn place_children_free<const PARTIAL: bool>(&mut self, next: &mut Option<Self::NodeId>, frame: &ParentFrame) -> Option<Branch<Self::NodeId>> {
-        walk_siblings!(; (*next, child); {}; self.next_sibling(child); self.node_layout_params(child).disabled; {
-            #[cfg(feature = "incremental")]
-            if PARTIAL && !self.node_layout_data(child).placement.visits(false) { continue; }
-            let child_size = self.node_layout_data(child).size();
-            let rect = self.free_child_rect(child, frame, child_size);
-            if let Some(branch) = self.publish_node::<PARTIAL>(child, rect, frame.output_origin, frame.snapper) {
-                return Some(branch);
-            }
-        });
-        None
+        let previous = previous.map(|(id, rect)| (id, [rect.x, rect.y]));
+        let mut target = NodeOutput::<_, _, false> { tree: self, snapper: None::<&Snapper>, fresh_placement: false };
+        placement_entry::append::<_, _, RustFloat>(&mut target, parent, child, [parent_rect.x, parent_rect.y], previous)
     }
 }
 
@@ -655,12 +614,14 @@ fn grid_start_rect(origin: Xy<f32>, step: Xy<f32>, cell: Xy<f32>, size: Xy<f32>)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let x = (origin.x + cell.x * step.x) + 0.0;
-        let y = (origin.y + cell.y * step.y) + 0.0;
-        Xy::new([x, x + size.x], [y, y + size.y])
+        Xy::new(
+            geometry::grid_start_edges(origin.x, step.x, cell.x, size.x),
+            geometry::grid_start_edges(origin.y, step.y, cell.y, size.y),
+        )
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn snap_rect(rect: XyRect, snapper: &Snapper) -> XyRect {
     let [left, right, top, bottom] = snapper.snap([rect.x[0], rect.x[1], rect.y[0], rect.y[1]]);
@@ -671,56 +632,6 @@ fn snap_rect(rect: XyRect, snapper: &Snapper) -> XyRect {
 mod pixel_grid;
 use pixel_grid::Snapper;
 
-
-#[inline]
-fn inner_range(frame: &ParentFrame, axis: Axis) -> [f32; 2] {
-    let [start, end] = frame.rect[axis];
-    let [pad_start, pad_end] = frame.padding[axis];
-    [start + pad_start, end - pad_end]
-}
-
-fn line_start_and_gap(arrange: Arrange, [start, end]: [f32; 2], total: f32, n: u32, spacing: f32) -> (f32, f32) {
-    let free = ((end - start) - total).max(0.0);
-    match arrange {
-        Arrange::Start => (start, spacing),
-        Arrange::End => (end - total, spacing),
-        Arrange::Center => ((start + end) / 2.0 - total / 2.0, spacing),
-        Arrange::SpaceBetween => {
-            let extra = if n > 1 { free / (n - 1) as f32 } else { 0.0 };
-            (start, spacing + extra)
-        }
-        Arrange::SpaceAround => {
-            let extra = if n > 0 { free / n as f32 } else { 0.0 };
-            (start + extra / 2.0, spacing + extra)
-        }
-        Arrange::SpaceEvenly => {
-            let extra = if n > 0 { free / stack_line::evenly_spaced_gaps(n) as f32 } else { 0.0 };
-            (start + extra, spacing + extra)
-        }
-    }
-}
-
-#[inline]
-fn place_in_line(frame: &ParentFrame, axis: Axis, range: [f32; 2], cursor: &mut f32, size: f32, margin: [f32; 2], gap: f32) -> [f32; 2] {
-    stack_line::place(cursor, frame.flipped[axis], range, size, margin, gap)
-}
-
-#[inline(always)]
-fn centered_range(start: f32, end: f32, size: f32) -> [f32; 2] {
-    let center = (start + end) / 2.0;
-    [center - size / 2.0, center + size / 2.0]
-}
-
-/// The anchor point of a node, as a fraction of its size from its origin-side edge.
-#[inline(always)]
-fn anchor_frac(anchor: Anchor) -> f32 {
-    match anchor {
-        Anchor::Start => 0.0,
-        Anchor::Center => 0.5,
-        Anchor::End => 1.0,
-        Anchor::Frac(f) => f,
-    }
-}
 
 #[cfg(test)]
 #[path = "placement_depth_tests.rs"]
@@ -734,8 +645,7 @@ mod tests {
     fn grid_start_rect_preserves_scalar_coordinates() {
         #[inline(never)]
         fn reference(origin: f32, step: f32, cell: f32, size: f32) -> [f32; 2] {
-            let start = (origin + cell * step) + 0.0;
-            [start, start + size]
+            geometry::grid_start_edges(origin, step, cell, size)
         }
 
         let coordinates = [
@@ -767,7 +677,9 @@ mod tests {
         // counts that would round down if converted before adding the extra gap.
         for count in [16_777_217, u32::MAX - 1, u32::MAX] {
             let expected = 4_294_967_296.0 / (u64::from(count) + 1) as f32;
-            let (start, gap) = line_start_and_gap(Arrange::SpaceEvenly, [0.0, 4_294_967_296.0], 0.0, count, 0.0);
+            let (start, gap) = geometry::line_start_and_gap::<RustFloat>(
+                Arrange::SpaceEvenly, [0.0, 4_294_967_296.0], 0.0, count, 0.0,
+            );
             assert_eq!((start, gap), (expected, expected));
         }
     }
@@ -778,12 +690,8 @@ mod tests {
         // gap still advance the cursor together by one representable coordinate.
         let start = (1_u32 << 24) as f32;
         let range = [start, start + 8.0];
-        let frame = ParentFrame {
-            rect: Xy::new_symm(range), padding: Xy::new_symm([0.0; 2]),
-            output_origin: Xy::new_symm(start), flipped: Xy::new_symm(false), snapper: None,
-        };
         let mut cursor = start;
-        let first = place_in_line(&frame, X, range, &mut cursor, 1.0, [0.0; 2], 1.0);
+        let first = stack_line::place(&mut cursor, false, range, 1.0, [0.0; 2], 1.0);
         assert_eq!(first, [start; 2]);
         assert_eq!(cursor, start + 2.0);
         assert_eq!(stack_line::after_item(first[0], 1.0, 0.0, 1.0), cursor);

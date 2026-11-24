@@ -8,6 +8,7 @@ use vstd::prelude::*;
 // Expand the complete sibling loop at its call site so LLVM can optimize the
 // placement body together with the traversal. The bounded form can stop before
 // advancing past a wrapping-line boundary.
+#[cfg(verus_keep_ghost)]
 macro_rules! walk_siblings {
     ($(#[$attr:meta])* ; ($cursor:expr, $id:ident); { $($before:tt)* }; $following:expr; $disabled:expr; $body:block) => {
         $(#[$attr])*

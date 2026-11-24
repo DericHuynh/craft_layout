@@ -2,7 +2,7 @@
 use vstd::prelude::*;
 
 #[path = "../src/placement_batch.rs"]
-mod kernel;
+pub(crate) mod kernel;
 use kernel::{Buffer, CAPACITY, Run};
 
 verus! {
@@ -23,6 +23,11 @@ pub proof fn empty_mask()
 
 pub open spec fn rows<I,E>(buffer: Buffer<I,E>, run: Run) -> Seq<(I,E,bool)> {
     Seq::new(run.len as nat, |n: int| (buffer.ids[n], buffer.edges[n], marked(run.dirty, n as usize)))
+}
+
+pub open spec fn published_rows<I,E>(ids: Seq<I>, snapped: Seq<E>, mask: u8, origin: [f32; 2])
+    -> Seq<(I,E,bool,[f32; 2])> {
+    Seq::new(ids.len(), |i: int| (ids[i], snapped[i], marked(mask, i as usize), origin))
 }
 
 // A boundary flushes the preceding leaf run before the next callback.
@@ -73,45 +78,6 @@ fn ordered_batches<I: Copy, E: Copy>(
     }
     let last = buffer.drain();
     Ghost(published + rows(buffer, last))
-}
-
-// Read the same two prefixes and consume the dirty mask as the publisher does.
-// `edges` may already hold the snapped coordinates for this run.
-fn visit_ready_rows<I: Copy, E: Copy>(
-    ids: &[I; CAPACITY], edges: &mut [E; CAPACITY], run: Run,
-) -> (emitted: Ghost<Seq<(I,E,bool)>>)
-    requires run.len <= CAPACITY,
-    ensures emitted@.len() == run.len,
-        forall |j: int| 0 <= j < run.len ==> #[trigger] emitted@[j]
-            == (ids[j], old(edges)[j], marked(run.dirty, j as usize)),
-{
-    let ids = run.ids(ids);
-    let edges = run.edges(edges);
-    let mask = run.dirty;
-    let mut rest = mask;
-    let mut i = 0;
-    let ghost mut out = Seq::<(I,E,bool)>::empty();
-    assert(mask >> 0usize == mask) by(bit_vector);
-    while i < ids.len()
-        invariant i <= run.len <= CAPACITY, out.len() == i,
-            ids.len() == run.len, edges.len() == run.len,
-            mask == run.dirty, rest == mask >> i,
-            forall |j: int| 0 <= j < i ==> #[trigger] out[j] == (ids[j], edges[j], marked(run.dirty, j as usize)),
-        decreases run.len - i,
-    {
-        let id = ids[i];
-        let edge = edges[i];
-        let dirty = kernel::pop_dirty(&mut rest);
-        proof {
-
-            assert(marked(mask >> i, 0) == marked(mask, i)) by(bit_vector);
-            assert(dirty == marked(mask, i));
-            assert(((mask >> i) >> 1u8) == (mask >> (i+1) as usize)) by(bit_vector) requires i < 8;
-            out = out.push((id, edge, dirty));
-        }
-        i += 1;
-    }
-    Ghost(out)
 }
 
 }

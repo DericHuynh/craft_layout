@@ -3,7 +3,9 @@ use vstd::prelude::*;
 
 #[path = "../src/pixel_grid/dispatch.rs"]
 mod dispatch;
-use dispatch::{Backend, Features, entry_for, for_build, select_for_build};
+#[path = "../src/pixel_grid/scalar_rounding.rs"]
+mod scalar_rounding;
+use dispatch::{Backend, Build, Features, Renderer, Selected, for_build, lane_results, same_snapped_words};
 
 verus! {
 
@@ -74,9 +76,43 @@ fn selected_entry_is_usable(
         (entry is Sse2PowerOfTwo) == (!unit_scale && power_of_two && x86_64 && reported.sse2),
         !((unit_scale || power_of_two) && x86_64 && reported.sse2) ==>
             for_build(reported, x86_64, has_avx512_entry, has_fma_entry).priority(entry),
+    no_unwind
 {
-    let selection = select_for_build(reported, x86_64, has_avx512_entry, has_fma_entry, unit_scale, power_of_two);
-    entry_for(selection)
+    let selection = Selected::prepare(reported, x86_64, has_avx512_entry, has_fma_entry, unit_scale, power_of_two);
+    let available = for_build(reported, x86_64, has_avx512_entry, has_fma_entry);
+    selection.entry(available)
+}
+
+/// Composition through the production build gates. The reported features are
+/// the only information taken from the execution environment.
+fn platform_entry_is_usable(
+    reported: Features, build: Build, unit_scale: bool, power_of_two: bool, Ghost(hardware): Ghost<Capabilities>,
+) -> (entry: Backend)
+    requires hardware.reports_sound(reported),
+    ensures hardware.permits(entry), !build.x86_64 ==> entry is Scalar,
+    no_unwind
+{
+    let selected = Selected::configure(reported, build, unit_scale, power_of_two);
+    let available = for_build(reported, build.x86_64, build.avx512_entry(), build.fma_entry());
+    selected.entry(available)
+}
+
+/// A selected batch kernel computes the same four words per rectangle as the
+/// single-rectangle route, including the tail and every non-vector backend.
+fn scalar_and_batch_publish_equal_words<R: Renderer>(
+    selected: Selected, renderer: &R, batch: &mut [[f32; 4]], index: usize, scale: R::Scale,
+) -> (single: [f32; 4])
+    requires selected.admitted(renderer.features()), index < old(batch).len(),
+    ensures same_snapped_words(renderer, single, final(batch)@[index as int]),
+    no_unwind
+{
+    let input = batch[index];
+    let single = selected.snap(renderer, input, scale);
+    selected.snap_many(renderer, batch, scale);
+    proof! {
+        assert(lane_results(renderer, selected.choice(), input, batch@[index as int], scale));
+    }
+    single
 }
 
 }

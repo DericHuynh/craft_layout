@@ -1,39 +1,17 @@
 #[path = "pixel_grid/dispatch.rs"]
 mod dispatch;
+#[path = "pixel_grid/scalar_rounding.rs"]
+mod scalar_rounding;
 #[cfg(target_arch = "x86_64")]
 #[path = "pixel_grid/vector.rs"]
 mod vector;
 
-#[derive(Clone, Copy)]
-pub(crate) struct Scale {
-    factor: f64,
-    inverse: f64,
-    #[cfg(target_arch = "x86_64")]
-    factor_f32: f32,
-    #[cfg(target_arch = "x86_64")]
-    inverse_f32: f32,
-}
-
-impl Scale {
-    #[inline]
-    pub(crate) fn new(scale: f32) -> Self {
-        let factor = f64::from(scale);
-        let inverse = 1.0 / factor;
-        Self {
-            factor,
-            inverse,
-            #[cfg(target_arch = "x86_64")]
-            factor_f32: scale,
-            #[cfg(target_arch = "x86_64")]
-            inverse_f32: inverse as f32,
-        }
-    }
-}
+pub(crate) use scalar_rounding::Scale;
 
 // Require both the factor and reciprocal to be normal binary32 powers of two.
+#[cfg(test)]
 fn supports_packed_power_of_two(scale: f32) -> bool {
-    let bits = scale.to_bits();
-    (0x0080_0000..=0x7e80_0000).contains(&bits) && bits & 0x007f_ffff == 0
+    scalar_rounding::supports_packed_power_of_two(scale.to_bits())
 }
 
 /// The factor, inverse, and backend prepared once for this placement pass.
@@ -44,60 +22,97 @@ pub(crate) struct Snapper {
 
 impl Snapper {
     pub(crate) fn new(scale: f32) -> Self {
-        Self {
-            scale: Scale::new(scale),
-            selected: dispatch::Selected::detect(scale == 1.0, supports_packed_power_of_two(scale)),
-        }
+        let (scale, unit, power_of_two) = scalar_rounding::prepare_scale(scale, scale.to_bits());
+        Self { scale, selected: dispatch::Selected::detect(unit, power_of_two) }
     }
 
     #[inline]
     pub(crate) fn snap(&self, edges: [f32; 4]) -> [f32; 4] {
-        self.selected.snap(edges, self.scale)
+        self.selected.snap(&NativeRenderer, edges, self.scale)
     }
 
     #[inline]
     pub(crate) fn prefers_batch(&self) -> bool {
-        self.selected.prefers_batch()
+        self.selected.prefers_batch(cfg!(target_feature = "avx2"), cfg!(target_feature = "avx512f"))
     }
 
     #[inline]
     pub(crate) fn snap_many(&self, rects: &mut [[f32; 4]]) {
-        self.selected.snap_many(rects, self.scale);
+        self.selected.snap_many(&NativeRenderer, rects, self.scale);
     }
 }
 
 #[inline]
 fn scalar(edges: [f32; 4], scale: Scale) -> [f32; 4] {
-    edges.map(|edge| snap_edge(edge, scale))
+    scalar_rounding::snap_rect::<scalar_rounding::RustRound>(
+        edges, scale, cfg!(all(target_arch = "x86_64", not(target_feature = "sse4.1"))),
+    )
 }
 
 #[inline]
+#[allow(dead_code)] // Compiled directly by the native IEEE rounding proof.
 pub(crate) fn snap_edge(edge: f32, scale: Scale) -> f32 {
-    let scaled = f64::from(edge) * scale.factor;
-    let rounded = if cfg!(all(target_arch = "x86_64", not(target_feature = "sse4.1"))) {
-        // Baseline SSE2 has no packed round instruction. The product of two f32s has
-        // at most 48 significant bits, so at 2^47 and above it is already integral.
-        let magnitude = scaled.abs();
-        const INTEGRAL_LIMIT: f64 = (1_u64 << 47) as f64;
-        const UNIT_SPACING: f64 = (1_u64 << 52) as f64;
-        // Below that limit, adding 2^52 rounds to the nearest integer. Bias upwards
-        // by at most two f64 ULPs so half-integers round away from zero. The five
-        // spare significand bits ensure this cannot round a non-tie across a boundary.
-        let biased = magnitude * (1.0 + f64::EPSILON);
-        let nearest = (biased + UNIT_SPACING) - UNIT_SPACING;
-        let rounded = if magnitude < INTEGRAL_LIMIT { nearest } else { magnitude };
-        rounded.copysign(scaled)
-    } else {
-        scaled.round()
+    scalar_rounding::snap_edge::<scalar_rounding::RustRound>(
+        edge, scale.factor, scale.inverse,
+        cfg!(all(target_arch = "x86_64", not(target_feature = "sse4.1"))),
+    )
+}
+
+struct NativeRenderer;
+
+impl dispatch::RendererModel for NativeRenderer {
+    type Scale = Scale;
+}
+
+macro_rules! native_entry {
+    ($entry:ident, $available:meta) => {
+        #[inline]
+        fn $entry(&self, edges: [f32; 4], scale: Scale) -> [f32; 4] {
+            #[cfg($available)]
+            {
+                // SAFETY: only the checked selector calls this method, after
+                // testing the entry's CPU and OS requirements.
+                unsafe { vector::$entry(edges, scale) }
+            }
+            #[cfg(not($available))]
+            { scalar(edges, scale) }
+        }
     };
-    // Binary32 inputs leave enough distance from each binary32 rounding
-    // boundary for the binary64 reciprocal and multiply errors.
-    (rounded * scale.inverse) as f32
+}
+
+macro_rules! native_batch {
+    ($entry:ident, $available:meta) => {
+        #[inline]
+        fn $entry(&self, rects: &mut [[f32; 4]], scale: Scale) {
+            #[cfg($available)]
+            {
+                // SAFETY: the batch has the same CPU and OS requirements as
+                // the corresponding single-rectangle entry.
+                unsafe { vector::$entry(rects, scale) }
+            }
+            #[cfg(not($available))]
+            for rect in rects { *rect = scalar(*rect, scale); }
+        }
+    };
+}
+
+impl dispatch::Renderer for NativeRenderer {
+    #[inline]
+    fn scalar(&self, edges: [f32; 4], scale: Scale) -> [f32; 4] { scalar(edges, scale) }
+
+    native_entry!(sse2_unit, target_arch = "x86_64");
+    native_entry!(sse2_power_of_two, target_arch = "x86_64");
+    native_entry!(sse2_scaled, target_arch = "x86_64");
+    native_entry!(avx2, target_arch = "x86_64");
+    native_entry!(avx2_fma, all(target_arch = "x86_64", any(test, all(target_feature = "avx2", target_feature = "fma"))));
+    native_entry!(avx512, all(target_arch = "x86_64", keru_avx512));
+    native_batch!(avx2_many, target_arch = "x86_64");
+    native_batch!(avx512_many, all(target_arch = "x86_64", keru_avx512));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Scale, dispatch::{Backend, Features, Selected, select_for_build}, supports_packed_power_of_two};
+    use super::{NativeRenderer, Scale, dispatch::{Backend, Features, Selected, select_for_build}, supports_packed_power_of_two};
     use rand::{Rng, SeedableRng};
 
     #[test]
@@ -149,9 +164,9 @@ mod tests {
                 }
                 for len in 0..=edges.len() {
                     let mut batch = edges;
-                    selected.snap_many(&mut batch[..len], params);
+                    selected.snap_many(&NativeRenderer, &mut batch[..len], params);
                     for (index, (input, output)) in edges.into_iter().zip(batch).enumerate() {
-                        let expected = if index < len { selected.snap(input, params) } else { input };
+                        let expected = if index < len { selected.snap(&NativeRenderer, input, params) } else { input };
                         for (actual, expected) in output.into_iter().zip(expected) {
                             assert!(
                                 actual.to_bits() == expected.to_bits() || actual.is_nan() && expected.is_nan(),
@@ -178,7 +193,7 @@ mod tests {
                     let scale = f64::from(scale);
                     ((f64::from(edge) * scale).round() / scale) as f32
                 });
-                for (expected, actual) in expected.into_iter().zip(selected.snap(edges, Scale::new(scale))) {
+                for (expected, actual) in expected.into_iter().zip(selected.snap(&NativeRenderer, edges, Scale::new(scale))) {
                     if expected.is_nan() {
                         assert!(actual.is_nan(), "{backend:?}");
                     } else {

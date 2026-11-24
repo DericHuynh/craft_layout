@@ -91,14 +91,14 @@ fn rounded_stack_and_grid_keep_preorder_and_parent_local_bits() {
         params.size = Xy::new(Size::Pixels(2.4 + node as f32 * 0.025), Size::Pixels(3.25));
         params.position = Xy::new_symm(Pos::Start);
     }
-    tree.params[2].disabled = true;
+    tree.params[4].disabled = true;
     tree.params[6].grid_span = Xy::new(3, 2);
     tree.params[12].free_placement = true;
     tree.params[17].children_layout = ChildrenLayout::Stack { axis: Axis::Y, arrange: Arrange::Start, spacing: 0.0 };
     tree.params[17].padding.x[0] = 0.225;
     let window = Xy::new(120.0, 10.0);
     let scale = 1.25_f64;
-    let expected_order: Vec<_> = (0..BRANCH_CHILD).filter(|&node| node != 2)
+    let expected_order: Vec<_> = (0..BRANCH_CHILD).filter(|&node| node != 4)
         .flat_map(|node| [Some(node), (node == 17).then_some(BRANCH_CHILD)].into_iter().flatten())
         .collect();
     let snap = |edge: f32| ((f64::from(edge) * scale).round() / scale) as f32;
@@ -114,7 +114,20 @@ fn rounded_stack_and_grid_keep_preorder_and_parent_local_bits() {
         rounded.solve_layout(window);
         assert_eq!(raw_tree.write_order, expected_order);
         assert_eq!(rounded.write_order, expected_order);
-        assert!(rounded.output[2].is_none());
+        assert!(rounded.output[4].is_none());
+        if matches!(mode, ChildrenLayout::Stack { .. }) {
+            let mut general = tree.clone();
+            // This resolves to zero after bypassing the plain Start prefix.
+            general.params[1].margin.x[1] = Margin::AUTO;
+            general.solve_layout(window);
+            assert_eq!(general.write_order, expected_order);
+            for &node in &expected_order {
+                let (absolute, local) = raw_tree.output[node].unwrap();
+                let (general_absolute, general_local) = general.output[node].unwrap();
+                assert_eq!(bits(absolute), bits(general_absolute));
+                assert_eq!(bits(local), bits(general_local));
+            }
+        }
         let general_grid = matches!(mode, ChildrenLayout::Grid { .. }).then(|| {
             let mut general = tree.clone();
             for params in &mut general.params[1..] {
@@ -240,6 +253,69 @@ fn a_retained_width_grid_supplies_a_nonzero_cell_to_a_rebuilt_subtree() {
 
 #[cfg(feature = "incremental")]
 #[test]
+fn grid_replay_keeps_the_clean_spanned_cell_and_publishes_the_edited_subtree() {
+    let viewport = Xy::new(94.25, 82.5);
+    let scale = PixelScale::new(1.25).unwrap();
+    let bits = |rect: XyRect| (rect.x.map(f32::to_bits), rect.y.map(f32::to_bits));
+    for retained in [false, true] {
+        let mut tree = Adapter {
+            retained,
+            parent: [None, Some(0), Some(0), None],
+            first: [Some(1), None, None, None],
+            next: [None, Some(2), None, None],
+            ..Adapter::default()
+        };
+        tree.params[0] = LayoutParams {
+            size: Xy::new(Size::Pixels(94.25), Size::Pixels(82.5)),
+            children_layout: ChildrenLayout::Grid {
+                columns: MainAxisCellSize::Width(30.0), main_axis: Axis::X,
+                spacing_x: 1.25, spacing_y: 2.25, backfill: true,
+            },
+            ..LayoutParams::DEFAULT
+        };
+        tree.params[1] = LayoutParams {
+            size: Xy::new(Size::Pixels(49.5), Size::Pixels(17.75)),
+            grid_span: Xy::new(2, 1),
+            position: Xy::new(Pos::Frac(0.375), Pos::End),
+            margin: Xy::new([Margin::px(1.25).unwrap(), Margin::ZERO], [Margin::ZERO; 2]),
+            ..LayoutParams::DEFAULT
+        };
+        tree.params[2] = LayoutParams {
+            grid_span: Xy::new(1, 2),
+            padding: Xy::new([1.75, 1.25], [2.5, 2.0]),
+            children_layout: ChildrenLayout::Stack { axis: Axis::Y, arrange: Arrange::Center, spacing: 1.25 },
+            ..LayoutParams::DEFAULT
+        };
+        tree.params[3].size = Xy::new(Size::Pixels(11.5), Size::Pixels(12.25));
+        tree.layout.set_pixel_scale(Some(scale));
+        tree.solve_layout(viewport);
+        let clean_output = tree.output[1].map(|(absolute, local)| (bits(absolute), bits(local)));
+        tree.write_order.clear();
+
+        tree.first[2] = Some(3);
+        tree.parent[3] = Some(2);
+        tree.register_child_attached(3).unwrap();
+        assert!(matches!(tree.solve_layout_incremental(viewport), IncrementalRelayoutOutcome::Success { .. }));
+        let expected_order: &[usize] = if retained { &[2, 3] } else { &[0, 1, 2, 3] };
+        assert_eq!(tree.write_order, expected_order);
+        assert_eq!(tree.output[1].map(|(absolute, local)| (bits(absolute), bits(local))), clean_output);
+        assert!(tree.output[2].unwrap().0.x[0] > 0.0);
+
+        let mut fresh = Adapter {
+            parent: tree.parent, first: tree.first, next: tree.next, params: tree.params,
+            ..Adapter::default()
+        };
+        fresh.layout.set_pixel_scale(Some(scale));
+        fresh.solve_layout(viewport);
+        assert_eq!(
+            tree.output.map(|entry| entry.map(|(absolute, local)| (bits(absolute), bits(local)))),
+            fresh.output.map(|entry| entry.map(|(absolute, local)| (bits(absolute), bits(local)))),
+        );
+    }
+}
+
+#[cfg(feature = "incremental")]
+#[test]
 fn a_retained_fractional_parent_supplies_its_size_to_a_rebuilt_subtree() {
     let window = Xy::new(80.5, 64.5);
     let mut tree = Adapter { retained: true, ..Adapter::default() };
@@ -333,6 +409,32 @@ fn partial_placement_requires_solved_sizes_throughout_the_visible_subtree() {
 }
 
 #[test]
+fn partial_placement_rejects_a_new_wrap_bound_until_it_is_solved() {
+    let mut tree = Adapter::default();
+    tree.params[1].children_layout = ChildrenLayout::Wrap {
+        axis: Axis::X, arrange: Arrange::Start, spacing: 0.0, line_spacing: 0.0,
+    };
+    let window = Xy::new_symm(100.0);
+    let rect = Xy::new_symm([10.0, 50.0]);
+    tree.solve_layout(window);
+    tree.write_order.clear();
+
+    #[cfg(feature = "incremental")]
+    let old = tree.params[2];
+    tree.params[2].min_size.y = Some(Size::Pixels(20.0));
+    #[cfg(feature = "incremental")]
+    tree.register_node_change(2, &old);
+
+    assert_eq!(tree.place_free_placed_subtree(1, rect), Err(FreePlacementError::Unsolved));
+    assert!(tree.write_order.is_empty());
+
+    tree.solve_layout(window);
+    tree.write_order.clear();
+    assert_eq!(tree.place_free_placed_subtree(1, rect), Ok(()));
+    assert_eq!(tree.write_order, [1, 2]);
+}
+
+#[test]
 fn partial_placement_writes_an_explicitly_free_child_and_its_descendants() {
     let mut tree = Adapter::default();
     tree.params[0].children_layout = ChildrenLayout::Block;
@@ -375,6 +477,53 @@ fn rounded_local_coordinates_share_the_absolute_edges() {
         tree.output[2],
         Some((Xy::new([0.5, 11.0], [0.0, 2.5]), Xy::new([0.0, 10.5], [0.0, 2.5]))),
     );
+}
+
+#[cfg(feature = "incremental")]
+#[test]
+fn incremental_layout_restores_a_manually_placed_free_subtree() {
+    let window = Xy::new_symm(100.0);
+    let mut tree = Adapter::<5> {
+        root: 0,
+        parent: [None, Some(0), Some(1), Some(0), None],
+        first: [Some(1), Some(2), None, None, None],
+        next: [None, Some(3), None, None, None],
+        params: [LayoutParams::DEFAULT; 5],
+        data: [NodeLayoutData::new(); 5],
+        layout: LayoutData::new(),
+        output: [None; 5],
+        measurements: 0,
+        writes: [0; 5],
+        write_order: Vec::new(),
+        retained: true,
+    };
+    tree.params[1].size = Xy::new_symm(Size::Pixels(20.0));
+    tree.params[2].size = Xy::new_symm(Size::Pixels(5.0));
+    tree.params[2].position = Xy::new_symm(Pos::Start);
+    tree.params[3].size = Xy::new_symm(Size::Pixels(30.0));
+    tree.params[4].size = Xy::new_symm(Size::Pixels(10.0));
+    tree.solve_layout(window);
+    let alternate_parent = Xy::new([8.0, 108.0], [16.0, 116.0]);
+    tree.place_free_placed_subtree(2, alternate_parent).unwrap();
+    let manually_placed = tree.output[2];
+
+    tree.first[3] = Some(4);
+    tree.parent[4] = Some(3);
+    tree.register_child_attached(4).unwrap();
+
+    let mut fresh = Adapter::<5> {
+        data: [NodeLayoutData::new(); 5],
+        layout: LayoutData::new(),
+        output: [None; 5],
+        ..tree.clone()
+    };
+    fresh.solve_layout(window);
+    assert_ne!(manually_placed, fresh.output[2]);
+    let outcome = tree.solve_layout_incremental(window);
+    assert!(matches!(outcome, IncrementalRelayoutOutcome::Success { .. }), "{outcome:?}");
+    let bits = |rect: XyRect| [rect.x.map(f32::to_bits), rect.y.map(f32::to_bits)];
+    let view = |tree: &Adapter<5>| tree.output.map(|row| row.map(|(absolute, local)| (bits(absolute), bits(local))));
+    assert_eq!(view(&tree), view(&fresh));
 }
 
 #[cfg(feature = "incremental")]
@@ -430,6 +579,56 @@ fn a_signed_zero_viewport_change_reaches_the_root() {
 
 #[cfg(feature = "incremental")]
 #[test]
+fn numeric_width_grid_reuses_cells_only_while_columns_agree() {
+    const N: usize = 32;
+    for main in [Axis::X, Axis::Y] {
+        let window = |extent| match main {
+            Axis::X => Xy::new(extent, 110.25),
+            Axis::Y => Xy::new(110.25, extent),
+        };
+        let mut template = Adapter::<N> {
+            root: 0,
+            parent: std::array::from_fn(|id| (id != 0).then_some(0)),
+            first: std::array::from_fn(|id| (id == 0).then_some(1)),
+            next: std::array::from_fn(|id| (1..N - 1).contains(&id).then_some(id + 1)),
+            params: std::array::from_fn(|id| LayoutParams {
+                size: Xy::new(Size::Pixels(3.25), Size::Pixels(7.75)),
+                grid_span: Xy::new(1 + (id % 3) as u16, 1 + (id % 2) as u16),
+                ..LayoutParams::DEFAULT
+            }),
+            data: [NodeLayoutData::new(); N],
+            layout: LayoutData::new(),
+            output: [None; N],
+            measurements: 0,
+            writes: [0; N],
+            write_order: Vec::new(),
+            retained: true,
+        };
+        template.params[0] = LayoutParams {
+            children_layout: ChildrenLayout::Grid {
+                columns: MainAxisCellSize::Width(22.5), main_axis: main,
+                spacing_x: 0.375, spacing_y: 0.25, backfill: true,
+            },
+            ..LayoutParams::DEFAULT
+        };
+        template.layout.set_pixel_scale(Some(PixelScale::new(1.25).unwrap()));
+        let mut incremental = template.clone();
+        incremental.solve_layout(window(200.0));
+        for width in [204.0, 165.0, 164.0, 216.0, 200.0] {
+            let mut full = template.clone();
+            full.solve_layout(window(width));
+            assert!(matches!(incremental.solve_layout_incremental(window(width)),
+                IncrementalRelayoutOutcome::Success { .. }));
+            let bits = |(a, l): (XyRect, XyRect)| [a.x, a.y, l.x, l.y].map(|edges| edges.map(f32::to_bits));
+            for id in 0..N {
+                assert_eq!(incremental.output[id].map(bits), full.output[id].map(bits), "{main:?} {width} node {id}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "incremental")]
+#[test]
 fn checked_solve_recovers_after_an_unregistered_edit() {
     let mut tree = Adapter::default();
     let window = Xy::new_symm(100.0);
@@ -444,6 +643,58 @@ fn checked_solve_recovers_after_an_unregistered_edit() {
     let [left, right] = tree.output[2].unwrap().0.x;
     assert_eq!(right - left, 25.0);
     assert_eq!(tree.solve_layout_incremental_checked(window), unchanged);
+}
+
+#[cfg(feature = "incremental")]
+#[test]
+fn checked_initial_fallback_publishes_the_engine_reference() {
+    #[derive(Default)]
+    struct OverridingAdapter {
+        inner: Adapter,
+        full_calls: usize,
+    }
+
+    impl TreeAdapter for OverridingAdapter {
+        type NodeId = usize;
+
+        fn root(&self) -> usize { self.inner.root() }
+        fn parent(&self, id: usize) -> Option<usize> { self.inner.parent(id) }
+        fn first_child(&self, id: usize) -> Option<usize> { self.inner.first_child(id) }
+        fn next_sibling(&self, id: usize) -> Option<usize> { self.inner.next_sibling(id) }
+        fn node_layout_params(&self, id: usize) -> &LayoutParams { self.inner.node_layout_params(id) }
+        fn node_layout_data(&self, id: usize) -> &NodeLayoutData { self.inner.node_layout_data(id) }
+        fn node_layout_data_mut(&mut self, id: usize) -> &mut NodeLayoutData { self.inner.node_layout_data_mut(id) }
+        fn layout_data(&mut self) -> &mut LayoutData<usize> { self.inner.layout_data() }
+        fn write_output_rect(&mut self, id: usize, rect: XyRect, local: XyRect) {
+            self.inner.write_output_rect(id, rect, local);
+        }
+        fn solve_layout(&mut self, window: Xy<f32>) {
+            self.full_calls += 1;
+            self.inner.solve_layout(window);
+        }
+    }
+
+    let window = Xy::new(100.25, 80.75);
+    let mut reference = Adapter::default();
+    reference.solve_layout(window);
+    let mut checked = OverridingAdapter::default();
+    assert_eq!(checked.solve_layout_incremental_checked(window), IncrementalRelayoutOutcome::FallbackNeverSolved);
+    assert_eq!(checked.full_calls, 0);
+    assert_eq!(checked.inner.write_order, reference.write_order);
+    assert_eq!(checked.inner.output, reference.output);
+
+    checked.inner.write_order.clear();
+    assert_eq!(
+        checked.solve_layout_incremental_checked(window),
+        IncrementalRelayoutOutcome::Success { computed: 0 },
+    );
+    assert_eq!(checked.full_calls, 0);
+    assert_eq!(checked.inner.write_order, reference.write_order);
+    assert_eq!(checked.inner.output, reference.output);
+
+    let mut ordinary = OverridingAdapter::default();
+    assert_eq!(ordinary.solve_layout_incremental(window), IncrementalRelayoutOutcome::FallbackNeverSolved);
+    assert_eq!(ordinary.full_calls, 1);
 }
 
 #[cfg(feature = "incremental")]
@@ -974,5 +1225,673 @@ fn a_disabled_root_publishes_no_rectangles_and_can_be_shown_again() {
             assert_eq!(tree.writes, fresh.writes);
             assert_eq!(tree.output, fresh.output);
         }
+    }
+}
+
+#[test]
+fn full_stack_rechecks_a_prior_fill_leaf_count() {
+    for (main, cross) in [(Axis::X, Axis::Y), (Axis::Y, Axis::X)] {
+        check_fill_leaf_count(main, cross);
+    }
+}
+
+fn check_fill_leaf_count(main: Axis, cross: Axis) {
+    const N: usize = 9;
+    let mut tree = Adapter::<N> {
+        parent: std::array::from_fn(|id| match id { 0 | 8 => None, 1 => Some(0), _ => Some(1) }),
+        first: std::array::from_fn(|id| match id { 0 => Some(1), 1 => Some(2), _ => None }),
+        next: std::array::from_fn(|id| (2..7).contains(&id).then_some(id + 1)),
+        root: 0,
+        params: [LayoutParams::DEFAULT; N],
+        data: [NodeLayoutData::new(); N],
+        layout: LayoutData::new(),
+        output: [None; N],
+        measurements: 0,
+        writes: [0; N],
+        write_order: Vec::new(),
+        #[cfg(feature = "incremental")]
+        retained: false,
+    };
+    let window = Xy::new(100.0, 100.0);
+    for (index, params) in tree.params.iter_mut().enumerate() {
+        params.position = Xy::new_symm(Pos::Start);
+        params.size[main] = if index == 0 { Size::Pixels(100.0) } else { Size::Fill };
+        params.size[cross] = if index < 2 { Size::FitContent } else { Size::Pixels(2.25 + index as f32) };
+        if index < 2 {
+            params.children_layout = ChildrenLayout::Stack {
+                axis: if index == 0 { cross } else { main },
+                arrange: Arrange::Start,
+                spacing: 0.35,
+            };
+        }
+    }
+    tree.params[2].margin[cross] = [Margin::px(-0.75).unwrap(), Margin::px(1.25).unwrap()];
+    let rect_bits = |(rect, local): (XyRect, XyRect)| {
+        [rect.x, rect.y, local.x, local.y].map(|edges| edges.map(f32::to_bits))
+    };
+    let check = |tree: &mut Adapter<N>| {
+        let mut cold = tree.clone();
+        cold.layout = LayoutData::new();
+        cold.data = [NodeLayoutData::new(); N];
+        cold.output = [None; N];
+        cold.write_order.clear();
+        tree.output = [None; N];
+        tree.write_order.clear();
+        cold.solve_layout(window);
+        tree.solve_layout(window);
+        assert_eq!(tree.write_order, cold.write_order);
+        assert_eq!(tree.output.map(|rect| rect.map(rect_bits)), cold.output.map(|rect| rect.map(rect_bits)));
+    };
+
+    check(&mut tree);
+    check(&mut tree);
+
+    // A matching hint still uses the current parent extent.
+    let old_right = tree.output[7].unwrap().0[main][1];
+    tree.params[0].size[main] = Size::Pixels(123.5);
+    check(&mut tree);
+    assert_ne!(tree.output[7].unwrap().0[main][1].to_bits(), old_right.to_bits());
+
+    // A longer sibling list may reject after provisionally preparing a prefix.
+    tree.parent[8] = Some(1);
+    tree.next[7] = Some(8);
+    check(&mut tree);
+    check(&mut tree);
+
+    // A shorter list rejects when its actual count does not match the hint.
+    tree.next[6] = None;
+    tree.next[7] = None;
+    tree.parent[7] = None;
+    tree.parent[8] = None;
+    check(&mut tree);
+
+    // Width bounds and non-unit weights reject the shape even at the old count.
+    tree.params[5].max_size[main] = Some(Size::Pixels(12.75));
+    check(&mut tree);
+    tree.params[5].max_size[main] = None;
+    tree.params[6].fill_weight = 2.25;
+    check(&mut tree);
+}
+
+#[test]
+fn cross_fill_line_matches_late_fallback() {
+    const N: usize = 8;
+    let margin = |value| Margin::px(value).unwrap();
+    for (cross, main) in [(Axis::X, Axis::Y), (Axis::Y, Axis::X)] {
+        let mut tree = Adapter::<N> {
+            root: 0,
+            parent: std::array::from_fn(|id| (1..7).contains(&id).then_some(0)),
+            first: std::array::from_fn(|id| (id == 0).then_some(1)),
+            next: std::array::from_fn(|id| (1..6).contains(&id).then_some(id + 1)),
+            params: [LayoutParams::DEFAULT; N],
+            data: [NodeLayoutData::new(); N],
+            layout: LayoutData::new(),
+            output: [None; N],
+            measurements: 0,
+            writes: [0; N],
+            write_order: Vec::new(),
+            #[cfg(feature = "incremental")]
+            retained: false,
+        };
+        tree.params[0].size[cross] = Size::Pixels(37.625);
+        tree.params[0].size[main] = Size::FitContent;
+        tree.params[0].padding[cross] = [5.75, 0.5];
+        tree.params[0].padding[main] = [1.25, 2.75];
+        tree.params[0].children_layout = ChildrenLayout::Stack {
+            axis: main, arrange: Arrange::Start, spacing: 0.1875,
+        };
+        let cross_margins = [
+            [Margin::ZERO, Margin::ZERO],
+            [margin(0.75), margin(-0.25)],
+            [margin(28.5), margin(17.0)],
+            [Margin::AUTO, margin(-3.0)],
+            [margin(-6.5), margin(0.25)],
+            [margin(-2.5), margin(2.5)],
+        ];
+        for (offset, pixels) in [-0.0, 2.75, 8.125, 0.5, 13.375, 3.625].into_iter().enumerate() {
+            let params = &mut tree.params[offset + 1];
+            params.size[main] = Size::Pixels(pixels);
+            params.margin[cross] = cross_margins[offset];
+            params.margin[main] = [margin(offset as f32 * 0.1), margin(-0.25)];
+            params.position = Xy::new_symm(Pos::Start);
+        }
+        let mut fallback = tree.clone();
+        fallback.next[6] = Some(7);
+        fallback.parent[7] = Some(0);
+        fallback.params[7].disabled = true;
+        let bits = |(rect, local): (XyRect, XyRect)| {
+            [rect.x, rect.y, local.x, local.y].map(|edges| edges.map(f32::to_bits))
+        };
+        let window = Xy::new_symm(100.0);
+        for iteration in 0..4 {
+            if iteration == 2 {
+                tree.params[4].position[cross] = Pos::Center;
+                fallback.params[4].position[cross] = Pos::Center;
+            }
+            if iteration == 3 {
+                tree.params[4].position[cross] = Pos::Start;
+                fallback.params[4].position[cross] = Pos::Start;
+                let scale = Some(PixelScale::new(1.25).unwrap());
+                tree.layout.set_pixel_scale(scale);
+                fallback.layout.set_pixel_scale(scale);
+            }
+            tree.write_order.clear();
+            fallback.write_order.clear();
+            tree.solve_layout(window);
+            fallback.solve_layout(window);
+            assert_eq!(tree.write_order, fallback.write_order);
+            assert_eq!(tree.output.map(|rect| rect.map(bits)), fallback.output.map(|rect| rect.map(bits)));
+        }
+    }
+}
+
+#[test]
+fn prepared_stack_rows_are_separate_from_enclosing_grid_and_wrap_metrics() {
+    const N: usize = 11;
+    let modes = [
+        ChildrenLayout::Wrap { axis: Axis::X, arrange: Arrange::Start, spacing: 4.0, line_spacing: 0.5 },
+        ChildrenLayout::Grid {
+            columns: MainAxisCellSize::Count(2), main_axis: Axis::X, spacing_x: 1.25, spacing_y: 0.5, backfill: false,
+        },
+    ];
+    for parent_mode in modes {
+        let mut tree = Adapter::<N> {
+            root: 0,
+            parent: [None, Some(0), Some(0), Some(1), Some(1), Some(1), Some(2), Some(2), Some(2), None, None],
+            first: [Some(1), Some(3), Some(6), None, None, None, None, None, None, None, None],
+            next: [None, Some(2), None, Some(4), Some(5), None, Some(7), Some(8), None, None, None],
+            params: [LayoutParams::DEFAULT; N],
+            data: [NodeLayoutData::new(); N],
+            layout: LayoutData::new(),
+            output: [None; N],
+            measurements: 0,
+            writes: [0; N],
+            write_order: Vec::new(),
+            #[cfg(feature = "incremental")]
+            retained: false,
+        };
+        tree.params[0].children_layout = parent_mode;
+        for id in 1..=2 {
+            tree.params[id].size = Xy::new(Size::Pixels(32.0 + id as f32 * 3.5), Size::FitContent);
+            tree.params[id].padding = Xy::new([0.25, 0.75], [0.125, 1.375]);
+            tree.params[id].position = Xy::new_symm(Pos::Start);
+            tree.params[id].children_layout = ChildrenLayout::Stack {
+                axis: Axis::Y, arrange: Arrange::Start, spacing: 0.15,
+            };
+        }
+        for id in 3..=8 {
+            tree.params[id].size.y = Size::Pixels(2.5 + id as f32);
+            tree.params[id].margin.y[1] = Margin::px(0.125 * id as f32).unwrap();
+            tree.params[id].position = Xy::new_symm(Pos::Start);
+        }
+        let mut fallback = tree.clone();
+        fallback.parent[9] = Some(1);
+        fallback.parent[10] = Some(2);
+        fallback.next[5] = Some(9);
+        fallback.next[8] = Some(10);
+        fallback.params[9].disabled = true;
+        fallback.params[10].disabled = true;
+        let bits = |(absolute, local): (XyRect, XyRect)| {
+            [absolute.x, absolute.y, local.x, local.y].map(|edges| edges.map(f32::to_bits))
+        };
+        for width in [105.0, 105.0, 73.0] {
+            let window = Xy::new(width, 100.0);
+            tree.write_order.clear();
+            fallback.write_order.clear();
+            tree.solve_layout(window);
+            fallback.solve_layout(window);
+            assert_eq!(tree.write_order, fallback.write_order);
+            assert_eq!(tree.output.map(|rect| rect.map(bits)), fallback.output.map(|rect| rect.map(bits)));
+        }
+    }
+}
+
+#[test]
+fn fixed_fraction_ratio_run_preserves_nested_output_and_fallback() {
+    const SENTINEL: usize = 9;
+    const N: usize = SENTINEL + 1;
+    let bits = |rect: XyRect| Xy::new(rect.x.map(f32::to_bits), rect.y.map(f32::to_bits));
+    let window = Xy::new(210.25, 175.125);
+    for outer in [
+        ChildrenLayout::Grid {
+            columns: MainAxisCellSize::Count(2), main_axis: Axis::X,
+            spacing_x: 0.375, spacing_y: 0.625, backfill: false,
+        },
+        ChildrenLayout::Wrap { axis: Axis::X, arrange: Arrange::Start, spacing: 0.125, line_spacing: 0.5 },
+    ] {
+        for axis in [Axis::X, Axis::Y] {
+            let mut fast = Adapter::<N> {
+                root: 0,
+                parent: std::array::from_fn(|id| match id {
+                    0 | SENTINEL => None, 1 | 2 => Some(0), _ => Some(1),
+                }),
+                first: std::array::from_fn(|id| match id { 0 => Some(1), 1 => Some(3), _ => None }),
+                next: std::array::from_fn(|id| (id == 1 || (3..SENTINEL - 1).contains(&id)).then_some(id + 1)),
+                params: [LayoutParams::DEFAULT; N],
+                data: [NodeLayoutData::new(); N],
+                layout: LayoutData::new(),
+                output: [None; N],
+                measurements: 0,
+                writes: [0; N],
+                write_order: Vec::new(),
+                #[cfg(feature = "incremental")]
+                retained: false,
+            };
+            fast.params[0].children_layout = outer;
+            fast.params[0].padding = Xy::new([1.375, 2.625], [4.75, 2.125]);
+            fast.params[1] = LayoutParams {
+                size: Xy::new(Size::Pixels(113.25), Size::Pixels(89.125)),
+                position: Xy::new_symm(Pos::Start),
+                padding: Xy::new([0.375, 0.5], [0.625, -0.125]),
+                children_layout: ChildrenLayout::Stack { axis, arrange: Arrange::Start, spacing: 0.375 },
+                ..LayoutParams::DEFAULT
+            };
+            fast.params[2] = LayoutParams {
+                size: Xy::new(Size::Pixels(23.125), Size::Pixels(31.25)),
+                position: Xy::new_symm(Pos::Start),
+                ..LayoutParams::DEFAULT
+            };
+            for (offset, (fraction, ratio)) in [
+                (0.5, 1.25), (-0.0, -1.5), (0.625, 3.25),
+                (-0.25, 2.75), (0.0, 1.5), (0.125, -1.25),
+            ].into_iter().enumerate() {
+                let size = if axis == Axis::X {
+                    Xy::new(Size::AspectRatio(ratio), Size::Frac(fraction))
+                } else {
+                    Xy::new(Size::Frac(fraction), Size::AspectRatio(ratio))
+                };
+                fast.params[offset + 3] = LayoutParams {
+                    size,
+                    position: Xy::new_symm(Pos::Start),
+                    margin: if offset % 2 == 0 {
+                        Xy::new([Margin::px(0.375).unwrap(), Margin::AUTO], [Margin::ZERO, Margin::px(-0.5).unwrap()])
+                    } else { Xy::new_symm([Margin::ZERO; 2]) },
+                    ..LayoutParams::DEFAULT
+                };
+            }
+            let mut general = fast.clone();
+            // Reject the packed run after its otherwise compatible live prefix.
+            general.params[SENTINEL].disabled = true;
+            general.parent[SENTINEL] = Some(1);
+            general.next[SENTINEL - 1] = Some(SENTINEL);
+            for frame in 0..4 {
+                for tree in [&mut fast, &mut general] {
+                    if frame == 2 {
+                        tree.params[6].position[if axis == Axis::X { Axis::Y } else { Axis::X }] = Pos::Center;
+                    }
+                    if frame == 3 {
+                        tree.params[4].min_size[axis] = Some(Size::Pixels(1.0));
+                    }
+                    tree.write_order.clear();
+                    tree.solve_layout(window);
+                    assert_eq!(tree.write_order, [0, 1, 3, 4, 5, 6, 7, 8, 2]);
+                }
+                for id in 0..SENTINEL {
+                    let (a, b) = fast.output[id].unwrap();
+                    let (c, d) = general.output[id].unwrap();
+                    assert_eq!(bits(a), bits(c), "absolute {outer:?} {axis:?} frame {frame} node {id}");
+                    assert_eq!(bits(b), bits(d), "local {outer:?} {axis:?} frame {frame} node {id}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "incremental")]
+#[test]
+fn warm_wrap_rows_keep_preorder_and_exact_edges_after_fallback() {
+    const LEAVES: usize = 20;
+    const HORIZONTAL: usize = 1;
+    const GRID: usize = HORIZONTAL + LEAVES + 1;
+    const STACK: usize = GRID + 1;
+    const VERTICAL: usize = STACK + LEAVES + 1;
+    const N: usize = VERTICAL + LEAVES + 1;
+    let mut tree = Adapter::<N> {
+        root: 0,
+        parent: std::array::from_fn(|id| match id {
+            0 => None,
+            HORIZONTAL | GRID => Some(0),
+            STACK | VERTICAL => Some(GRID),
+            id if id < GRID => Some(HORIZONTAL),
+            id if id < VERTICAL => Some(STACK),
+            _ => Some(VERTICAL),
+        }),
+        first: std::array::from_fn(|id| match id {
+            0 => Some(HORIZONTAL),
+            HORIZONTAL | GRID | STACK | VERTICAL => Some(id + 1),
+            _ => None,
+        }),
+        next: std::array::from_fn(|id| match id {
+            HORIZONTAL => Some(GRID),
+            STACK => Some(VERTICAL),
+            0 | GRID | VERTICAL => None,
+            id if id + 1 == GRID || id + 1 == VERTICAL || id + 1 == N => None,
+            _ => Some(id + 1),
+        }),
+        params: [LayoutParams::DEFAULT; N],
+        data: [NodeLayoutData::new(); N],
+        layout: LayoutData::new(),
+        output: [None; N],
+        measurements: 0,
+        writes: [0; N],
+        write_order: Vec::new(),
+        retained: false,
+    };
+    tree.params[0].children_layout = ChildrenLayout::Stack { axis: Axis::Y, arrange: Arrange::Start, spacing: 1.25 };
+    tree.params[GRID].children_layout = ChildrenLayout::Grid {
+        columns: MainAxisCellSize::Count(2), main_axis: Axis::X, spacing_x: 0.125, spacing_y: 0.5, backfill: false,
+    };
+    tree.params[GRID].size = Xy::new(Size::Pixels(40.0), Size::FitContent);
+    tree.params[STACK].children_layout = ChildrenLayout::Stack { axis: Axis::Y, arrange: Arrange::Start, spacing: 0.25 };
+    tree.params[STACK].size = Xy::new(Size::Pixels(10.0), Size::FitContent);
+    for child in &mut tree.params[STACK + 1..VERTICAL] {
+        child.size = Xy::new(Size::Fill, Size::Pixels(1.625));
+        child.position = Xy::new_symm(Pos::Start);
+    }
+    for (wrap, axis) in [(HORIZONTAL, Axis::X), (VERTICAL, Axis::Y)] {
+        tree.params[wrap].children_layout = ChildrenLayout::Wrap { axis, arrange: Arrange::Start, spacing: 0.125, line_spacing: 0.625 };
+        tree.params[wrap].size = Xy::new_symm(Size::FitContent);
+        tree.params[wrap].size[axis] = Size::Pixels(12.0);
+        for (offset, child) in tree.params[wrap + 1..wrap + LEAVES + 1].iter_mut().enumerate() {
+            child.size[axis] = Size::Pixels(1.25 + (offset % 4) as f32);
+            child.size[if axis == Axis::X { Axis::Y } else { Axis::X }] = if offset % 3 == 1 {
+                Size::Fill
+            } else {
+                Size::Pixels(2.0 + (offset % 5) as f32 / 8.0)
+            };
+            child.position = Xy::new_symm(Pos::Start);
+        }
+    }
+    let bits = |rect: XyRect| Xy::new(rect.x.map(f32::to_bits), rect.y.map(f32::to_bits));
+    for frame in 0..6 {
+        let disabled = HORIZONTAL + LEAVES - 1;
+        tree.params[disabled].disabled = frame == 2;
+        let window = Xy::new(100.0 - 0.25 * frame as f32, 175.25);
+        let scale = (frame == 4).then(|| PixelScale::new(1.25).unwrap());
+        tree.params[VERTICAL + 1].size.y = if frame == 3 { Size::Pixels(-0.0) } else { Size::Pixels(2.0) };
+        let mut fresh = tree.clone();
+        fresh.layout = LayoutData::new();
+        fresh.data = [NodeLayoutData::new(); N];
+        for current in [&mut tree, &mut fresh] {
+            current.output = [None; N];
+            current.write_order.clear();
+            current.layout.set_pixel_scale(scale);
+            current.solve_layout(window);
+        }
+        let expected: Vec<_> = (0..N).filter(|&id| frame != 2 || id != disabled).collect();
+        assert_eq!(fresh.write_order, expected);
+        assert_eq!(tree.write_order, expected, "frame {frame}");
+        assert_eq!(
+            tree.output.map(|rect| rect.map(|(absolute, local)| (bits(absolute), bits(local)))),
+            fresh.output.map(|rect| rect.map(|(absolute, local)| (bits(absolute), bits(local)))),
+            "frame {frame}",
+        );
+    }
+}
+
+#[cfg(feature = "incremental")]
+#[test]
+fn checked_flow_replay_matches_the_full_adapter_view() {
+    #[derive(Clone)]
+    struct Measured {
+        tree: Adapter,
+        height: [f32; 4],
+        calls: [u32; 4],
+    }
+    impl TreeAdapter for Measured {
+        type NodeId = usize;
+        fn root(&self) -> usize { self.tree.root() }
+        fn parent(&self, node: usize) -> Option<usize> { self.tree.parent(node) }
+        fn first_child(&self, node: usize) -> Option<usize> { self.tree.first_child(node) }
+        fn next_sibling(&self, node: usize) -> Option<usize> { self.tree.next_sibling(node) }
+        fn node_layout_params(&self, node: usize) -> &LayoutParams { self.tree.node_layout_params(node) }
+        fn node_layout_data(&self, node: usize) -> &NodeLayoutData { self.tree.node_layout_data(node) }
+        fn node_layout_data_mut(&mut self, node: usize) -> &mut NodeLayoutData { self.tree.node_layout_data_mut(node) }
+        fn layout_data(&mut self) -> &mut LayoutData<usize> { self.tree.layout_data() }
+        fn measure_text_height(&mut self, node: usize, width: Option<f32>) -> f32 {
+            self.calls[node] += 1;
+            self.height[node] + width.unwrap_or(0.0) * 0.125
+        }
+        fn write_output_rect(&mut self, node: usize, absolute: XyRect, local: XyRect) {
+            self.tree.write_output_rect(node, absolute, local);
+        }
+        fn retains_output_rects(&self) -> bool { true }
+    }
+
+    let bits = |r: XyRect| [r.x.map(f32::to_bits), r.y.map(f32::to_bits)];
+    let compare_full = |tree: &Measured, window| {
+        let mut full = tree.clone();
+        full.tree.layout = LayoutData::new();
+        full.tree.data = [NodeLayoutData::new(); 4];
+        full.tree.output = [None; 4];
+        full.tree.write_order.clear();
+        full.solve_layout(window);
+        assert_eq!(tree.tree.write_order, full.tree.write_order);
+        let rectangles = |tree: &Measured| tree.tree.output.map(|r| r.map(|(a, b)| (bits(a), bits(b))));
+        assert_eq!(rectangles(tree), rectangles(&full));
+    };
+    for mode in [
+        ChildrenLayout::Block,
+        ChildrenLayout::Wrap { axis: Axis::X, arrange: Arrange::Start, spacing: 0.75, line_spacing: 1.0 },
+    ] {
+        let window = Xy::new(41.0, 0.0);
+        let mut tree = Measured {
+            tree: Adapter {
+                parent: [None, Some(0), Some(0), None],
+                first: [Some(1), None, None, None],
+                next: [None, Some(2), None, None],
+                ..Adapter::default()
+            },
+            height: [0.0, 7.25, 12.5, 4.0],
+            calls: [0; 4],
+        };
+        tree.tree.params[0] = LayoutParams {
+            size: Xy::new(Size::Fill, Size::FitContent),
+            children_layout: mode,
+            ..LayoutParams::DEFAULT
+        };
+        for leaf in &mut tree.tree.params[1..] {
+            leaf.size = Xy::new(Size::Pixels(10.25), Size::FitContent);
+            leaf.text = TextContent::Wrapping;
+        }
+        tree.solve_layout(window);
+
+        tree.calls = [0; 4];
+        tree.tree.write_order.clear();
+        tree.height[1] = 11.5;
+        tree.register_content_change(1);
+        assert!(matches!(tree.solve_layout_incremental(window), IncrementalRelayoutOutcome::Success { .. }), "{mode:?}");
+        assert_eq!(tree.calls, [0, 1, 0, 0], "{mode:?}");
+        compare_full(&tree, window);
+
+        tree.tree.write_order.clear();
+        tree.height[1] = 3.0;
+        tree.register_content_change(1);
+        tree.register_content_change(1);
+        assert!(matches!(tree.solve_layout_incremental_checked(window), IncrementalRelayoutOutcome::Success { .. }), "{mode:?}");
+        compare_full(&tree, window);
+
+        let negative_zero = Xy::new(41.0, -0.0);
+        tree.tree.write_order.clear();
+        tree.height[1] = 8.25;
+        tree.register_content_change(1);
+        assert!(matches!(tree.solve_layout_incremental_checked(negative_zero), IncrementalRelayoutOutcome::Success { .. }), "{mode:?}");
+        compare_full(&tree, negative_zero);
+
+        tree.tree.write_order.clear();
+        tree.tree.parent[3] = Some(0);
+        tree.tree.next[2] = Some(3);
+        tree.register_child_attached(3).unwrap();
+        assert!(matches!(tree.solve_layout_incremental_checked(negative_zero), IncrementalRelayoutOutcome::Success { .. }), "{mode:?}");
+        compare_full(&tree, negative_zero);
+    }
+
+    // A Stack root can contain flowing rows. A resize must remeasure the leaf
+    // with a new width, while a fixed-width neighbor can keep its measurement.
+    let mut tree = Measured {
+        tree: Adapter {
+            parent: [None, Some(0), Some(1), Some(1)],
+            first: [Some(1), Some(2), None, None],
+            next: [None, None, Some(3), None],
+            ..Adapter::default()
+        },
+        height: [0.0, 0.0, 7.25, 12.5],
+        calls: [0; 4],
+    };
+    tree.tree.params[0].children_layout = ChildrenLayout::Stack { axis: Axis::Y, arrange: Arrange::Start, spacing: 0.0 };
+    tree.tree.params[1] = LayoutParams {
+        size: Xy::new(Size::Fill, Size::FitContent),
+        children_layout: ChildrenLayout::Wrap { axis: Axis::X, arrange: Arrange::Start, spacing: 0.75, line_spacing: 1.0 },
+        ..LayoutParams::DEFAULT
+    };
+    tree.tree.params[2].size = Xy::new(Size::Frac(0.5), Size::FitContent);
+    tree.tree.params[3].size = Xy::new(Size::Pixels(14.5), Size::FitContent);
+    tree.tree.params[2].text = TextContent::Wrapping;
+    tree.tree.params[3].text = TextContent::Wrapping;
+    tree.solve_layout(Xy::new(41.0, 120.0));
+    for width in [23.5, 75.0, 23.5] {
+        let window = Xy::new(width, 120.0);
+        tree.calls = [0; 4];
+        tree.tree.write_order.clear();
+        assert!(matches!(tree.solve_layout_incremental(window), IncrementalRelayoutOutcome::Success { .. }));
+        assert_eq!(tree.calls, [0, 0, 1, 0]);
+        compare_full(&tree, window);
+    }
+}
+
+#[cfg(feature = "incremental")]
+#[test]
+fn flow_replay_publishes_exact_rounded_rectangles_in_document_order() {
+    let scale = PixelScale::new(1.25).unwrap();
+    let bits = |r: XyRect| [r.x.map(f32::to_bits), r.y.map(f32::to_bits)];
+    let modes = [
+        ChildrenLayout::Block,
+        ChildrenLayout::Wrap { axis: Axis::X, arrange: Arrange::SpaceAround, spacing: 0.75, line_spacing: 2.125 },
+    ];
+    for mode in modes {
+        for retained in [false, true] {
+            let mut tree = Adapter::<7> {
+                root: 0, retained,
+                parent: [None, Some(0), Some(0), Some(1), Some(1), Some(1), Some(1)],
+                first: [Some(1), Some(3), None, None, None, None, None],
+                next: [None, Some(2), None, Some(4), Some(5), Some(6), None],
+                params: [LayoutParams::DEFAULT; 7], data: [NodeLayoutData::new(); 7],
+                layout: LayoutData::new(), output: [None; 7], measurements: 0,
+                writes: [0; 7], write_order: Vec::new(),
+            };
+            tree.params[1] = LayoutParams {
+                size: Xy::new(Size::Fill, Size::FitContent),
+                children_layout: mode,
+                position: Xy::new(Pos::Pixels(3.25), Pos::Pixels(5.75)),
+                anchor: Xy::new_symm(Anchor::Start),
+                padding: Xy::new([0.125; 2], [0.0; 2]),
+                children_origin_flipped: Xy::new(true, false),
+                ..LayoutParams::DEFAULT
+            };
+            tree.params[2].size = Xy::new_symm(Size::Pixels(9.25));
+            for (id, width, height) in [(3, 13.25, 0.0), (4, 11.5, 7.25), (5, 15.25, 12.5)] {
+                tree.params[id].size = Xy::new(Size::Pixels(width), Size::Pixels(height));
+                tree.params[id].margin.y = [Margin::px(id as f32 * 0.5).unwrap(), Margin::px(-0.75).unwrap()];
+            }
+            tree.params[6].size = Xy::new_symm(Size::Pixels(2.75));
+            tree.params[6].free_placement = true;
+            tree.layout.set_pixel_scale(Some(scale));
+            let mut window = Xy::new(42.25, 90.0);
+            tree.solve_layout(window);
+
+            for frame in 0..3 {
+                let previous = tree.output;
+                tree.write_order.clear();
+                match frame {
+                    0 => {
+                        let old = tree.params[4];
+                        match mode {
+                            ChildrenLayout::Block => tree.params[4].size.y = Size::Pixels(16.5),
+                            _ => tree.params[4].size.x = Size::Pixels(16.5),
+                        }
+                        tree.register_node_change(4, &old);
+                    }
+                    1 => window.x = 28.75,
+                    _ => {
+                        tree.first[1] = Some(4);
+                        tree.next[4] = Some(3);
+                        tree.next[3] = Some(5);
+                        tree.register_children_change(1);
+                    }
+                }
+                let outcome = tree.solve_layout_incremental(window);
+                assert!(matches!(outcome, IncrementalRelayoutOutcome::Success { .. }), "{mode:?} {frame}: {outcome:?}");
+                assert_ne!(tree.output, previous);
+
+                let mut fresh = tree.clone();
+                fresh.layout = LayoutData::new();
+                fresh.layout.set_pixel_scale(Some(scale));
+                fresh.data = [NodeLayoutData::new(); 7];
+                fresh.output = [None; 7];
+                fresh.write_order.clear();
+                fresh.solve_layout(window);
+                let expected_order: &[usize] = if frame == 2 && retained { &[1, 4, 3, 5, 6] } else { &fresh.write_order };
+                assert_eq!(tree.write_order, expected_order, "{mode:?} {retained} {frame}");
+                let rectangles = |tree: &Adapter<7>| tree.output.map(|r| r.map(|(absolute, local)| (bits(absolute), bits(local))));
+                assert_eq!(rectangles(&tree), rectangles(&fresh), "{mode:?} {retained} {frame}");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "incremental")]
+#[test]
+fn width_grid_updates_a_fixed_cross_stack_around_ready_intrinsic_leaves() {
+    const N: usize = 6;
+    let mut params = [LayoutParams::DEFAULT; N];
+    params[0].children_layout = ChildrenLayout::Stack {
+        axis: Axis::Y, arrange: Arrange::Start, spacing: 2.25,
+    };
+    params[0].padding.x = [3.5, 1.25];
+    params[1].children_layout = ChildrenLayout::Grid {
+        main_axis: Axis::X, columns: MainAxisCellSize::Width(20.0),
+        spacing_x: 3.25, spacing_y: 4.0, backfill: false,
+    };
+    params[1].size.y = Size::FitContent;
+    params[1].padding.x = [0.5, 1.75];
+    params[2].size.y = Size::Pixels(10.0);
+    params[2].children_layout = ChildrenLayout::Stack {
+        axis: Axis::X, arrange: Arrange::SpaceBetween, spacing: 1.375,
+    };
+    params[3].size = Xy::new(Size::FitContent, Size::Pixels(3.5));
+    params[3].image = Some(Xy::new(6.25, 0.0));
+    params[4].size.y = Size::Pixels(8.0);
+    params[4].children_layout = ChildrenLayout::Wrap {
+        axis: Axis::X, arrange: Arrange::Start, spacing: 2.0, line_spacing: 1.0,
+    };
+    params[5].size = Xy::new(Size::FitContent, Size::Pixels(4.25));
+    params[5].image = Some(Xy::new(4.125, 0.0));
+    let mut tree = Adapter::<N> {
+        root: 0,
+        parent: [None, Some(0), Some(1), Some(2), Some(0), Some(2)],
+        first: [Some(1), Some(2), Some(3), None, None, None],
+        next: [None, Some(4), None, Some(5), None, None],
+        params,
+        data: [NodeLayoutData::new(); N],
+        layout: LayoutData::new(),
+        output: [None; N],
+        measurements: 0,
+        writes: [0; N],
+        write_order: Vec::new(),
+        retained: true,
+    };
+    tree.solve_layout(Xy::new(94.5, 100.0));
+    for (width, changed_image) in [
+        (88.25, false), (56.0, false), (94.5, true), (88.25, false),
+    ] {
+        if changed_image {
+            let old = tree.params[5];
+            tree.params[5].image = Some(Xy::new(2.75, 0.0));
+            tree.register_node_change(5, &old);
+        }
+        let before = tree.output[2].unwrap().0;
+        let outcome = tree.solve_layout_incremental_checked(Xy::new(width, 100.0));
+        assert!(matches!(outcome, IncrementalRelayoutOutcome::Success { computed: 1.. }), "{outcome:?}");
+        assert_ne!(tree.output[2].unwrap().0, before);
     }
 }
