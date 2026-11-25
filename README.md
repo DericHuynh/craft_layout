@@ -30,6 +30,8 @@ In short, the idea of this library is to consider the resulting graph of depende
 
 Run `cargo bench --bench real_workloads` for browser, Linux compositor, and CAD layout scenarios. The suite measures full and incremental layout over the same edit sequences. [Workloads and measurement method](benchmarks/real_workloads/README.md)
 
+The benchmark handoff covers first solves, peer engines, application edits, and topological-order experiments. [Benchmark runners and adapters](benchmarks/README.md)
+
 ## Usage
 
 `keru_layout` has a trait-based API similar to Taffy's low-level API.
