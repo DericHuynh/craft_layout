@@ -16,6 +16,7 @@ exclude = [
 [features]
 default = ["incremental"]
 incremental = ["dep:arrayvec"]
+batch-pilot = ["incremental"]
 
 [dependencies]
 slotmap = "1.0"

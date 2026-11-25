@@ -298,6 +298,7 @@ fn docked_viewport() -> Case {
 
     Case {
         name: "cad/docked_viewport",
+        period: RESIZES.len(),
         tree,
         viewport: RESIZES[0].0,
         edit: Box::new(move |tree, frame| {
@@ -593,6 +594,7 @@ fn assembly_inspector() -> Case {
     let mut detail = None;
     Case {
         name: "cad/assembly_inspector",
+        period: INSPECTOR_STATES.len(),
         tree,
         viewport,
         edit: Box::new(move |tree, frame| {

@@ -19,12 +19,29 @@ pub(crate) struct Node<I, C> {
     pub(crate) first_child: Option<I>,
     pub(crate) parent: Option<I>,
     pub(crate) layout: NodeLayoutData,
-    pub(crate) rect: XyRect,
     pub(crate) params: LayoutParams,
     pub(crate) last_child: Option<I>,
     pub(crate) prev_sibling: Option<I>,
     pub(crate) context: Option<C>,
+    // Publish the edges and the incarnation's availability bit together.
+    pub(crate) rect: XyRect,
     pub(crate) identity: u64,
+}
+
+#[cfg(any(feature = "batch-pilot", verus_keep_ghost))]
+#[inline]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(count =>
+    ensures count <= population,
+        count as int == if first <= last && last - first < population {
+            last - first + 1
+        } else { 0 },
+    no_unwind
+))]
+pub(super) fn leaf_count_hint(first: u64, last: u64, population: u32) -> u32 {
+    let Some(distance) = last.checked_sub(first) else { return 0; };
+    if distance >= population as u64 { return 0; }
+    distance as u32 + 1
 }
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]

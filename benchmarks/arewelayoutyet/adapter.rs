@@ -25,7 +25,7 @@ fn weight(value: Option<BenchmarkSize>) -> Option<f32> {
     value.filter(|value| value.mode == SizeMode::Expand).map(|value| value.value)
 }
 
-fn axis(node: &LayoutNode) -> Axis {
+pub(crate) fn axis(node: &LayoutNode) -> Axis {
     if node.flow_direction == Some(FlowDirection::Horizontal) {
         Axis::X
     } else {
@@ -33,7 +33,7 @@ fn axis(node: &LayoutNode) -> Axis {
     }
 }
 
-fn params(node: &LayoutNode, parent_axis: Option<Axis>) -> Option<LayoutParams> {
+pub(crate) fn params(node: &LayoutNode, parent_axis: Option<Axis>) -> Option<LayoutParams> {
     let padding = |value: Option<f32>| value.unwrap_or(0.0);
     let margin = |value: Option<f32>| Margin::px(value.unwrap_or(0.0));
     let width = [node.width, node.max_width, node.min_width];
@@ -76,7 +76,7 @@ fn params(node: &LayoutNode, parent_axis: Option<Axis>) -> Option<LayoutParams> 
     })
 }
 
-fn count(node: &LayoutNode) -> usize {
+pub(crate) fn count(node: &LayoutNode) -> usize {
     1 + node.children.iter().map(count).sum::<usize>()
 }
 
@@ -172,14 +172,20 @@ impl KeruLayoutTree {
 
     pub fn node_count(&self) -> usize { self.tree.nodes.len() - 1 }
 
+    pub fn rectangle_bits(&self) -> impl Iterator<Item = [u32; 4]> + '_ {
+        self.tree.nodes.iter().map(|node| {
+            let [left, right] = node.rect.x;
+            let [top, bottom] = node.rect.y;
+            [left, right, top, bottom].map(f32::to_bits)
+        })
+    }
+
     /// Check every absolute edge word, including signed zero, outside the timer.
     pub fn geometry_hash(&self) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for node in &self.tree.nodes {
-            for edge in node.rect.x.into_iter().chain(node.rect.y) {
-                hash ^= u64::from(edge.to_bits());
-                hash = hash.wrapping_mul(0x100_0000_01b3);
-            }
+        for edge in self.rectangle_bits().flatten() {
+            hash ^= u64::from(edge);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
         }
         hash
     }

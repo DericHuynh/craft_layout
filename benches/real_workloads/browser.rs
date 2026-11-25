@@ -202,6 +202,7 @@ fn article() -> Case {
 
     Case {
         name: "browser/article_reflow",
+        period: FRAMES.len(),
         tree,
         viewport: Xy::new(1080.0, 900.0),
         edit: Box::new(move |tree, frame| {
@@ -423,6 +424,7 @@ fn catalog() -> Case {
 
     Case {
         name: "browser/product_catalog",
+        period: FRAMES.len(),
         tree,
         viewport: Xy::new(1280.0, 840.0),
         edit: Box::new(move |tree, frame| {

@@ -17,12 +17,14 @@ mod numeric;
 pub(crate) mod tape;
 pub(crate) mod tape_plan;
 mod intake;
-mod readers;
+pub(crate) mod readers;
 mod register;
 use readers::Filter;
 pub(crate) use readers::NodeChange;
 use numeric::{QueueActions, QueueModel, QueuePoll};
 mod regional;
+#[cfg(feature = "batch-pilot")]
+pub(crate) use regional::block::{accepts_declarations as accepts_block_declarations, width as resolve_block_width};
 mod plan;
 pub(crate) use plan::{SubtreeCounts, Suspended};
 pub(crate) use checked_view::OutputRecord;
@@ -121,7 +123,7 @@ impl<I> LayoutData<I> {
 
 impl NodeChange {
     /// A structural change requires rebuilding the affected dependencies.
-    fn between(old: &LayoutParams, new: &LayoutParams, track_sizes: bool) -> Option<Self> {
+    pub(crate) fn between(old: &LayoutParams, new: &LayoutParams, track_sizes: bool) -> Option<Self> {
         if registration_rules::sizing_structure_changed(old, new) {
             return None;
         }

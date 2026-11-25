@@ -8,6 +8,9 @@ mod child_walk;
 #[macro_use]
 mod solve;
 mod declarations;
+#[cfg(feature = "batch-pilot")]
+#[allow(dead_code)] // The standalone experiment also uses the slice-based kernel API.
+mod batch_order;
 mod fill_budget;
 mod flow;
 mod full_layout;
@@ -62,6 +65,8 @@ pub use place::FreePlacementError;
 pub use incremental::IncrementalRelayoutOutcome;
 #[cfg(feature = "incremental")]
 pub use layout_tree::{ChildId, Destination, LayoutTree, NodeId, TreeError, measure_monospace_text};
+#[cfg(feature = "batch-pilot")]
+pub use layout_tree::{BatchLayoutError, BatchLayoutStats};
 #[cfg(feature = "incremental")]
 pub use tree_walk::AttachmentError;
 
@@ -124,6 +129,18 @@ pub trait TreeAdapter {
     /// skip writes to unchanged subtrees during structural relayout.
     #[cfg(feature = "incremental")]
     fn retains_output_rects(&self) -> bool { false }
+
+    /// Capacity hint for the checked Stack leaf preparation paths.
+    #[doc(hidden)]
+    #[cfg(feature = "batch-pilot")]
+    fn stack_leaf_count_hint(&self, node: Self::NodeId) -> u32 {
+        self.node_layout_data(node).n_placed_children
+    }
+
+    /// Estimated population available for reserving prepared leaf rows.
+    #[doc(hidden)]
+    #[cfg(feature = "batch-pilot")]
+    fn first_stack_population_hint(&self) -> u32 { 0 }
 
     /// Called when the layout solver finds a problem in a node's layout.
     /// 

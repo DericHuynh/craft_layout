@@ -630,7 +630,7 @@ fn snap_rect(rect: XyRect, snapper: &Snapper) -> XyRect {
 
 #[path = "pixel_grid.rs"]
 mod pixel_grid;
-use pixel_grid::Snapper;
+pub(crate) use pixel_grid::Snapper;
 
 
 #[cfg(test)]

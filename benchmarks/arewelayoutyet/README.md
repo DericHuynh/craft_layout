@@ -22,7 +22,44 @@ cargo --config 'patch.crates-io.keru_layout.path="/path/to/keru"' \
 
 The source adapter derives from the MIT-licensed upstream Keru adapter. [Upstream adapter](https://github.com/DericHuynh/arewelayoutyet/blob/b1f5ff86eae840705950ae037f8d397e0f20a0a2/benchmarks/src/keru_layout_helpers.rs) · [Upstream license](LICENSE)
 
-## Cross-engine results
+## Compare Batch Pearce–Kelly with the upstream engines
+
+Use a scratch checkout at the pinned arewelayoutyet revision. The paired runner keeps the upstream PanGUI templates, peer adapters, and adapter coverage. It adds three local timings for the dense full solver and the default and batch solvers on identical owned `LayoutTree` inputs. Before each timed solve it invalidates the previous layout values. A warm batch solve can reuse its dependency graph. Template parsing, tree construction, invalidation, and geometry checks happen outside the timer.
+
+Each peer and workload pair gets 21 samples. The runner rotates the four modes and computes the mean time of individually timed solves per sample. The summary uses paired medians for ratios. Standard error reports both the first Batch API solve, which uses the default solver, and the first invalidated Batch solve, which captures and evaluates the retained graph. `PANGUI_VERIFY_ONLY=1` checks exact absolute rectangle bits across all three Keru modes on the first solve, after handoff, and after a retained solve. `PANGUI_FILTER` selects a template by name substring.
+
+The Batch API shares the ordinary owned solver’s first pass and allocates its Pearce–Kelly workspace on the first later call that needs it. The latest first-solve run compares the optimized Batch entry against frozen owned and earlier Batch builds. [First-solve optimization and samples](../../reports/pangui-2026-11-24-first-pass-optimization/report.md) · [Earlier first-pass comparison](../../reports/pangui-2026-11-24-first-pass-parity/report.md) · [Default-first and handoff results](../../reports/pangui-2026-11-24-default-first/report.md)
+
+Run these commands from the `craft_layout` checkout. Use a CPU available on the host or omit `taskset`. [Taffy 0.3 compatibility patch](../../reports/pangui-2026-11-23-optimized/taffy03-compat.patch) · [Peer timing boundaries](../../reports/pangui-2026-11-23-optimized/report.md#method)
+
+```sh
+craft_root="$PWD"
+upstream_root=/path/to/arewelayoutyet-scratch
+adapter_dir="$craft_root/benchmarks/arewelayoutyet"
+bench_dir="$upstream_root/benchmarks"
+cp "$bench_dir/benches/pangui.rs" "$bench_dir/benches/pangui_batch.rs"
+git -C "$upstream_root" apply "$adapter_dir/batch-runner.patch"
+git -C "$upstream_root" apply "$craft_root/reports/pangui-2026-11-23-optimized/taffy03-compat.patch"
+cp "$adapter_dir/adapter.rs" "$bench_dir/src/keru_layout_helpers.rs"
+cp "$adapter_dir/owned_adapter.rs" "$adapter_dir/batch_sampling.rs" "$bench_dir/benches/"
+cat >> "$bench_dir/Cargo.toml" <<'TOML'
+
+[[bench]]
+name = "pangui_batch"
+path = "benches/pangui_batch.rs"
+harness = false
+required-features = ["keru_layout"]
+TOML
+cd "$bench_dir"
+BINDGEN_EXTRA_CLANG_ARGS="-idirafter $(gcc -print-file-name=include)" \
+  taskset -c 4 cargo --config "patch.crates-io.keru_layout.path=\"$craft_root\"" \
+  bench --bench pangui_batch \
+  --features cephal,clay,backer,ply,yoga,taffy03,morphorm,torin,keru_layout/batch-pilot,hooke,ui-layout \
+  > paired.tsv
+python3 "$adapter_dir/summarize_batch.py" paired.tsv
+```
+
+## Earlier dense adapter results
 
 The paired PanGUI run with this adapter measured a **3.8190× minimum speedup** and a **5.4095× geometric mean** across all 13 workloads. The report includes the measurements against all 11 supported peers, allocation counts, and reproduction steps. [Original-adapter report](../../reports/pangui-2026-11-23-original-adapter/report.md)
 

@@ -128,6 +128,7 @@ Placement-only changes in wrapping and block layouts reuse measured sizes. Flow 
 
 Large batches can use root replay if edit intake reaches its limit before sizing starts. Full solves handle the initial frame, explicit invalidation, and work that cannot safely reuse prior sizing. `LayoutTree` keeps a bounded cache of wrapped text heights for matching width bits. Report content edits or call `invalidate()` when the measurer changes. Disable the `incremental` feature to omit change tracking and use full solves through `TreeAdapter`.
 
+The opt-in `batch-pilot` feature uses the default solver for the first layout. When a later solve needs work, it builds a retained sizing graph and uses batch Pearce–Kelly for its ordering and graph edits. [Pilot API and benchmarks](benchmarks/topological_order/README.md#layout-pilot)
 
 ## FAQ
 

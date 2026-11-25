@@ -249,6 +249,9 @@ pub(crate) trait RequestModel {
     type Id: Copy + Eq;
     type Source: RequestSource<Id = Self::Id> + ?Sized;
     type Event;
+    type Context;
+    #[verifier::prophetic]
+    spec fn context(&self) -> Self::Context;
     spec fn topology(&self) -> Topology<Self::Id>;
     spec fn projection(&self) -> spec_fn(Request<Self::Id>) -> Self::Event;
     spec fn requests(&self) -> Seq<Self::Event>;
@@ -507,6 +510,7 @@ pub(crate) trait RequestAccess: RequestModel {
     #[cfg_attr(verus_keep_ghost, verus_spec(
         ensures final(self).topology() == old(self).topology(),
             final(self).projection() == old(self).projection(),
+            final(self).context() == old(self).context(),
             final(self).requests() == old(self).requests().push((old(self).projection())(slot)),
         no_unwind
     ))]
@@ -518,6 +522,7 @@ pub(crate) trait RequestAccess: RequestModel {
 #[cfg_attr(verus_keep_ghost, verus_spec(
     ensures final(access).topology() == old(access).topology(),
         final(access).projection() == old(access).projection(),
+        final(access).context() == old(access).context(),
         final(access).requests() == old(access).requests()
             + declaration_prefix(old(access).topology(), slot, false, 3).map_values(old(access).projection()),
     no_unwind
@@ -540,6 +545,7 @@ fn final_declarations<A: RequestAccess>(access: &mut A, slot: Request<A::Id>) {
 #[cfg_attr(verus_keep_ghost, verus_spec(
     ensures final(access).topology() == old(access).topology(),
         final(access).projection() == old(access).projection(),
+        final(access).context() == old(access).context(),
         final(access).requests() == old(access).requests()
             + declaration_prefix(old(access).topology(), slot, intrinsic, 3).map_values(old(access).projection()),
     no_unwind
@@ -549,6 +555,7 @@ fn declarations<A: RequestAccess>(access: &mut A, slot: Request<A::Id>, intrinsi
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant access.topology() == old(access).topology(), index <= 3,
             access.projection() == old(access).projection(),
+            access.context() == old(access).context(),
             access.requests() == old(access).requests()
                 + declaration_prefix(access.topology(), slot, intrinsic, index as nat).map_values(access.projection()),
         decreases 3 - index,
@@ -579,6 +586,7 @@ fn declarations<A: RequestAccess>(access: &mut A, slot: Request<A::Id>, intrinsi
 #[cfg_attr(verus_keep_ghost, verus_spec(
     ensures final(access).topology() == old(access).topology(),
         final(access).projection() == old(access).projection(),
+        final(access).context() == old(access).context(),
         final(access).requests() == old(access).requests()
             + intrinsic_inputs(old(access).topology(), slot).map_values(old(access).projection()),
     no_unwind
@@ -598,6 +606,7 @@ fn intrinsic<A: RequestAccess>(access: &mut A, slot: Request<A::Id>) {
         #[cfg_attr(verus_keep_ghost, verus_spec(
             invariant access.topology() == old(access).topology(),
                 access.projection() == old(access).projection(),
+                access.context() == old(access).context(),
                 seen@ <= (access.topology().children)(slot.node).len(),
                 next == child_at((access.topology().children)(slot.node), seen@),
                 access.requests() == old(access).requests()
@@ -637,6 +646,7 @@ fn intrinsic<A: RequestAccess>(access: &mut A, slot: Request<A::Id>) {
 #[cfg_attr(verus_keep_ghost, verus_spec(
     ensures final(access).topology() == old(access).topology(),
         final(access).projection() == old(access).projection(),
+        final(access).context() == old(access).context(),
         final(access).requests() == old(access).requests()
             + parent_inputs(old(access).topology(), slot).map_values(old(access).projection()),
     no_unwind
@@ -712,10 +722,11 @@ impl<A: RequestAccess> BlockModel for BlockBinding<A> {
     type Id = A::Id;
 
     type Event = A::Event;
-    type Scope = (Topology<A::Id>, A::Id, spec_fn(Request<A::Id>) -> A::Event);
+    type Scope = (Topology<A::Id>, A::Context, A::Id, spec_fn(Request<A::Id>) -> A::Event);
 
     closed spec fn children(&self) -> Seq<block_spec::Child<A::Id>> { (self.access.topology().block_children)(self.parent) }
-    closed spec fn scope(&self) -> Self::Scope { (self.access.topology(), self.parent, self.access.projection()) }
+    #[verifier::prophetic]
+    closed spec fn scope(&self) -> Self::Scope { (self.access.topology(), self.access.context(), self.parent, self.access.projection()) }
     closed spec fn project(&self) -> spec_fn(BlockRequest<A::Id>) -> Self::Event {
         let project = self.access.projection();
         |request: BlockRequest<A::Id>| project(block_slot(request))
@@ -758,11 +769,12 @@ impl<A: RequestAccess> WrapModel for WrapBinding<A> {
     type Id = A::Id;
 
     type Event = A::Event;
-    type Scope = (Topology<A::Id>, A::Id, bool, spec_fn(Request<A::Id>) -> A::Event);
+    type Scope = (Topology<A::Id>, A::Context, A::Id, bool, spec_fn(Request<A::Id>) -> A::Event);
 
     closed spec fn children(&self) -> Seq<wrap_spec::Child<A::Id>> { wrap_rows(self.access.topology(), self.parent, self.main) }
+    #[verifier::prophetic]
     closed spec fn scope(&self) -> Self::Scope {
-        (self.access.topology(), self.parent, self.main, self.access.projection())
+        (self.access.topology(), self.access.context(), self.parent, self.main, self.access.projection())
     }
     closed spec fn project(&self) -> spec_fn(WrapRequest<A::Id>) -> Self::Event {
         let node = self.parent;
@@ -830,6 +842,7 @@ impl<A: RequestAccess> FlowRequestSchedule for WrapBinding<A> {
 #[cfg_attr(verus_keep_ghost, verus_spec(result =>
     requires wrap_spec::distinct(wrap_rows(access.topology(), node, main)),
     ensures result.topology() == access.topology(), result.projection() == access.projection(),
+        result.context() == access.context(),
         result.requests() == access.requests()
             + wrap_inputs(access.topology(), node, main, producer).map_values(access.projection()),
     no_unwind
@@ -850,6 +863,7 @@ fn wrap<A: RequestAccess>(access: A, node: A::Id, main: bool, producer: Producer
 #[cfg_attr(verus_keep_ghost, verus_spec(result =>
     requires block_spec::unique((access.topology().block_children)(node)),
     ensures result.topology() == access.topology(), result.projection() == access.projection(),
+        result.context() == access.context(),
         result.requests() == access.requests()
             + block_inputs(access.topology(), node).map_values(access.projection()),
     no_unwind
@@ -870,6 +884,7 @@ fn block<A: RequestAccess>(access: A, node: A::Id) -> A {
 #[cfg_attr(verus_keep_ghost, verus_spec(result =>
     requires ordered_children(access.topology(), slot),
     ensures result.topology() == access.topology(), result.projection() == access.projection(),
+        result.context() == access.context(),
         result.requests() == access.requests() + inputs(access.topology(), slot).map_values(access.projection()),
     no_unwind
 ))]

@@ -160,6 +160,9 @@ impl<V: RequestSource + ?Sized, S: TaskModel<Request<V::Id>, O>, O>
     type Id = V::Id;
     type Source = V;
     type Event = Task<Request<V::Id>, O>;
+    type Context = ();
+
+    closed spec fn context(&self) -> Self::Context { () }
 
     closed spec fn topology(&self) -> sizing_requests::Topology<Self::Id> { self.source.topology() }
     closed spec fn projection(&self) -> spec_fn(Request<Self::Id>) -> Self::Event {

@@ -1,6 +1,8 @@
 mod browser;
 mod cad;
 mod compositor;
+#[cfg(feature = "batch-pilot")]
+mod telemetry;
 
 use keru_layout::{
     IncrementalRelayoutOutcome, LayoutTree, NodeId, TreeError, Xy, measure_monospace_text,
@@ -12,13 +14,14 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_FRAMES: usize = 120;
 const WARMUP_FRAMES: usize = 24;
-const USAGE: &str =
-    "Usage: cargo bench --bench real_workloads -- [--frames N] [--filter NAME] [--verify-only]";
+const USAGE: &str = "Usage: cargo bench --bench real_workloads -- [--frames N] [--filter NAME] [--verify-only] [--batch-pilot] [--phase-timings [--runs N]]";
 
 type Edit = dyn FnMut(&mut LayoutTree<String>, usize) -> Xy<f32>;
 
 struct Case {
     name: &'static str,
+    #[cfg_attr(not(feature = "batch-pilot"), allow(dead_code))]
+    period: usize,
     tree: LayoutTree<String>,
     viewport: Xy<f32>,
     edit: Box<Edit>,
@@ -29,7 +32,22 @@ impl Case {
         self.viewport = (self.edit)(&mut self.tree, frame);
     }
 
-    fn layout(&mut self) -> IncrementalRelayoutOutcome {
+    #[cfg(feature = "batch-pilot")]
+    fn layout_batch(&mut self) -> keru_layout::BatchLayoutStats {
+        self.tree
+            .solve_layout_batch_with_measure(self.viewport, measure_monospace_text)
+            .unwrap_or_else(|error| panic!("{} batch layout: {error}", self.name))
+    }
+
+    fn layout(&mut self, batch: bool) -> IncrementalRelayoutOutcome {
+        #[cfg(feature = "batch-pilot")]
+        if batch {
+            let result = self.layout_batch();
+            let computed = u32::try_from(result.computed).unwrap_or(u32::MAX);
+            return IncrementalRelayoutOutcome::Success { computed };
+        }
+        #[cfg(not(feature = "batch-pilot"))]
+        let _ = batch;
         self.tree
             .solve_layout_with_measure(self.viewport, measure_monospace_text)
     }
@@ -83,9 +101,9 @@ fn verify(incremental: &Case, full: &Case, frame: &str) -> Vec<NodeOutput> {
     actual
 }
 
-fn time_layout(case: &mut Case) -> (Duration, IncrementalRelayoutOutcome) {
+fn time_layout(case: &mut Case, batch: bool) -> (Duration, IncrementalRelayoutOutcome) {
     let start = Instant::now();
-    let outcome = black_box(case.layout());
+    let outcome = black_box(case.layout(batch));
     (start.elapsed(), outcome)
 }
 
@@ -102,10 +120,16 @@ fn percentiles(mut times: Vec<Duration>) -> (f64, f64) {
     (median, micros(times[p95]))
 }
 
-fn run(mut incremental: Case, mut full: Case, frames: Option<NonZeroUsize>) {
+fn run(
+    mut incremental: Case,
+    mut full: Case,
+    frames: NonZeroUsize,
+    verify_only: bool,
+    batch: bool,
+) {
     assert_eq!(incremental.name, full.name);
-    incremental.layout();
-    full.layout();
+    incremental.layout(batch);
+    full.layout(false);
     let mut previous = verify(&incremental, &full, "initial");
     let initial_nodes = previous.len();
     let mut changed = false;
@@ -113,18 +137,28 @@ fn run(mut incremental: Case, mut full: Case, frames: Option<NonZeroUsize>) {
         incremental.apply_frame(frame);
         full.apply_frame(frame);
         full.tree.invalidate();
-        incremental.layout();
-        full.layout();
+        incremental.layout(batch);
+        full.layout(false);
         let current = verify(&incremental, &full, &format!("warmup frame {frame}"));
         changed |= previous != current;
         previous = current;
     }
     assert!(changed, "{} did not change geometry", incremental.name);
 
-    let Some(frames) = frames else {
+    if verify_only {
+        if batch {
+            for frame in (WARMUP_FRAMES..).take(frames.get()) {
+                incremental.apply_frame(frame);
+                full.apply_frame(frame);
+                full.tree.invalidate();
+                incremental.layout(true);
+                full.layout(false);
+                verify(&incremental, &full, &format!("verified frame {frame}"));
+            }
+        }
         println!("{}\t{initial_nodes}\tverified", incremental.name);
         return;
-    };
+    }
     let frames = frames.get();
     let mut incremental_times = Vec::with_capacity(frames);
     let mut full_times = Vec::with_capacity(frames);
@@ -134,10 +168,13 @@ fn run(mut incremental: Case, mut full: Case, frames: Option<NonZeroUsize>) {
         full.apply_frame(frame);
         full.tree.invalidate();
         let (incremental_sample, full_sample) = if index % 2 == 0 {
-            (time_layout(&mut incremental), time_layout(&mut full))
+            (
+                time_layout(&mut incremental, batch),
+                time_layout(&mut full, false),
+            )
         } else {
-            let full_sample = time_layout(&mut full);
-            (time_layout(&mut incremental), full_sample)
+            let full_sample = time_layout(&mut full, false);
+            (time_layout(&mut incremental, batch), full_sample)
         };
         assert_eq!(
             full_sample.1,
@@ -171,6 +208,9 @@ fn execute() -> Result<(), String> {
     let mut frames = NonZeroUsize::new(DEFAULT_FRAMES).unwrap();
     let mut filter = String::new();
     let mut verify_only = false;
+    let mut batch = false;
+    let mut telemetry = false;
+    let mut runs: Option<NonZeroUsize> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             // Cargo appends this argument to custom benchmark executables.
@@ -183,12 +223,39 @@ fn execute() -> Result<(), String> {
             }
             "--filter" => filter = args.next().ok_or("--filter expects a workload name")?,
             "--verify-only" => verify_only = true,
+            "--phase-timings" => telemetry = true,
+            "--runs" => {
+                runs = Some(
+                    args.next()
+                        .and_then(|value| value.parse().ok())
+                        .ok_or("--runs expects a positive integer")?,
+                );
+            }
+            "--batch-pilot" => {
+                if !cfg!(feature = "batch-pilot") {
+                    return Err("--batch-pilot requires --features batch-pilot".into());
+                }
+                batch = true;
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return Ok(());
             }
             _ => return Err(format!("unknown argument {arg}")),
         }
+    }
+
+    if telemetry {
+        if batch || verify_only {
+            return Err("--phase-timings already runs all three solver modes".into());
+        }
+        #[cfg(feature = "batch-pilot")]
+        return telemetry::run(&filter, frames.get(), runs.map_or(5, NonZeroUsize::get));
+        #[cfg(not(feature = "batch-pilot"))]
+        return Err("--phase-timings requires --features batch-pilot".into());
+    }
+    if runs.is_some() {
+        return Err("--runs requires --phase-timings".into());
     }
 
     let mut selected = cases()
@@ -206,7 +273,7 @@ fn execute() -> Result<(), String> {
         );
     }
     for (incremental, full) in selected {
-        run(incremental, full, (!verify_only).then_some(frames));
+        run(incremental, full, frames, verify_only, batch);
     }
     Ok(())
 }

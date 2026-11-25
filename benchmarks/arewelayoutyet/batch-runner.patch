@@ -1,0 +1,95 @@
+--- a/benchmarks/benches/pangui_batch.rs
++++ b/benchmarks/benches/pangui_batch.rs
+@@ -2,17 +2,22 @@
+ //! (<https://www.pangui.io/blog/05-layout-rework-and-benchmarks/>).
+ //!
+ //! Each file in the `pangui` directory is one benchmark, written in PanGUI's benchmark template format.
+-use criterion::measurement::WallTime;
+-use criterion::{criterion_group, criterion_main, BenchmarkGroup, BenchmarkId, Criterion};
+ use rand::Rng;
+ use std::path::Path;
+ use taffy::prelude::*;
+ use taffy::style::Style as TaffyStyle;
+ 
+-use taffy_benchmarks::pangui_template::{
++use taffy_benchmarks::pangui_template;
++use pangui_template::{
+     parse_test_case, BenchmarkSize, FlowDirection, LayoutNode, SizeMode, WrapMode,
+ };
+-use taffy_benchmarks::{bench_layout, benchmark_group, BuildTree, BuildTreeExt, GenStyle, TaffyTreeBuilder};
++use taffy_benchmarks::{BuildTree, BuildTreeExt, GenStyle, TaffyTreeBuilder};
++
++mod batch_sampling;
++#[path = "../src/keru_layout_helpers.rs"]
++mod keru_layout_helpers;
++mod owned_adapter;
++use batch_sampling::{BenchmarkId, PairGroup, bench_layout, iter_timed};
+ 
+ #[cfg(feature = "backer")]
+ use taffy_benchmarks::backer_helpers::BackerTree;
+@@ -22,8 +27,6 @@
+ use taffy_benchmarks::clay_helpers::ClayTree;
+ #[cfg(feature = "hooke")]
+ use taffy_benchmarks::hooke_helpers::HookeTree;
+-#[cfg(feature = "keru_layout")]
+-use taffy_benchmarks::keru_layout_helpers::KeruLayoutTree;
+ #[cfg(feature = "morphorm")]
+ use taffy_benchmarks::morphorm_helpers::MorphormTree;
+ #[cfg(feature = "taffy03")]
+@@ -212,7 +215,7 @@
+ 
+ /// Benchmark the layout libraries which have their own translation of the templates, rather than from a Taffy style.
+ #[allow(unused_variables)]
+-fn benchmark_native_libraries(group: &mut BenchmarkGroup<WallTime>, name: &str, root: &LayoutNode) {
++fn benchmark_native_libraries(group: &mut PairGroup<'_>, name: &str, root: &LayoutNode) {
+     let (width, height) = (root_size(&root.width), root_size(&root.height));
+ 
+     #[cfg(feature = "backer")]
+@@ -251,25 +254,17 @@
+         });
+     }
+ 
+-    #[cfg(feature = "keru_layout")]
+-    if let Some(tree) = KeruLayoutTree::new(root, width, height) {
+-        let mut tree = Some(tree);
+-        group.bench_function(BenchmarkId::new(name, "keru_layout"), |b| {
+-            bench_layout(b, &mut tree, || unreachable!(), |tree| tree.mark_all_dirty(), |tree| tree.compute_layout())
+-        });
+-    }
+-
+     #[cfg(feature = "clay")]
+     if let Some(mut tree) = ClayTree::new(root, width, height) {
+         group.bench_function(BenchmarkId::new(name, "Clay"), |b| {
+-            taffy_benchmarks::iter_timed(b, || tree.layout_duration())
++            iter_timed(b, || tree.layout_duration())
+         });
+     }
+ 
+     #[cfg(feature = "ply")]
+     if let Some(mut tree) = PlyTree::new(root, width, height) {
+         group.bench_function(BenchmarkId::new(name, "Ply"), |b| {
+-            taffy_benchmarks::iter_timed(b, || tree.layout_duration())
++            iter_timed(b, || tree.layout_duration())
+         });
+     }
+ 
+@@ -314,14 +309,9 @@
+         .collect()
+ }
+ 
+-fn pangui_benchmarks(c: &mut Criterion) {
+-    let mut group = benchmark_group(c, "PanGUI");
+-    for (name, root) in templates() {
+-        benchmark_native_libraries(&mut group, name.as_str(), &root);
+-        benchmark_each_library!(group, name.as_str(), root);
+-    }
+-    group.finish();
++fn main() {
++    batch_sampling::run(templates(), |group, name, root| {
++        benchmark_native_libraries(group, name, root);
++        benchmark_each_library!(group, name, root);
++    });
+ }
+-
+-criterion_group!(name = benches; config = taffy_benchmarks::criterion_config(); targets = pangui_benchmarks);
+-criterion_main!(benches);

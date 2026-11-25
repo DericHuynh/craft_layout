@@ -50,6 +50,7 @@ pub trait ScheduleModel {
     spec fn children(&self) -> Seq<Child<Self::Id>>;
     type Event;
     type Scope;
+    #[verifier::prophetic]
     spec fn scope(&self) -> Self::Scope;
     spec fn project(&self) -> spec_fn(Request<Self::Id>) -> Self::Event;
     spec fn requests(&self) -> Seq<Self::Event>;

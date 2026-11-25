@@ -176,13 +176,14 @@ fn record_cycle<A: PhaseAccess + ?Sized>(host: &mut A, slot: Request<A::Id>) {
     no_unwind
 ))]
 pub(crate) fn enter_slot<A: PhaseAccess + ?Sized>(host: &mut A, slot: Request<A::Id>) -> Option<bool> {
-    let entry = cycle_rules::enter_packed_slot(host.node_record(slot.node).flags.0, slot.axis().index(), slot.kind);
+    let record = host.node_record(slot.node);
+    let axis = slot.axis().index();
+    let entry = cycle_rules::enter_packed_slot(record.flags.0, axis, slot.kind);
     match entry {
         Entry::Reuse => {
             #[cfg(any(feature = "incremental", verus_keep_ghost))]
             {
-                let levels = &host.node_record(slot.node).levels;
-                let level = cycle_rules::read_slot(levels, slot.axis().index(), slot.kind);
+                let level = cycle_rules::read_slot(&record.levels, axis, slot.kind);
                 let current = host.current_level();
                 *current = dependency_rules::include_level(*current, level);
             }
@@ -299,8 +300,9 @@ pub(crate) fn finish_open_slot<A: PhaseAccess + ?Sized, const CHECK: bool>(host:
                 assert(prior@(req) == phase(host, req));
             }
         }
-        let level = *host.current_level();
-        *host.current_level() = dependency_rules::include_level(opened.outer_level, level);
+        let current = host.current_level();
+        let level = *current;
+        *current = dependency_rules::include_level(opened.outer_level, level);
         #[cfg(verus_keep_ghost)]
         proof! {
             assert forall |req: Request<A::Id>| #[trigger] phase(host, req) == prior@(req) by {

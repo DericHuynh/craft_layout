@@ -485,11 +485,14 @@ fn take_run<T: StartActions + ?Sized>(tree: &mut T, parent: T::Id) -> Option<Pac
     no_unwind
 ))]
 pub(crate) fn try_leaf_wrap<T: StartActions + ?Sized>(tree: &mut T, parent: T::Id) -> Option<u32> {
+    let ChildrenLayout::Wrap { axis, .. } = tree.params(parent).children_layout else { return None; };
     #[cfg(any(feature = "incremental", verus_keep_ghost))]
     let mut run = take_run(tree, parent);
-    let result = prepare_leaf_wrap(
-        tree, parent, #[cfg(any(feature = "incremental", verus_keep_ghost))] &mut run,
-    );
+    // Keep axis selection outside both child walks.
+    let result = match axis {
+        Axis::X => prepare_leaf_wrap::<T, true>(tree, parent, #[cfg(any(feature = "incremental", verus_keep_ghost))] &mut run),
+        Axis::Y => prepare_leaf_wrap::<T, false>(tree, parent, #[cfg(any(feature = "incremental", verus_keep_ghost))] &mut run),
+    };
     #[cfg(verus_keep_ghost)]
     let prepared = wrap_projection(tree);
     #[cfg(verus_keep_ghost)]
@@ -555,12 +558,13 @@ pub(crate) fn try_leaf_wrap<T: StartActions + ?Sized>(tree: &mut T, parent: T::I
         },
     no_unwind
 ))]
-fn prepare_leaf_wrap<T: StartActions + ?Sized>(
+fn prepare_leaf_wrap<T: StartActions + ?Sized, const HORIZONTAL: bool>(
     tree: &mut T, parent: T::Id,
     #[cfg(any(feature = "incremental", verus_keep_ghost))] run: &mut Option<PackedRun<T::Id>>,
 ) -> Option<u32> {
     let params = tree.params(parent);
-    let ChildrenLayout::Wrap { axis, spacing, line_spacing, .. } = params.children_layout else { return None; };
+    let ChildrenLayout::Wrap { spacing, line_spacing, .. } = params.children_layout else { return None; };
+    let axis = if HORIZONTAL { Axis::X } else { Axis::Y };
     let cross = axis.other();
     if !matches!(params.size.component(cross), Size::FitContent | Size::Auto)
         || !independent(params, axis) || !independent(params, cross)
@@ -668,8 +672,8 @@ fn prepare_leaf_wrap<T: StartActions + ?Sized>(
         };
         let combined = if count == 0 { base } else { wrap_lines::extend_main(width, spacing, base) };
         if count != 0 && wrap_lines::beyond_limit(combined, limit) {
-            if !write_leaf_line(
-                tree, parent, head, count, cross, height, later_line, line_zero_margins,
+            if !write_leaf_line::<T, HORIZONTAL>(
+                tree, parent, head, count, height, later_line, line_zero_margins,
                 #[cfg(any(feature = "incremental", verus_keep_ghost))] run,
                 #[cfg(any(feature = "incremental", verus_keep_ghost))] spacing,
             ) { return None; }
@@ -720,8 +724,8 @@ fn prepare_leaf_wrap<T: StartActions + ?Sized>(
         leaf_line_ids(old(tree).order(), hidden(old(tree)), head, line@, None);
     }
     if population < 4 { return None; }
-    if !write_leaf_line(
-        tree, parent, head, count, cross, height, later_line, line_zero_margins,
+    if !write_leaf_line::<T, HORIZONTAL>(
+        tree, parent, head, count, height, later_line, line_zero_margins,
         #[cfg(any(feature = "incremental", verus_keep_ghost))] run,
         #[cfg(any(feature = "incremental", verus_keep_ghost))] spacing,
     ) { return None; }
@@ -763,9 +767,9 @@ fn prepare_leaf_wrap<T: StartActions + ?Sized>(
             + line_ids(old(tree).order(), next, count as nat),
     no_unwind
 ))]
-fn write_leaf_line<T: StartActions + ?Sized>(
+fn write_leaf_line<T: StartActions + ?Sized, const HORIZONTAL: bool>(
     tree: &mut T, parent: T::Id, mut next: Option<T::Id>, mut count: u32,
-    cross_axis: Axis, cross: f32, mut line_start: bool, zero_margins: bool,
+    cross: f32, mut line_start: bool, zero_margins: bool,
     #[cfg(any(feature = "incremental", verus_keep_ghost))] run: &mut Option<PackedRun<T::Id>>,
     #[cfg(any(feature = "incremental", verus_keep_ghost))] spacing: f32,
 ) -> bool {
@@ -774,6 +778,7 @@ fn write_leaf_line<T: StartActions + ?Sized>(
     #[cfg(verus_keep_ghost)]
     let expected = save_line(tree, next, count);
     use crate::declarations::{X, Y};
+    let cross_axis = if HORIZONTAL { Y } else { X };
     let metrics = [0, T::Float::bits(cross)];
     #[cfg(feature = "incremental")]
     use crate::StructuralChange;

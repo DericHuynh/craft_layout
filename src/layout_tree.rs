@@ -9,6 +9,8 @@ mod id;
 mod structural_guard;
 mod output;
 mod records;
+#[cfg(feature = "batch-pilot")]
+mod batch;
 #[cfg(target_arch = "x86_64")]
 mod ascii_width;
 
@@ -20,6 +22,8 @@ use solve_frame::TailEdits;
 use std::sync::Arc;
 use id::TreeIdentity;
 pub use id::{ChildId, Destination, NodeId, TreeError};
+#[cfg(feature = "batch-pilot")]
+pub use batch::{BatchLayoutError, BatchLayoutStats};
 use structural_guard::{BindContext, ContextModel, HandleLookup, HandleModel, InsertionArena, InsertionModel,
     incarnation, insert_optional_entry, insert_record, next_incarnation,
     rectangle_available, reserve_entries, resolve_record, root_capacity};
@@ -33,6 +37,23 @@ new_key_type! {
 const ROOT_INCARNATION: u64 = 0;
 
 pub(crate) type LayoutNode = records::Node<NodeKey, DefaultKey>;
+
+#[cfg(feature = "batch-pilot")]
+#[derive(Debug, Clone, Copy)]
+enum BatchStart {
+    First,
+    Default(Option<f32>),
+    Handoff,
+}
+
+#[cfg(feature = "batch-pilot")]
+impl BatchStart {
+    fn changed(&mut self) {
+        if matches!(self, Self::Default(_)) {
+            *self = Self::Handoff;
+        }
+    }
+}
 
 /// A tree of layout nodes. It records the changes to the nodes, and `solve_layout` uses them to do an incremental relayout when it can.
 ///
@@ -56,6 +77,11 @@ pub struct LayoutTree<T = ()> {
     warnings: Vec<LayoutWarning<NodeId>>,
     tail_edits: TailEdits<NodeKey>,
     tail_stack: Option<StackTail>,
+    #[cfg(feature = "batch-pilot")]
+    batch_start: BatchStart,
+    // Allocate the Batch workspace when the first changed solve needs it.
+    #[cfg(feature = "batch-pilot")]
+    batch: Vec<batch::State>,
 }
 
 impl<T: Clone> Clone for LayoutTree<T> {
@@ -79,6 +105,10 @@ impl<T: Clone> Clone for LayoutTree<T> {
             warnings,
             tail_edits: TailEdits::Other,
             tail_stack: None,
+            #[cfg(feature = "batch-pilot")]
+            batch_start: BatchStart::First,
+            #[cfg(feature = "batch-pilot")]
+            batch: Vec::new(),
         }
     }
 }
@@ -114,6 +144,10 @@ impl<T> LayoutTree<T> {
             root, owner: Arc::new(TreeIdentity { root }),
             next_incarnation: 1, layout_data, warnings: Vec::new(),
             tail_edits: TailEdits::Other, tail_stack: None,
+            #[cfg(feature = "batch-pilot")]
+            batch_start: BatchStart::First,
+            #[cfg(feature = "batch-pilot")]
+            batch: Vec::new(),
         }
     }
 
@@ -165,8 +199,37 @@ impl<T> LayoutTree<T> {
             Destination::LastChildOf(parent) => MoveDestination::LastChildOf(self.raw_handle(parent)),
             Destination::Before(sibling) => MoveDestination::Before(self.raw_handle(sibling)),
         };
+        #[cfg(feature = "batch-pilot")]
+        let key = node.key;
+        #[cfg(feature = "batch-pilot")]
+        let retained_reorder = (|| {
+            let moved = self.nodes.get(key)?;
+            let parent = moved.parent?;
+            let destination_parent = match &destination {
+                MoveDestination::LastChildOf(handle) => handle.key,
+                MoveDestination::Before(handle) => self.nodes.get(handle.key)?.parent?,
+            };
+            let params = &self.nodes.get(parent)?.params;
+            (parent == destination_parent && self.batch.first()?.can_retain_reorder(parent, params))
+                .then_some((parent, moved.prev_sibling, params.children_layout))
+        })();
         let live = self.nodes.len();
-        links::relocate::move_handles(self, node, destination, live)
+        let result = links::relocate::move_handles(self, node, destination, live);
+        #[cfg(feature = "batch-pilot")]
+        if result.is_ok() && let Some((parent, old_previous, layout)) = retained_reorder
+            && let Some(batch) = self.batch.first_mut()
+        {
+            // The parent and the moved node can change their first/next link.
+            // The previous sibling at either end of the move can change next.
+            let new_previous = self.nodes.get(key).and_then(|node| node.prev_sibling);
+            batch.retain_reorder(
+                &self.nodes,
+                [Some(parent), Some(key), old_previous, new_previous],
+                parent,
+                layout,
+            );
+        }
+        result
     }
 
     fn invalidate_dormant_grid(&mut self) {
@@ -209,6 +272,13 @@ impl<T> LayoutTree<T> {
         let node = self.nodes.get(i).ok_or(TreeError::StaleNode)?;
         if node.params.same_input(&params) {
             return Ok(());
+        }
+        #[cfg(feature = "batch-pilot")]
+        {
+            self.batch_start.changed();
+            if let Some(batch) = self.batch.first_mut() {
+                batch.parameters_changed(i, &node.params, &params);
+            }
         }
         let placement_only = matches!(self.tail_edits, TailEdits::None | TailEdits::Placement)
             && solve_frame::same_sizing_inputs(node.params, params);
@@ -263,6 +333,8 @@ impl<T> LayoutTree<T> {
     pub fn remove(&mut self, node: &ChildId) -> Result<(), TreeError> {
         let (i, parent, record) = self.resolve_child(node)?;
         let retired_leaf = if self.contexts.is_some() && record.first_child.is_none() { record.context } else { None };
+        #[cfg(feature = "batch-pilot")]
+        let local_tail = self.batch.first().and_then(|batch| batch.removable_tail(i));
         self.record_tail_edit(i, parent, false);
         self.unlink(i, parent)?;
         if let Some(key) = retired_leaf {
@@ -270,10 +342,19 @@ impl<T> LayoutTree<T> {
             // payload directly so it drops after the handle becomes stale.
             self.nodes.remove(i).ok_or(TreeError::StaleNode)?;
             let retired = self.contexts.as_mut().and_then(|contexts| contexts.remove(key));
+            #[cfg(feature = "batch-pilot")]
+            if let Some(tail) = local_tail && let Some(batch) = self.batch.first_mut() {
+                batch.record_local_removal(tail);
+            }
             drop(retired);
             return Ok(());
         }
-        removal::remove_owned_tree(self, i)
+        let result = removal::remove_owned_tree(self, i);
+        #[cfg(feature = "batch-pilot")]
+        if result.is_ok() && let Some(tail) = local_tail && let Some(batch) = self.batch.first_mut() {
+            batch.record_local_removal(tail);
+        }
+        result
     }
 
     /// Read the node's `LayoutParams`.
@@ -329,6 +410,11 @@ impl<T> LayoutTree<T> {
         self.invalidate_hidden_grid_edit(i);
         self.tail_edits = TailEdits::Other;
         if let Some(node) = self.nodes.get_mut(i) {
+            #[cfg(feature = "batch-pilot")]
+            {
+                self.batch_start.changed();
+                if let Some(batch) = self.batch.first_mut() { batch.content_changed(i); }
+            }
             self.text_heights.invalidate_node(incarnation(node.identity));
             self.layout_data.record_content_change(i, &mut node.layout);
         }
@@ -336,6 +422,11 @@ impl<T> LayoutTree<T> {
 
     /// Makes the next `solve_layout` a full solve. Use it when the measure function changes, for example after a font change.
     pub fn invalidate(&mut self) {
+        #[cfg(feature = "batch-pilot")]
+        {
+            self.batch_start.changed();
+            if let Some(batch) = self.batch.first_mut() { batch.invalidate(); }
+        }
         self.invalidate_dormant_grid();
         self.text_heights.clear::<crate::vec_memory::RustVec>();
         self.layout_data.request_full_solve(IncrementalRelayoutOutcome::FallbackInvalidated);
@@ -382,7 +473,7 @@ impl<T> LayoutTree<T> {
 
     /// Solves the layout. `window_size` is the size of the window, in logical pixels. The text of all nodes measures as zero.
     pub fn solve_layout(&mut self, window_size: Xy<f32>) -> IncrementalRelayoutOutcome {
-        self.solve_owned(window_size, |_, _, _| Xy::new_symm(0.0), |_, _, _| Xy::new_symm(0.0), false)
+        self.solve_owned(window_size, zero_text::<T>, zero_content::<T>, false)
     }
 
     /// Solves the layout. `window_size` is the size of the window, in logical pixels. `measure` gives the size of the text of a node, with its width optionally fixed to a wrap width.
@@ -390,7 +481,7 @@ impl<T> LayoutTree<T> {
     /// its content or measurer is invalidated. The solver can reuse a measurement
     /// without calling `measure` again.
     pub fn solve_layout_with_measure(&mut self, window_size: Xy<f32>, measure: impl FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32>) -> IncrementalRelayoutOutcome {
-        self.solve_layout_with_measurers(window_size, measure, |_, _, _| Xy::new_symm(0.0))
+        self.solve_layout_with_measurers(window_size, measure, zero_content::<T>)
     }
 
     /// Solves the layout using a custom intrinsic content callback and zero text measurements.
@@ -400,7 +491,7 @@ impl<T> LayoutTree<T> {
         window_size: Xy<f32>,
         measure: impl FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32>,
     ) -> IncrementalRelayoutOutcome {
-        self.solve_owned(window_size, |_, _, _| Xy::new_symm(0.0), measure, false)
+        self.solve_owned(window_size, zero_text::<T>, measure, false)
     }
 
     /// Solves the layout using callbacks for both text and custom intrinsic content.
@@ -416,6 +507,104 @@ impl<T> LayoutTree<T> {
         self.solve_owned(window_size, text, content, true)
     }
 
+    /// Solves an acyclic layout with the experimental batch scheduler and
+    /// zero intrinsic measurements.
+    #[cfg(feature = "batch-pilot")]
+    pub fn solve_layout_batch(&mut self, window: Xy<f32>) -> Result<BatchLayoutStats, BatchLayoutError> {
+        self.solve_batch_owned(window, zero_text::<T>, zero_content::<T>, false)
+    }
+
+    /// Solves an acyclic layout with the experimental batch scheduler and
+    /// a text measurer.
+    #[cfg(feature = "batch-pilot")]
+    pub fn solve_layout_batch_with_measure(
+        &mut self, window: Xy<f32>,
+        text: impl FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32>,
+    ) -> Result<BatchLayoutStats, BatchLayoutError> {
+        self.solve_layout_batch_with_measurers(window, text, zero_content::<T>)
+    }
+
+    /// Solves an acyclic layout with the experimental batch scheduler.
+    /// Applies the measurement requirements of [Self::solve_layout_with_measurers].
+    /// The first solve uses the default solver and reports zero Batch work.
+    /// The first subsequent call that needs work builds the Batch graph.
+    /// A rejected graph leaves the previously published rectangle data and warnings in place.
+    /// The default solver may call the measurers while checking the first graph.
+    #[cfg(feature = "batch-pilot")]
+    pub fn solve_layout_batch_with_measurers(
+        &mut self, window: Xy<f32>,
+        text: impl FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32>,
+        content: impl FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32>,
+    ) -> Result<BatchLayoutStats, BatchLayoutError> {
+        self.solve_batch_owned(window, text, content, true)
+    }
+
+    #[cfg(feature = "batch-pilot")]
+    fn solve_batch_owned(
+        &mut self,
+        window: Xy<f32>,
+        text: impl FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32>,
+        content: impl FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32>,
+        cache_text: bool,
+    ) -> Result<BatchLayoutStats, BatchLayoutError> {
+        let scale = self.layout_data.pixel_scale;
+        match self.batch_start {
+            BatchStart::First => {
+                let registered_pixels = self.layout_data.n_nodes_solved != 0;
+                let population = if registered_pixels {
+                    0
+                } else {
+                    u32::try_from(self.nodes.len()).unwrap_or(u32::MAX)
+                };
+                let previous_warnings = std::mem::take(&mut self.warnings);
+                let mut adapter = Adapter::new(self, text, content);
+                adapter.cache_text = WrappedHeightCache::for_flow(cache_text);
+                adapter.first_stack_population = population;
+                let accepted = crate::full_layout::run_owned::<_, crate::vec_memory::RustVec>(
+                    &mut adapter, window, registered_pixels, true,
+                );
+                self.tail_stack = None;
+                if accepted {
+                    self.batch_start = BatchStart::Default(scale);
+                    self.tail_edits = TailEdits::None;
+                    return Ok(BatchLayoutStats::default());
+                }
+                self.layout_data.request_full_solve(IncrementalRelayoutOutcome::FallbackInvalidated);
+                self.tail_edits = TailEdits::Other;
+                self.warnings = previous_warnings;
+                return Err(BatchLayoutError::Cycle);
+            }
+            BatchStart::Default(last_scale)
+                if self.layout_data.window_size.same_input(&window) && last_scale.same_input(&scale) =>
+            {
+                self.warnings.clear();
+                return Ok(BatchLayoutStats::default());
+            }
+            _ => {}
+        }
+
+        if self.batch.is_empty() {
+            self.batch.try_reserve_exact(1)?;
+            self.batch.push(batch::State::default());
+            self.batch_start = BatchStart::Handoff;
+        }
+        let mut batch = std::mem::take(&mut self.batch);
+        let previous_warnings = std::mem::take(&mut self.warnings);
+        let population = self.nodes.len();
+        let mut adapter = Adapter::new(self, text, content);
+        adapter.cache_text = WrappedHeightCache::Batch;
+        let result = batch[0].solve(&mut adapter, population, window, scale);
+        self.batch = batch;
+        if result.is_ok() {
+            self.layout_data.request_full_solve(IncrementalRelayoutOutcome::FallbackInvalidated);
+            self.tail_edits = TailEdits::Other;
+            self.tail_stack = None;
+        } else {
+            self.warnings = previous_warnings;
+        }
+        result
+    }
+
     fn solve_owned(
         &mut self,
         window: Xy<f32>,
@@ -423,9 +612,14 @@ impl<T> LayoutTree<T> {
         content: impl FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32>,
         cache_text: bool,
     ) -> IncrementalRelayoutOutcome {
+        #[cfg(feature = "batch-pilot")]
+        {
+            self.batch_start.changed();
+            if let Some(batch) = self.batch.first_mut() { batch.output_changed(); }
+        }
         self.warnings.clear();
         let mut adapter = Adapter::new(self, text, content);
-        adapter.cache_text = cache_text;
+        adapter.cache_text = WrappedHeightCache::for_flow(cache_text);
         solve_frame::run(&mut adapter, window).outcome
     }
 
@@ -440,7 +634,13 @@ impl<T> LayoutTree<T> {
         let next = next_incarnation(self.nodes.len(), id).ok_or(TreeError::Capacity)?;
         let (i, _) = insert_record(&mut self.nodes, &mut self.contexts, LayoutNode::new(params, id), context)?;
         self.next_incarnation = next;
+        #[cfg(feature = "batch-pilot")]
+        let batch_was_clean = self.batch.first().is_some_and(batch::State::can_record_tail);
         self.link(i, parent, last, None);
+        #[cfg(feature = "batch-pilot")]
+        if let Some(batch) = self.batch.first_mut() {
+            batch.record_local_append(batch_was_clean, &self.nodes, i, parent, last);
+        }
         self.record_tail_edit(i, parent, true);
         self.record_attachment(i, parent);
         Ok(ChildId(NodeId::new(&self.owner, i, id)))
@@ -622,6 +822,11 @@ impl<T> links::LinkStore for LayoutTree<T> {
     fn edit_links(&mut self, key: NodeKey, edit: links::Edit<NodeKey>) {
         if let Some(node) = self.nodes.get_mut(key) {
             links::apply(node, edit);
+            #[cfg(feature = "batch-pilot")]
+            {
+                self.batch_start.changed();
+                if let Some(batch) = self.batch.first_mut() { batch.graph_changed(); }
+            }
         }
     }
 }
@@ -636,20 +841,60 @@ impl LayoutNode {
     }
 }
 
+fn zero_text<T>(_: NodeId, _: Option<&mut T>, _: Option<f32>) -> Xy<f32> {
+    Xy::new_symm(0.0)
+}
+
+fn zero_content<T>(_: NodeId, _: Option<&mut T>, _: ContentMeasureInput) -> Xy<f32> {
+    Xy::new_symm(0.0)
+}
+
 /// Gives a `LayoutTree` and a measure function to the solver.
 struct Adapter<'a, T, M, C> {
     tree: &'a mut LayoutTree<T>,
     text: M,
     content: C,
-    cache_text: bool,
+    cache_text: WrappedHeightCache,
+    #[cfg(feature = "batch-pilot")]
+    first_stack_population: u32,
     // The solver's borrowed-data interface is total. A missing internal key
     // has no links or callbacks and its writes stay in this adapter.
     missing_layout: NodeLayoutData,
 }
 
+#[derive(Clone, Copy)]
+enum WrappedHeightCache {
+    Disabled,
+    Flow,
+    #[cfg(feature = "batch-pilot")]
+    Batch,
+}
+
+impl WrappedHeightCache {
+    fn for_flow(enabled: bool) -> Self {
+        if enabled { Self::Flow } else { Self::Disabled }
+    }
+
+    fn enabled(self, has_flow: bool) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Flow => has_flow,
+            // The batch solver's sizing records live outside the default
+            // solver, so its layout data cannot classify a batch frame.
+            #[cfg(feature = "batch-pilot")]
+            Self::Batch => true,
+        }
+    }
+}
+
 impl<'a, T, M, C> Adapter<'a, T, M, C> {
     fn new(tree: &'a mut LayoutTree<T>, text: M, content: C) -> Self {
-        Self { tree, text, content, cache_text: false, missing_layout: NodeLayoutData::new() }
+        Self {
+            tree, text, content, cache_text: WrappedHeightCache::Disabled,
+            #[cfg(feature = "batch-pilot")]
+            first_stack_population: 0,
+            missing_layout: NodeLayoutData::new(),
+        }
     }
 }
 
@@ -703,10 +948,36 @@ where
     type NodeId = NodeKey;
 
     fn solve_layout(&mut self, window_size: Xy<f32>) {
-        self.solve_full::<true>(window_size);
+        // Fresh trees can use the full solver's unregistered preparation.
+        let registered_pixels = self.tree.layout_data.n_nodes_solved != 0;
+        crate::full_layout::run_owned::<_, crate::vec_memory::RustVec>(
+            self, window_size, registered_pixels, false,
+        );
     }
 
     fn retains_output_rects(&self) -> bool { true }
+
+    #[cfg(feature = "batch-pilot")]
+    #[inline]
+    fn stack_leaf_count_hint(&self, id: NodeKey) -> u32 {
+        let Some(parent) = self.tree.nodes.get(id) else { return 0; };
+        let recorded = parent.layout.n_placed_children;
+        let capacity = self.first_stack_population;
+        if recorded != 0 || capacity == 0 { return recorded; }
+        if parent.first_child == parent.last_child { return 0; }
+        // Adjacent fresh allocations often describe a complete leaf group.
+        // The preparation kernels still check the actual sibling count.
+        let Some(first) = parent.first_child.and_then(|id| self.tree.nodes.get(id)) else { return 0; };
+        let Some(last) = parent.last_child.and_then(|id| self.tree.nodes.get(id)) else { return 0; };
+        if first.first_child.is_some() || last.first_child.is_some() { return 0; }
+        let first = incarnation(first.identity);
+        let last = incarnation(last.identity);
+        records::leaf_count_hint(first, last, capacity)
+    }
+
+    #[cfg(feature = "batch-pilot")]
+    #[inline(always)]
+    fn first_stack_population_hint(&self) -> u32 { self.first_stack_population }
 
     #[inline(always)]
     fn root(&self) -> NodeKey {
@@ -764,7 +1035,7 @@ where
 
     fn measure_text_height(&mut self, i: NodeKey, wrap_width: Option<f32>) -> f32 {
         if let Some(width) = wrap_width
-            && self.cache_text && self.tree.layout_data.has_flow
+            && self.cache_text.enabled(self.tree.layout_data.has_flow)
         {
             let Some(node) = self.tree.nodes.get(i) else { return 0.0; };
             let identity = incarnation(node.identity);
@@ -802,6 +1073,23 @@ where
         {
             let warning = warning.map_node(|id| self.tree.node_id(id));
             self.tree.warnings.push(warning);
+        }
+    }
+}
+
+#[cfg(feature = "batch-pilot")]
+impl<T, M, C> batch::MemoSource for Adapter<'_, T, M, C>
+where
+    M: FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32>,
+    C: FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32>,
+{
+    fn batch_rectangle(&self, key: NodeKey) -> Option<XyRect> {
+        self.tree.nodes.get(key).map(|node| node.rect)
+    }
+
+    fn restore_batch_rectangle(&mut self, key: NodeKey, rectangle: XyRect) {
+        if let Some(node) = self.tree.nodes.get_mut(key) {
+            output::publish(&mut node.rect, &mut node.identity, rectangle);
         }
     }
 }
@@ -912,6 +1200,56 @@ fn max_line_chars(wrap_width: Option<f32>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "batch-pilot")]
+    #[test]
+    fn batch_workspace_is_deferred_until_a_changed_solve() {
+        let scale = PixelScale::new(1.25);
+        let window = Xy::new(100.25, 50.75);
+        let words = |rect: XyRect| [rect.x, rect.y].map(|edges| edges.map(f32::to_bits));
+
+        for switch_to_legacy in [false, true] {
+            let mut tree = LayoutTree::<()>::new();
+            let root = tree.root();
+            let mut style = LayoutParams {
+                size: Xy::new_symm(Size::Pixels(10.375)),
+                ..LayoutParams::DEFAULT
+            };
+            let child = tree.add_node(&root, style).unwrap();
+            tree.set_pixel_scale(scale);
+            assert_eq!(tree.solve_layout_batch(window).unwrap(), BatchLayoutStats::default());
+            assert_eq!(tree.batch.capacity(), 0);
+            let initial = words(tree.layout(&child).unwrap());
+
+            assert_eq!(tree.solve_layout_batch(window).unwrap(), BatchLayoutStats::default());
+            assert_eq!(tree.batch.capacity(), 0);
+            tree.set_pixel_scale(PixelScale::new(2.0));
+            tree.set_pixel_scale(scale);
+            assert_eq!(tree.solve_layout_batch(window).unwrap(), BatchLayoutStats::default());
+            assert_eq!(tree.batch.capacity(), 0);
+            assert_eq!(words(tree.layout(&child).unwrap()), initial);
+
+            let changed_window = if switch_to_legacy {
+                let resized = Xy::new(120.25, 70.75);
+                tree.solve_layout(resized);
+                resized
+            } else {
+                style.position.x = Pos::End;
+                tree.update_node_params(&child, style).unwrap();
+                window
+            };
+            assert_eq!(tree.batch.capacity(), 0);
+            assert!(tree.solve_layout_batch(changed_window).unwrap().rebuilt_graph);
+            assert_eq!(tree.batch.len(), 1);
+            assert_ne!(words(tree.layout(&child).unwrap()), initial);
+
+            let mut full = tree.clone();
+            full.solve_layout(changed_window);
+            for key in [root.key(), child.key()] {
+                assert_eq!(tree.layout(&tree.node_id(key)).map(words), full.layout(&full.node_id(key)).map(words));
+            }
+        }
+    }
 
     #[test]
     fn absent_adapter_key_has_no_links_callbacks_or_live_layout_writes() {
@@ -1346,7 +1684,7 @@ mod text_measure_binding_tests {
             },
             |_: NodeId, _: Option<&mut Rc<Cell<u32>>>, _: ContentMeasureInput| Xy::new_symm(0.0),
         );
-        adapter.cache_text = cache_text;
+        adapter.cache_text = WrappedHeightCache::for_flow(cache_text);
         let bits = adapter.measure_text_height(key, Some(width)).to_bits();
         (bits, calls)
     }

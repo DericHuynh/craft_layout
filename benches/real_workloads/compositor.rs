@@ -85,6 +85,7 @@ fn set_position(params: &mut LayoutParams, x: f32, y: f32) {
 }
 
 fn tiled_workspace() -> Case {
+    const WEIGHTS: [f32; 6] = [1.20, 1.45, 1.25, 0.95, 1.15, 1.0];
     let mut tree = LayoutTree::new();
     tree.set_pixel_scale(Some(
         PixelScale::try_from(1.25).expect("valid fractional scale"),
@@ -136,10 +137,10 @@ fn tiled_workspace() -> Case {
     let split = windows[0][0].clone();
     Case {
         name: "compositor/tiled_split_resize",
+        period: WEIGHTS.len(),
         tree,
         viewport,
         edit: Box::new(move |tree, frame| {
-            const WEIGHTS: [f32; 6] = [1.20, 1.45, 1.25, 0.95, 1.15, 1.0];
             let phase = frame % WEIGHTS.len();
             let mut params = *tree.params(&split).expect("live tiling split");
             params.fill_weight = WEIGHTS[phase];
@@ -155,6 +156,16 @@ fn tiled_workspace() -> Case {
 }
 
 fn floating_workspace() -> Case {
+    const DRAG: [(f32, f32); 8] = [
+        (464.25, 229.5),
+        (575.5, 280.25),
+        (737.25, 352.75),
+        (1035.5, 529.25),
+        (1052.75, 605.5),
+        (897.25, 474.25),
+        (644.75, 321.5),
+        (436.25, 201.5),
+    ];
     let mut tree = LayoutTree::new();
     tree.set_pixel_scale(Some(
         PixelScale::try_from(1.5).expect("valid fractional scale"),
@@ -203,19 +214,10 @@ fn floating_workspace() -> Case {
     let following = windows[3].clone();
     Case {
         name: "compositor/floating_drag_and_raise",
+        period: DRAG.len(),
         tree,
         viewport,
         edit: Box::new(move |tree, frame| {
-            const DRAG: [(f32, f32); 8] = [
-                (464.25, 229.5),
-                (575.5, 280.25),
-                (737.25, 352.75),
-                (1035.5, 529.25),
-                (1052.75, 605.5),
-                (897.25, 474.25),
-                (644.75, 321.5),
-                (436.25, 201.5),
-            ];
             let phase = frame % DRAG.len();
             let (x, y) = DRAG[phase];
             let mut params = *tree.params(&dragged).expect("live dragged surface");

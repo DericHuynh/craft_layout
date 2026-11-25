@@ -3,17 +3,14 @@
 
 use super::{sizing_requests, Request, RequestAccess, RequestModel, RequestSource};
 use core::marker::PhantomData;
-use sizing_requests::{FlowMode, RequestView};
 #[cfg(not(verus_keep_ghost))]
 use super::super::sizing_finish::StoredSize;
 #[cfg(verus_keep_ghost)]
 use crate::{cycles::kernel, dependencies::sizing_finish::StoredSize};
-#[cfg(not(verus_keep_ghost))]
-use super::super::dependency_rules::Form;
-#[cfg(verus_keep_ghost)]
-use crate::dependencies::rules::Form;
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+use sizing_requests::RequestView;
 
 #[cfg(not(verus_keep_ghost))]
 pub(crate) trait NativeModel {
@@ -52,21 +49,6 @@ pub(crate) open spec fn inputs_available<W: NativeModel + ?Sized>(work: &W, slot
 
 pub(crate) open spec fn ordered<I: Copy>(topology: sizing_requests::Topology<I>) -> bool {
     forall |slot: Request<I>| #[trigger] sizing_requests::ordered_children(topology, slot)
-}
-
-pub(crate) open spec fn empty<I>() -> sizing_requests::Topology<I> {
-    sizing_requests::Topology {
-        form: |_: Request<I>| None,
-        stack_parent: |_: Request<I>| None,
-        parent: |_: I| None,
-        parent_flow: |_: Request<I>, _: I| false,
-        parent_other: |_: Request<I>, _: I| false,
-        intrinsic_flow: |_: Request<I>| false,
-        intrinsic_other: |_: Request<I>| false,
-        children: |_: I| Seq::empty(),
-        flow_mode: |_: I| FlowMode::Other,
-        block_children: |_: I| Seq::empty(),
-    }
 }
 
 pub(crate) type VisitEvidence<I> = (bool, Request<I>, ISet<Request<I>>);
@@ -152,26 +134,21 @@ pub(crate) trait NativeAccess: NativeModel {
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 trait Continuation<W: NativeAccess> {
-    #[cfg_attr(verus_keep_ghost, verus_spec(result =>
-        requires ordered(work.topology()),
-        ensures result.topology() == work.topology(),
-            ready(&work).subset_of(ready(&result)), ready(&result).contains(slot),
-            result.packed_phase(slot) == if work.packed_phase(slot) == kernel::IN_PROGRESS {
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires ordered(old(work).topology()),
+        ensures final(work).topology() == old(work).topology(),
+            ready(old(work)).subset_of(ready(final(work))), ready(final(work)).contains(slot),
+            final(work).packed_phase(slot) == if old(work).packed_phase(slot) == kernel::IN_PROGRESS {
                 kernel::IN_PROGRESS
             } else { kernel::SOLVED },
         no_unwind
     ))]
-    fn visit(work: W, slot: Request<W::Id>) -> W;
+    fn visit(work: &mut W, slot: Request<W::Id>);
 }
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
-struct ActiveSource<W: NativeAccess> {
-    work: Option<W>,
-}
-
-#[cfg_attr(verus_keep_ghost, verus_verify)]
-struct NativeRequests<W: NativeAccess, Next: Continuation<W>> {
-    active: ActiveSource<W>,
+struct NativeRequests<'a, W: NativeAccess, Next: Continuation<W>> {
+    work: &'a mut W,
     next: PhantomData<Next>,
     #[cfg(verus_keep_ghost)]
     trace: Ghost<Seq<VisitEvidence<W::Id>>>,
@@ -181,44 +158,31 @@ struct NativeRequests<W: NativeAccess, Next: Continuation<W>> {
 
 #[cfg(verus_keep_ghost)]
 verus! {
-impl<W: NativeAccess, Next: Continuation<W>> NativeRequests<W, Next> {
+impl<'a, W: NativeAccess, Next: Continuation<W>> NativeRequests<'a, W, Next> {
     #[verifier::type_invariant]
     spec fn valid(&self) -> bool {
-        match &self.active.work {
-            Some(active) => {
-                &&& ordered(active.topology())
-                &&& self.initial@.subset_of(ready(active))
-                &&& forall |i: int| 0 <= i < self.trace@.len() && (#[trigger] self.trace@[i]).0
-                    ==> ready(active).contains(self.trace@[i].1)
-            },
-            None => true,
-        }
-    }
-
-}
-
-impl<W: NativeAccess> RequestView for ActiveSource<W> {
-    type Id = W::Id;
-
-    closed spec fn topology(&self) -> sizing_requests::Topology<W::Id> {
-        match &self.work {
-            Some(active) => active.topology(),
-            None => empty(),
-        }
+        &&& ordered(self.work.topology())
+        &&& self.initial@.subset_of(ready(self.work))
+        &&& forall |i: int| 0 <= i < self.trace@.len()
+            ==> ready(self.work).contains((#[trigger] self.trace@[i]).1)
     }
 }
 
-impl<W: NativeAccess, Next: Continuation<W>> RequestModel for NativeRequests<W, Next> {
+impl<W: NativeAccess, Next: Continuation<W>> RequestModel for NativeRequests<'_, W, Next> {
     type Id = W::Id;
-    type Source = ActiveSource<W>;
+    type Source = W::View;
     type Event = VisitEvidence<W::Id>;
+    type Context = W;
 
-    closed spec fn topology(&self) -> sizing_requests::Topology<W::Id> { self.active.topology() }
+    // Request dispatch returns the borrow to the original work frame.
+    #[verifier::prophetic]
+    closed spec fn context(&self) -> Self::Context { *final(self.work) }
+
+    closed spec fn topology(&self) -> sizing_requests::Topology<W::Id> { self.work.topology() }
 
     closed spec fn projection(&self) -> spec_fn(Request<W::Id>) -> Self::Event {
-        let present = self.active.work.is_some();
         let initial = self.initial@;
-        |slot: Request<W::Id>| (present, slot, initial)
+        |slot: Request<W::Id>| (true, slot, initial)
     }
 
     closed spec fn requests(&self) -> Seq<Self::Event> { self.trace@ }
@@ -226,143 +190,39 @@ impl<W: NativeAccess, Next: Continuation<W>> RequestModel for NativeRequests<W, 
 }
 
 #[cfg(not(verus_keep_ghost))]
-impl<W: NativeAccess> RequestView for ActiveSource<W> {
+impl<W: NativeAccess, Next: Continuation<W>> RequestModel for NativeRequests<'_, W, Next> {
     type Id = W::Id;
-}
-
-#[cfg(not(verus_keep_ghost))]
-impl<W: NativeAccess, Next: Continuation<W>> RequestModel for NativeRequests<W, Next> {
-    type Id = W::Id;
-    type Source = ActiveSource<W>;
-}
-
-impl<W: NativeAccess> ActiveSource<W> {
-    #[inline(always)]
-    #[cfg_attr(verus_keep_ghost, verus_verify)]
-    #[cfg_attr(verus_keep_ghost, verus_spec(view =>
-        ensures view.is_some() == self.work.is_some(),
-            view.is_some() ==> view.unwrap().topology() == self.topology(),
-        no_unwind
-    ))]
-    fn view(&self) -> Option<&W::View> {
-        match &self.work {
-            Some(active) => Some(active.view()),
-            None => None,
-        }
-    }
+    type Source = W::View;
 }
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
-impl<W: NativeAccess> RequestSource for ActiveSource<W> {
+impl<W: NativeAccess, Next: Continuation<W>> RequestAccess for NativeRequests<'_, W, Next> {
     #[inline(always)]
-    fn form(&self, slot: Request<W::Id>) -> Option<Form> {
-        match self.view() { Some(view) => view.form(slot), None => None }
-    }
-
-    #[inline(always)]
-    fn final_declarations(&self, slot: Request<W::Id>) -> (bool, bool, bool) {
-        match self.view() { Some(view) => view.final_declarations(slot), None => (false, false, false) }
-    }
-
-    #[inline(always)]
-    fn stack_parent(&self, slot: Request<W::Id>) -> Option<W::Id> {
-        match self.view() { Some(view) => view.stack_parent(slot), None => None }
-    }
-
-    #[inline(always)]
-    fn parent(&self, node: W::Id) -> Option<W::Id> {
-        match self.view() { Some(view) => view.parent(node), None => None }
-    }
-
-    #[inline(always)]
-    fn parent_uses_flow(&self, slot: Request<W::Id>, parent: W::Id) -> bool {
-        match self.view() { Some(view) => view.parent_uses_flow(slot, parent), None => false }
-    }
-
-    #[inline(always)]
-    fn parent_uses_other_axis(&self, slot: Request<W::Id>, parent: W::Id) -> bool {
-        match self.view() { Some(view) => view.parent_uses_other_axis(slot, parent), None => false }
-    }
-
-    #[inline(always)]
-    fn intrinsic_uses_flow(&self, slot: Request<W::Id>) -> bool {
-        match self.view() { Some(view) => view.intrinsic_uses_flow(slot), None => false }
-    }
-
-    #[inline(always)]
-    fn intrinsic_uses_other_axis(&self, slot: Request<W::Id>) -> bool {
-        match self.view() { Some(view) => view.intrinsic_uses_other_axis(slot), None => false }
-    }
-
-    #[inline(always)]
-    fn first_child(&self, node: W::Id) -> Option<W::Id> {
-        match self.view() { Some(view) => view.first_child(node), None => None }
-    }
-
-    #[inline(always)]
-    fn child(&self, parent: W::Id, child: W::Id) -> (Option<W::Id>, bool) {
-        match self.view() { Some(view) => view.child(parent, child), None => (None, false) }
-    }
-
-    #[inline(always)]
-    fn flow_mode(&self, parent: W::Id) -> FlowMode {
-        match self.view() { Some(view) => view.flow_mode(parent), None => FlowMode::Other }
-    }
-
-    #[inline(always)]
-    fn block_child(&self, parent: W::Id, child: W::Id) -> (Option<W::Id>, bool, bool) {
-        match self.view() { Some(view) => view.block_child(parent, child), None => (None, false, false) }
-    }
-
-    #[inline(always)]
-    fn wrap_child(&self, parent: W::Id, main: bool, child: W::Id) -> (Option<W::Id>, bool) {
-        match self.view() { Some(view) => view.wrap_child(parent, main, child), None => (None, false) }
-    }
-}
-
-#[cfg_attr(verus_keep_ghost, verus_verify)]
-impl<W: NativeAccess, Next: Continuation<W>> RequestAccess for NativeRequests<W, Next> {
-    #[inline(always)]
-    fn source(&self) -> &Self::Source { &self.active }
+    fn source(&self) -> &Self::Source { self.work.view() }
 
     #[inline(always)]
     fn emit(&mut self, slot: Request<W::Id>) {
         #[cfg(verus_keep_ghost)]
         proof! { use_type_invariant(&*self); }
-        let active = self.active.work.take();
         #[cfg(verus_keep_ghost)]
-        let present = active.is_some();
-        if let Some(active) = active {
-            #[cfg(verus_keep_ghost)]
-            let prior = ready_start(&active);
-            let visited = Next::visit(active, slot);
-            #[cfg(verus_keep_ghost)]
-            proof! {
-                assert(self.initial@.subset_of(prior@));
-                assert(self.initial@.subset_of(ready(&visited)));
-                assert forall |i: int| 0 <= i < self.trace@.len() && (#[trigger] self.trace@[i]).0
-                    implies ready(&visited).contains(self.trace@[i].1) by {
-                    assert(prior@.contains(self.trace@[i].1));
-                }
-            }
-            self.active.work = Some(visited);
-        }
+        let prior = ready_start(self.work);
+        Next::visit(self.work, slot);
         #[cfg(verus_keep_ghost)]
         {
             let old_trace = self.trace;
-            self.trace = append_trace(self.trace, present, slot, self.initial);
+            self.trace = append_trace(self.trace, true, slot, self.initial);
             proof! {
-                if let Some(visited) = &self.active.work {
-                    assert forall |i: int| 0 <= i < self.trace@.len() && (#[trigger] self.trace@[i]).0
-                        implies ready(visited).contains(self.trace@[i].1) by {
+                assert(self.initial@.subset_of(prior@));
+                assert(self.initial@.subset_of(ready(self.work)));
+                assert forall |i: int| 0 <= i < self.trace@.len()
+                    implies ready(self.work).contains((#[trigger] self.trace@[i]).1) by {
                         if i < old_trace@.len() {
                             assert(self.trace@[i] == old_trace@[i]);
-                            assert(ready(visited).contains(old_trace@[i].1));
+                            assert(prior@.contains(old_trace@[i].1));
                         } else {
-                            assert(self.trace@[i] == (present, slot, self.initial@));
+                            assert(self.trace@[i] == (true, slot, self.initial@));
                         }
-                    }
-                }
+                    };
             }
         }
     }
@@ -373,11 +233,10 @@ struct Spill;
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 impl<W: NativeAccess> Continuation<W> for Spill {
-    fn visit(mut work: W, slot: Request<W::Id>) -> W {
+    fn visit(work: &mut W, slot: Request<W::Id>) {
         if let Some((opened, check)) = work.start(slot) {
             work.spill(opened, check);
         }
-        work
     }
 }
 
@@ -386,18 +245,20 @@ struct Step<Next>(PhantomData<Next>);
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 impl<W: NativeAccess, Next: Continuation<W>> Continuation<W> for Step<Next> {
-    fn visit(mut work: W, slot: Request<W::Id>) -> W {
-        let Some((opened, check)) = work.start(slot) else { return work; };
+    fn visit(work: &mut W, slot: Request<W::Id>) {
+        let Some((opened, check)) = work.start(slot) else { return; };
         #[cfg(verus_keep_ghost)]
-        let initial = ready_start(&work);
+        let initial = ready_start(work);
         let pending = NativeRequests {
-            active: ActiveSource { work: Some(work) },
+            work: &mut *work,
             next: PhantomData::<Next>,
             #[cfg(verus_keep_ghost)]
             trace: empty_trace(),
             #[cfg(verus_keep_ghost)]
             initial,
         };
+        #[cfg(verus_keep_ghost)]
+        proof! { assert(pending.context() == *final(pending.work)); }
         let visited = sizing_requests::request_inputs(pending, slot);
         #[cfg(verus_keep_ghost)]
         proof! {
@@ -408,12 +269,10 @@ impl<W: NativeAccess, Next: Continuation<W>> Continuation<W> for Step<Next> {
             let exact = sizing_requests::inputs(topology, slot).map_values(|dependency: Request<W::Id>| (true, dependency, initial@));
             assert(visited.requests() =~= exact);
             assert(visited.initial@ == initial@);
-            if let Some(active) = &visited.active.work {
-                assert(inputs_available(active, slot)) by {
-                    let inputs = sizing_requests::inputs(active.topology(), slot);
-                    assert forall |i: int| 0 <= i < inputs.len() implies ready(active).contains(#[trigger] inputs[i]) by {
-                        assert(visited.requests()[i] == (true, inputs[i], initial@));
-                    }
+            assert(inputs_available(visited.work, slot)) by {
+                let inputs = sizing_requests::inputs(visited.work.topology(), slot);
+                assert forall |i: int| 0 <= i < inputs.len() implies ready(visited.work).contains(#[trigger] inputs[i]) by {
+                    assert(visited.requests()[i] == (true, inputs[i], initial@));
                 }
             }
             assert forall |live: Set<W::Id>| sizing_requests::live::closed(topology, live) && live.contains(slot.node)
@@ -421,10 +280,7 @@ impl<W: NativeAccess, Next: Continuation<W>> Continuation<W> for Step<Next> {
                 native_emissions_live(topology, slot, live, initial@);
             }
         }
-        // The projection records that all requests returned the active solver.
-        let Some(mut work) = visited.active.work else { unreachable!() };
-        let _stored = work.finish(opened, check);
-        work
+        let _stored = visited.work.finish(opened, check);
     }
 }
 
@@ -449,11 +305,13 @@ type Configured = Eight<Eight<Eight<Spill>>>;
         } else { kernel::SOLVED },
     no_unwind
 ))]
-pub(crate) fn drive<W: NativeAccess>(work: W, slot: Request<W::Id>) -> W {
-    Configured::visit(work, slot)
+pub(crate) fn drive<W: NativeAccess>(mut work: W, slot: Request<W::Id>) -> W {
+    Configured::visit(&mut work, slot);
+    work
 }
 
 #[cfg(test)]
-pub(crate) fn drive_spill<W: NativeAccess>(work: W, slot: Request<W::Id>) -> W {
-    Spill::visit(work, slot)
+pub(crate) fn drive_spill<W: NativeAccess>(mut work: W, slot: Request<W::Id>) -> W {
+    Spill::visit(&mut work, slot);
+    work
 }

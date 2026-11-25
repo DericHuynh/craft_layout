@@ -461,7 +461,7 @@ proof fn append_flow<I, F: Scalar>(order: Order<I>, parent: I, rows: Seq<(I, Blo
     ensures accepted == supported_declarations(*p, root),
     no_unwind
 ))]
-fn accepts_declarations(p: &LayoutParams, root: bool) -> bool {
+pub(crate) fn accepts_declarations(p: &LayoutParams, root: bool) -> bool {
     let inline = matches!(p.size.x, Size::Pixels(_) | Size::Fill) || !root && matches!(p.size.x, Size::Auto);
     let block = matches!(p.size.y, Size::Pixels(_) | Size::Auto | Size::FitContent) || root && matches!(p.size.y, Size::Fill);
     inline && block && p.min_size.x.is_none() && p.min_size.y.is_none() && p.max_size.y.is_none()
@@ -471,7 +471,7 @@ fn accepts_declarations(p: &LayoutParams, root: bool) -> bool {
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(width => ensures width == ordinary_block_width::<F>(*p, parent, root), no_unwind))]
-fn width<F: FrameFloat>(p: &LayoutParams, parent: f32, root: bool) -> Width {
+pub(crate) fn width<F: FrameFloat>(p: &LayoutParams, parent: f32, root: bool) -> Width {
     let [before, after] = p.margin.x;
     let regular = match p.size.x {
         Size::Pixels(pixels) => pixels,

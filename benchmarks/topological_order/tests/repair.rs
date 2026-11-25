@@ -32,6 +32,15 @@ fn assert_repair_matches_kahn(
     let before = TopologicalOrder::new(initial.to_vec()).unwrap();
     let mut order = before.clone();
     let result = order.repair(graph, additions, scratch);
+    if initial.iter().copied().eq(0..initial.len()) {
+        let mut cold = TopologicalOrder::default();
+        assert_eq!(cold.repair_with_appended(graph, additions, scratch), result);
+        if result.is_ok() {
+            assert_eq!(cold, order);
+        } else {
+            assert_eq!(cold, TopologicalOrder::default());
+        }
+    }
     if static_kahn(graph).is_none() {
         assert_eq!(
             result,
@@ -112,6 +121,50 @@ fn every_old_forward_graph_and_insertion_batch_for_four_vertices() {
 }
 
 #[test]
+#[ignore = "exhaustive graph check, use the release test profile"]
+fn every_five_vertex_graph_on_the_initial_append_path() {
+    const VERTICES: usize = 5;
+    let edges: Vec<_> = (0..VERTICES)
+        .flat_map(|from| {
+            (0..VERTICES)
+                .filter(move |&to| to != from)
+                .map(move |to| (from, to))
+        })
+        .collect();
+    let mut graph: [Vec<usize>; VERTICES] = std::array::from_fn(|_| Vec::new());
+    let mut backward = Vec::new();
+    let mut scratch = RepairScratch::default();
+    let mut accepted = 0;
+    for mask in 0..(1 << edges.len()) {
+        graph.iter_mut().for_each(Vec::clear);
+        backward.clear();
+        for (bit, &(from, to)) in edges.iter().enumerate() {
+            if mask & (1 << bit) != 0 {
+                graph[from].push(to);
+                if to < from {
+                    backward.push((from, to));
+                }
+            }
+        }
+        let mut order = TopologicalOrder::default();
+        let result = order.repair_with_appended(graph.as_slice(), &backward, &mut scratch);
+        if static_kahn(&graph).is_some() {
+            assert!(result.is_ok(), "{mask:020b}: {result:?}");
+            assert_eq!(order.validate_graph(&graph), Ok(()), "{mask:020b}");
+            assert_eq!(order.order().len(), VERTICES);
+            for (rank, &vertex) in order.order().iter().enumerate() {
+                assert_eq!(order.positions()[vertex], rank, "{mask:020b}");
+            }
+            accepted += 1;
+        } else {
+            assert_eq!(result, Err(RepairError::Cycle), "{mask:020b}");
+            assert_eq!(order, TopologicalOrder::default(), "{mask:020b}");
+        }
+    }
+    assert_eq!(accepted, 29_281);
+}
+
+#[test]
 fn independently_permuted_orders_and_inserted_edges() {
     let mut state = 0x843b_794a_b16f_1b57u64;
     let mut next = || {
@@ -175,6 +228,31 @@ fn forward_only_checks_seed_endpoints_and_keeps_the_unchanged_order() {
     );
     assert_eq!(order.order(), initial);
     assert_eq!(order.validate_graph(&graph), Ok(()));
+}
+
+#[test]
+fn sparse_identity_shift_matches_the_general_shift_in_disjoint_regions() {
+    let mut graph = vec![Vec::new(); 1_024];
+    let additions = [(600, 40), (910, 740)];
+    for (from, to) in [(40, 92), (92, 136), (740, 810)]
+        .into_iter()
+        .chain(additions)
+    {
+        graph[from].push(to);
+    }
+    let mut scratch = RepairScratch::default();
+    let mut general = TopologicalOrder::new((0..graph.len()).collect()).unwrap();
+    let expected = general.repair(&graph, &additions, &mut scratch).unwrap();
+    assert_eq!(expected.regions, 2);
+    assert_eq!(expected.discovered_vertices, 5);
+
+    let mut cold = TopologicalOrder::default();
+    let actual = cold
+        .repair_with_appended(graph.as_slice(), &additions, &mut scratch)
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(cold, general);
+    assert_eq!(cold.validate_graph(&graph), Ok(()));
 }
 
 #[test]
@@ -245,6 +323,27 @@ fn a_late_cycle_or_invalid_edge_leaves_earlier_regions_uncommitted() {
             .regions,
         2
     );
+    assert_eq!(order.validate_graph(&graph), Ok(()));
+}
+
+#[test]
+fn a_rejected_expansion_restores_the_order_before_appending_slots() {
+    let before = TopologicalOrder::new(vec![1, 0]).unwrap();
+    let mut order = before.clone();
+    let mut scratch = RepairScratch::default();
+    let mut graph = [vec![1], vec![0], vec![], vec![2]];
+    assert_eq!(
+        order.repair_with_appended(&graph[..], &[(0, 1), (3, 2)], &mut scratch),
+        Err(RepairError::Cycle)
+    );
+    assert_eq!(order, before);
+
+    graph[0].clear();
+    let repaired = order
+        .repair_with_appended(&graph[..], &[(3, 2)], &mut scratch)
+        .unwrap();
+    assert_eq!(repaired.regions, 1);
+    assert_eq!(order.order(), &[1, 0, 3, 2]);
     assert_eq!(order.validate_graph(&graph), Ok(()));
 }
 

@@ -179,6 +179,9 @@ pub(crate) trait Records: RecordModel {
     ))]
     fn record(&self, node: Self::Id) -> &NodeLayoutData;
 
+    #[cfg_attr(verus_keep_ghost, verus_spec(requires live(self, node), no_unwind))]
+    fn stack_leaf_count_hint(&self, node: Self::Id) -> u32;
+
     #[cfg_attr(verus_keep_ghost, verus_spec(data =>
         requires live(old(self), node),
         ensures final(self).order() == old(self).order(),
@@ -296,6 +299,14 @@ impl<T: crate::TreeAdapter + ?Sized> Records for T {
 
     #[inline(always)]
     fn record(&self, node: Self::Id) -> &NodeLayoutData { self.node_layout_data(node) }
+
+    #[inline(always)]
+    fn stack_leaf_count_hint(&self, node: Self::Id) -> u32 {
+        #[cfg(feature = "batch-pilot")]
+        { crate::TreeAdapter::stack_leaf_count_hint(self, node) }
+        #[cfg(not(feature = "batch-pilot"))]
+        { self.node_layout_data(node).n_placed_children }
+    }
 
     #[inline(always)]
     fn edit(&mut self, node: Self::Id) -> &mut NodeLayoutData { self.node_layout_data_mut(node) }
@@ -589,7 +600,7 @@ fn prepare_fill_leaf_line_axis<T: StartActions + ?Sized, const VERTICAL: bool>(
     tree: &mut T, mut frame: PrepareFrame<T::Id>, own: KnownAxis, inner: f32, retained: &mut RetainedSizing,
 ) -> Option<Summary> {
     let parent = frame.node;
-    let expected = tree.record(parent).n_placed_children;
+    let expected = tree.stack_leaf_count_hint(parent);
     // Summing this many unit weights in source order is exact in binary32.
     if expected == 0 || expected > 16_777_216 { return None; }
     let mut count = 0;
@@ -750,7 +761,7 @@ fn prepare_cross_fill_line_axis<T: StartActions + ?Sized, const VERTICAL: bool>(
     let cross = if VERTICAL { Axis::Y } else { Axis::X };
     let main = cross.other();
     #[cfg(any(feature = "incremental", verus_keep_ghost))]
-    let expected = tree.record(frame.node).n_placed_children;
+    let expected = tree.stack_leaf_count_hint(frame.node);
     #[cfg(any(feature = "incremental", verus_keep_ghost))]
     let mut rows: Option<(u32, u32)> = None;
     let mut record = T::empty_record();

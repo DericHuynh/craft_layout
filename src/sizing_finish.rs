@@ -547,7 +547,7 @@ pub(crate) fn padding_for<F: FrameFloat>(params: &LayoutParams, axis: Axis) -> f
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(gaps => ensures gaps == gap_extent::<F>(spacing, count), no_unwind))]
-fn stack_gap_total<F: FrameFloat>(spacing: f32, count: u32) -> f32 {
+pub(crate) fn stack_gap_total<F: FrameFloat>(spacing: f32, count: u32) -> f32 {
     let gap_count = F::max(F::subtract(F::from_count(count), 1.0), 0.0);
     F::multiply(spacing, gap_count)
 }

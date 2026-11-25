@@ -92,6 +92,8 @@ mod node_data;
 mod prepare_frame;
 #[path = "../src/prepare_leaf.rs"]
 mod prepare_leaf;
+#[path = "../src/layout_tree/batch/warm/ratio.rs"]
+mod batch_ratio;
 #[path = "../src/prepare_nodes.rs"]
 mod prepare_nodes;
 #[path = "../src/sizing_pass.rs"]
