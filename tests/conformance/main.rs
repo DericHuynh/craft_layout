@@ -9,6 +9,7 @@
 //! cargo test --test conformance -- --verbose        # print every failure
 //! cargo test --test conformance -- --update         # rewrite the ratchet
 //! cargo test --test conformance -- --case-report cases.tsv
+//! cargo test --test conformance -- --workarounds    # local CSS authoring probes only
 //! ```
 //!
 //! Fixtures in `passing.txt` must match Chrome. Cases in
@@ -651,10 +652,36 @@ impl Tally {
     }
 }
 
+// These local probes assert the documented Craft result. Some intentionally
+// differ from the measured browser geometry. Keep them outside the Taffy tally.
+fn check_workarounds() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmarks/conformance/workarounds");
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .expect("CSS workaround fixtures")
+        .map(|entry| entry.expect("workaround fixture entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "xml"))
+        .collect();
+    paths.sort();
+    assert!(!paths.is_empty(), "no CSS workaround fixtures found");
+    for path in &paths {
+        let result = run(path, None, &mut Details::default(), false);
+        assert!(
+            matches!(result, Outcome::Pass),
+            "{}: {result:?}",
+            path.display()
+        );
+    }
+    println!("CSS workaround fixtures: {} verified", paths.len());
+}
+
 fn main() {
+    check_workarounds();
     translate::check_sibling_composition();
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| args.iter().any(|a| a == name);
+    if flag("--workarounds") {
+        return;
+    }
     let filter = args
         .iter()
         .position(|a| a == "--filter")

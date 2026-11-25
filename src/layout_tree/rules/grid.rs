@@ -71,13 +71,8 @@ fn content_floor(
         if tracks.len() > 1 && matches!(max, TrackMax::Fr(_)) {
             return (0., false);
         }
-        qualifies |= matches!(min, TrackMin::Content)
-            || matches!(min, TrackMin::Percent(_)) && extent.is_none();
-        let fixed_min = match min {
-            TrackMin::Pixels(v) => v.max(0.),
-            TrackMin::Percent(p) => extent.map_or(0., |w| p.max(0.) * w),
-            _ => 0.,
-        };
+        qualifies |= matches!(min, TrackMin::Content) || min.is_relative() && extent.is_none();
+        let fixed_min = min.resolve(extent).unwrap_or(0.) as f32;
         // fit-content() limits preferred growth. Its argument is not a
         // fixed maximum for the automatic minimum of its occupants.
         let fixed_max = match (track, max) {
@@ -89,7 +84,7 @@ fn content_floor(
             }
             _ => f32::INFINITY,
         };
-        relative |= matches!(min, TrackMin::Percent(_));
+        relative |= min.is_relative();
         cap += fixed_max.max(fixed_min);
     }
     if !qualifies {

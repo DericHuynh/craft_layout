@@ -77,11 +77,33 @@ fn breadth(raw: &str, unit: &str) -> Option<f32> {
     (n.is_finite() && n >= 0.).then_some(n)
 }
 
-fn track(raw: &str, stretch: bool) -> Result<Track> {
+fn pixels(raw: &str) -> Option<f32> {
     if raw == "0" {
-        return Ok(Track::Pixels(0.));
+        Some(0.)
+    } else {
+        breadth(raw, "px")
     }
-    if let Some(px) = breadth(raw, "px") {
+}
+
+// CSS min() in the lower bound of a grid track, with one percentage and one pixel length.
+fn capped_percentage(raw: &str) -> Option<TrackMin> {
+    let (a, b) = raw
+        .strip_prefix("min(")?
+        .strip_suffix(')')?
+        .split_once(',')?;
+    let (percent, pixels) = if a.trim_end().ends_with('%') {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    Some(TrackMin::CappedPercent {
+        fraction: breadth(percent.trim(), "%")? / 100.,
+        pixels: breadth(pixels.trim(), "px")?,
+    })
+}
+
+fn track(raw: &str, stretch: bool) -> Result<Track> {
+    if let Some(px) = pixels(raw) {
         return Ok(Track::Pixels(px));
     }
     if let Some(p) = breadth(raw, "%") {
@@ -117,13 +139,15 @@ fn track(raw: &str, stretch: bool) -> Result<Track> {
     if let Some(args) = raw
         .strip_prefix("minmax(")
         .and_then(|s| s.strip_suffix(')'))
-        && let Some((min, max)) = args.split_once(',')
+        && let Some((min, max)) = args.rsplit_once(',')
     {
         let (min, max) = (min.trim(), max.trim());
-        let min = if let Some(v) = breadth(min, "px") {
+        let min = if let Some(v) = pixels(min) {
             TrackMin::Pixels(v)
         } else if let Some(v) = breadth(min, "%") {
             TrackMin::Percent(v / 100.)
+        } else if let Some(limit) = capped_percentage(min) {
+            limit
         } else if min == "min-content" {
             TrackMin::MinContent
         } else if min == "max-content" {
@@ -133,7 +157,7 @@ fn track(raw: &str, stretch: bool) -> Result<Track> {
         } else {
             return unsupported(format!("grid track minimum={min}"));
         };
-        let max = if let Some(v) = breadth(max, "px") {
+        let max = if let Some(v) = pixels(max) {
             TrackMax::Pixels(v)
         } else if let Some(v) = breadth(max, "%") {
             TrackMax::Percent(v / 100.)

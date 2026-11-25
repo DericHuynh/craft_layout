@@ -18,6 +18,14 @@ pub enum TrackMin {
     Pixels(f32),
     /// Fraction of the container's content size.
     Percent(f32),
+    /// The smaller of a fraction of the content box and a logical pixel limit.
+    /// Like `Percent`, this minimum is intrinsic until the container extent is definite.
+    CappedPercent {
+        /// Fraction of the content size on the track's axis.
+        fraction: f32,
+        /// Maximum value of this minimum in logical pixels.
+        pixels: f32,
+    },
     /// Protect the full preferred contribution, even under a tight budget.
     MaxContent,
     /// Protect the minimum unbreakable content contribution.
@@ -25,6 +33,25 @@ pub enum TrackMin {
     /// Minimum contribution of items occupying this track.
     Content,
 }
+impl TrackMin {
+    #[cfg(feature = "incremental")]
+    pub(crate) fn is_relative(self) -> bool {
+        matches!(self, Self::Percent(_) | Self::CappedPercent { .. })
+    }
+
+    pub(crate) fn resolve(self, extent: Option<f32>) -> Option<f64> {
+        let percent = |f: f32| extent.map(|e| f64::from(e) * f64::from(f.max(0.)));
+        match self {
+            Self::Pixels(p) => Some(f64::from(p.max(0.))),
+            Self::Percent(f) => percent(f),
+            Self::CappedPercent { fraction, pixels } => {
+                percent(fraction).map(|v| v.min(f64::from(pixels.max(0.))))
+            }
+            Self::Content | Self::MinContent | Self::MaxContent => None,
+        }
+    }
+}
+
 /// Upper limit of a track.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrackMax {
@@ -87,14 +114,14 @@ pub enum TrackAxis {
     Tracks(Vec<Track>),
     /// Repeat as often as fits and retain empty tracks.
     AutoFill {
-        /// Minimum space needed for one repetition, excluding gaps.
+        /// Minimum width or height of a repeated track, excluding gaps.
         minimum: f32,
         /// Track declaration used for each repetition.
         track: Track,
     },
     /// Repeat as often as fits, collapsing empty tracks and adjacent gaps.
     AutoFit {
-        /// Minimum space needed for one repetition, excluding gaps.
+        /// Minimum width or height of a repeated track, excluding gaps.
         minimum: f32,
         /// Track declaration used for each repetition.
         track: Track,
@@ -130,6 +157,23 @@ impl TrackAxis {
     pub fn repeat(count: u16, track: Track) -> Self {
         Self::Tracks(vec![track; usize::from(count)])
     }
+    /// Fit as many equal fractional tracks as the preferred minimum allows.
+    /// A single track can shrink to the container extent. Empty slots collapse.
+    pub fn auto_fit_within(preferred_minimum: f32) -> Self {
+        Self::AutoRepeat {
+            before: Vec::new(),
+            pattern: vec![Track::MinMax(
+                TrackMin::CappedPercent {
+                    fraction: 1.,
+                    pixels: preferred_minimum,
+                },
+                TrackMax::Fr(1.),
+            )],
+            after: Vec::new(),
+            fit: true,
+        }
+    }
+
     pub(crate) fn count(&self, extent: f32, gap: f32, inherited: Option<usize>) -> usize {
         match self {
             Self::Tracks(v) => v.len().min(MAX_TRACKS),
@@ -560,11 +604,7 @@ struct Sizing {
 fn sizing(track: Track, extent: Option<f32>) -> Sizing {
     let percent = |f: f32| extent.map(|e| f64::from(e) * f64::from(f.max(0.)));
     let (min, max) = track.bounds();
-    let lower = match min {
-        TrackMin::Pixels(p) => Some(f64::from(p.max(0.))),
-        TrackMin::Percent(f) => percent(f),
-        TrackMin::Content | TrackMin::MinContent | TrackMin::MaxContent => None,
-    };
+    let lower = min.resolve(extent);
     let upper = match max {
         TrackMax::Pixels(p) => Some(f64::from(p.max(0.))),
         TrackMax::Percent(f) => percent(f),

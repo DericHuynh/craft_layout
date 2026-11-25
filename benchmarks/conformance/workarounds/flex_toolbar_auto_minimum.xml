@@ -1,0 +1,20 @@
+<test name="flex_toolbar_auto_minimum" use-rounding="false">
+  <!-- Chromium 83 and the CSS importer give the title slot 288px. The 40px action begins at x=296. -->
+  <viewport width="400px" height="400px"/>
+  <input>
+    <div display="flex" direction="ltr" position="absolute" width="224px" height="32px">
+      <div display="flex" direction="ltr" position="relative" flex-basis="0%" flex-grow="1" flex-shrink="1">
+        <div display="flex" direction="ltr" position="relative" width="288px" height="16px" flex-shrink="0"/>
+      </div>
+      <div display="flex" direction="ltr" position="relative" width="40px" flex-shrink="0" margin-left="8px"/>
+    </div>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="224" height="32">
+      <node x="0" y="0" width="288" height="32">
+        <node x="0" y="0" width="288" height="16"/>
+      </node>
+      <node x="296" y="0" width="40" height="32"/>
+    </node>
+  </expectations>
+</test>

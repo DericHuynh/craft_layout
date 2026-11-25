@@ -347,6 +347,9 @@ pub struct LayoutParams {
     /// Keep child block margins inside this box and separate its own before and after
     /// margins when empty. Its outer margins can still collapse with adjacent siblings.
     /// Managed flex and track grids establish this boundary automatically.
+    /// In an owned tree's horizontal block flow, an isolated block avoids adjacent
+    /// floats and includes its own floats in its intrinsic height. Overflow stays visible
+    /// by default.
     pub isolate_block_margins: bool,
     /// Place this node freely within the parent, outside the parent's in-flow layout.
     pub free_placement: bool,
