@@ -102,11 +102,16 @@ fn free_placement_positions_and_anchors() {
     let br = child(&mut tree, &root, at(Pos::End, Pos::End, Anchor::End, Anchor::End));
     let pixel = child(&mut tree, &root, at(Pos::Pixels(40.0), Pos::Pixels(30.0), Anchor::Start, Anchor::Start));
     let frac = child(&mut tree, &root, at(Pos::Frac(0.25), Pos::Frac(0.5), Anchor::Start, Anchor::Center));
+    let offset = child(&mut tree, &root, at(
+        Pos::Offset { fraction: 1.0, pixels: -12.0 }, Pos::Offset { fraction: 0.5, pixels: 8.0 },
+        Anchor::End, Anchor::Center,
+    ));
     solve(&mut tree, WINDOW);
     assert_rect(&tree, &tl, [0.0, 0.0, 100.0, 50.0]);
     assert_rect(&tree, &br, [700.0, 550.0, 800.0, 600.0]);
     assert_rect(&tree, &pixel, [40.0, 30.0, 140.0, 80.0]);
     assert_rect(&tree, &frac, [200.0, 275.0, 300.0, 325.0]);
+    assert_rect(&tree, &offset, [688.0, 283.0, 788.0, 333.0]);
 }
 
 #[test]

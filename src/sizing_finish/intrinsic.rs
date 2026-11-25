@@ -139,6 +139,7 @@ pub(crate) struct StackRow {
     pub(crate) minimum: Option<f32>,
     pub(crate) maximum: Option<f32>,
     pub(crate) margins: [f32; 2],
+    pub(crate) block_padding: Option<f32>,
     pub(crate) fraction: Option<f32>,
     pub(crate) span: u16,
 }
@@ -154,6 +155,9 @@ pub(crate) open spec fn stack_row<A: FinishModel + ?Sized>(
             minimum: pre_grow_bound(access, target(other, slot.vertical, Kind::Min)),
             maximum: pre_grow_bound(access, target(other, slot.vertical, Kind::Max)),
             margins: margin_pair::<A::Float>(access.finish_layout(other), slot.axis()),
+            block_padding: if access.finish_layout(slot.node).children_layout is Block {
+                Some(pad_extent::<A::Float>(access.finish_layout(other), slot.axis()))
+            } else { None },
             fraction: match child_declaration(access, regular) {
                 Some(Size::Frac(fraction)) => Some(fraction), _ => None,
             },
@@ -289,6 +293,7 @@ pub(crate) open spec fn flow_intrinsic_value<A: FinishModel + ?Sized>(access: &A
 
 pub(crate) open spec fn largest_row_extent<F: FrameFloat>(row: StackRow, free: bool) -> f32 {
     let size = clamp_extent::<F>(row.regular, row.minimum, row.maximum);
+    let size = match row.block_padding { Some(pad) => F::maximum(size, pad), None => size };
     if free { size } else { with_stack_margin::<F>(size, F::sum(row.margins[0], row.margins[1])) }
 }
 
@@ -336,7 +341,7 @@ pub(crate) open spec fn largest_intrinsic_value<A: FinishModel + ?Sized>(access:
 pub(crate) open spec fn grid_cell_extent<F: FrameFloat>(row: StackRow, tracks: f32, spacing: f32) -> f32 {
     let span = F::count_value(if row.span == 0 { 1u32 } else { row.span as u32 });
     let span = F::minimum(span, F::maximum(tracks, 1.0f32));
-    let footprint = largest_row_extent::<F>(row, false);
+    let footprint = stack_row_extent::<F>(row);
     F::quotient(F::difference(footprint, F::product(F::difference(span, 1.0f32), spacing)), span)
 }
 
@@ -670,6 +675,45 @@ pub(crate) trait IntrinsicRows: IntrinsicContent {
 
 }
 
+/// A zero-sized measurement or a fixed sibling is still a source for an
+/// intrinsic extent. Inspect declarations only when a collapse warning is
+/// already a candidate. A zero pixel minimum alone supplies no size.
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+pub(super) fn lacks_intrinsic_source<A: IntrinsicRows>(access: &A, slot: Request<A::Id>) -> bool {
+    let params = access.params(slot.node);
+    if !matches!(params.text, TextContent::None) || !matches!(params.content_measure, ContentMeasure::None)
+        || params.image.is_some()
+    {
+        return false;
+    }
+    let mut next = access.first_child(slot.node);
+    #[cfg(verus_keep_ghost)]
+    let mut cursor = start_children();
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant cursor@ <= (access.topology().children)(slot.node).len(),
+            next == sizing_requests::child_at((access.topology().children)(slot.node), cursor@),
+        decreases (access.topology().children)(slot.node).len() - cursor@,
+    ))]
+    while let Some(child) = next {
+        let (following, in_flow) = access.child(slot.node, child);
+        if in_flow {
+            let child = access.params(child);
+            let minimum = *child.min_size.component(slot.axis());
+            if !child.size.component(slot.axis()).is_flex()
+                || matches!(minimum, Some(Size::FitContent | Size::Auto | Size::AspectRatio(_)))
+                || matches!(minimum, Some(Size::Pixels(px)) if px > 0.0)
+            {
+                return false;
+            }
+        }
+        next = following;
+        #[cfg(verus_keep_ghost)]
+        { cursor = step_child(cursor); }
+    }
+    true
+}
+
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(result =>
@@ -804,14 +848,20 @@ fn scan_stack_child<A: IntrinsicRows>(
     requires is_intrinsic(access, slot), ready_inputs(access, slot), !(access.topology().intrinsic_flow)(slot),
         child_bound(access, slot, cursor@),
         child == (access.topology().children)(slot.node)[cursor@ as int].node,
+        block == (access.finish_layout(slot.node).children_layout is Block),
     ensures next == A::Float::maximum(extent, largest_row_extent::<A::Float>(stack_rows(access, slot)[cursor@ as int].unwrap(), free)),
     no_unwind
 ))]
 fn scan_largest_child<A: IntrinsicRows>(
-    access: &A, slot: Request<A::Id>, child: A::Id, free: bool, extent: f32,
+    access: &A, slot: Request<A::Id>, child: A::Id, free: bool, block: bool, extent: f32,
     #[cfg(verus_keep_ghost)] cursor: Ghost<nat>,
 ) -> f32 {
     let size = pre_grow(access, slot, child, #[cfg(verus_keep_ghost)] cursor);
+    // Block items reserve their padding even when their regular width comes
+    // from the parent. Include that same floor in the parent's intrinsic width.
+    let size = if block {
+        A::Float::max(size, padding_for::<A::Float>(access.params(child), slot.axis()))
+    } else { size };
     let size = if free { size } else {
         let [start, end] = A::margins(access.params(child), slot.axis());
         add_margin::<A::Float>(size, A::Float::add(start, end))
@@ -871,6 +921,7 @@ fn scan_grid_child<A: IntrinsicRows>(
     no_unwind
 ))]
 fn scan_extent<A: IntrinsicRows>(access: &A, slot: Request<A::Id>, measure: Extent) -> (f32, f32, bool, Option<f32>) {
+    let block = matches!(access.params(slot.node).children_layout, ChildrenLayout::Block);
     let mut next = access.first_child(slot.node);
     let mut extent = 0.0f32;
     let mut free_frac = 0.0f32;
@@ -887,6 +938,7 @@ fn scan_extent<A: IntrinsicRows>(access: &A, slot: Request<A::Id>, measure: Exte
     }
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant is_intrinsic(access, slot), ready_inputs(access, slot),
+            block == (access.finish_layout(slot.node).children_layout is Block),
             !(access.topology().intrinsic_flow)(slot),
             cursor@ <= (access.topology().children)(slot.node).len(),
             next == sizing_requests::child_at((access.topology().children)(slot.node), cursor@),
@@ -922,7 +974,7 @@ fn scan_extent<A: IntrinsicRows>(access: &A, slot: Request<A::Id>, measure: Exte
 
             match measure {
                 Extent::Largest { free } => {
-                    extent = scan_largest_child(access, slot, child, free, extent, #[cfg(verus_keep_ghost)] cursor);
+                    extent = scan_largest_child(access, slot, child, free, block, extent, #[cfg(verus_keep_ghost)] cursor);
                 }
                 Extent::Grid { tracks, spacing } => {
                     extent = scan_grid_child(access, slot, child, tracks, spacing, extent, #[cfg(verus_keep_ghost)] cursor);

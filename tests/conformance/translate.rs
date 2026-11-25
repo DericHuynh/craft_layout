@@ -17,7 +17,7 @@ pub type Tree = LayoutTree<AhemText>;
 #[derive(Clone, Copy)]
 pub enum Parent {
     /// The fixture root, placed in the window's top-left corner.
-    Viewport { definite: Xy<bool> },
+    Viewport { size: Xy<Option<f32>> },
     Flex { main: Axis, align_items: Align },
     Block,
 }
@@ -53,10 +53,12 @@ fn align(raw: &str) -> Result<Option<Align>> {
     }))
 }
 
-fn arrange(raw: &str) -> Result<Arrange> {
+fn arrange(raw: &str, reverse: bool) -> Result<Arrange> {
     Ok(match raw {
-        "normal" | "flex-start" | "start" => Arrange::Start,
-        "flex-end" | "end" => Arrange::End,
+        "normal" | "flex-start" => Arrange::Start,
+        "flex-end" => Arrange::End,
+        "start" => if reverse { Arrange::End } else { Arrange::Start },
+        "end" => if reverse { Arrange::Start } else { Arrange::End },
         "center" => Arrange::Center,
         "space-between" => Arrange::SpaceBetween,
         "space-around" => Arrange::SpaceAround,
@@ -91,6 +93,49 @@ fn size(value: Option<Value>, name: &str, extra: f32) -> Result<Option<Size>> {
         Some(Value::MaxContent) => Some(Size::FitContent),
         Some(other) => return unsupported(format!("{name}={other:?}")),
     })
+}
+
+/// Convert the physical CSS containing-box coordinate to the parent's native origin.
+fn at(mut fraction: f32, mut pixels: f32, mut anchor: f32, flipped: bool) -> (Pos, Anchor) {
+    if flipped {
+        fraction = 1.0 - fraction;
+        pixels = -pixels;
+        anchor = 1.0 - anchor;
+    }
+    let anchor = match anchor { 0.0 => Anchor::Start, 0.5 => Anchor::Center, 1.0 => Anchor::End, f => Anchor::Frac(f) };
+    let position = match (fraction, pixels, anchor) {
+        (0.0, 0.0, Anchor::Start) => Pos::Start,
+        (0.5, 0.0, Anchor::Center) => Pos::Center,
+        (1.0, 0.0, Anchor::End) => Pos::End,
+        (0.0, _, _) => Pos::Pixels(pixels),
+        (_, 0.0, _) => Pos::Frac(fraction),
+        _ => Pos::Offset { fraction, pixels },
+    };
+    (position, anchor)
+}
+
+fn inset(value: Option<Value>) -> Result<Option<(f32, f32)>> {
+    Ok(match value {
+        None | Some(Value::Auto) => None,
+        Some(Value::Px(px)) => Some((0.0, px)),
+        Some(Value::Percent(frac)) => Some((frac, 0.0)),
+        _ => return unsupported("absolute insets"),
+    })
+}
+
+fn static_alignment(parent: &LayoutParams, axis: Axis, align: Align) -> f32 {
+    match parent.children_layout {
+        ChildrenLayout::Stack { axis: main, arrange, .. } | ChildrenLayout::Wrap { axis: main, arrange, .. }
+            if main == axis => {
+                let logical = match arrange {
+                    Arrange::Start | Arrange::SpaceBetween => 0.0,
+                    Arrange::Center | Arrange::SpaceAround | Arrange::SpaceEvenly => 0.5,
+                    Arrange::End => 1.0,
+                };
+                if parent.children_origin_flipped[axis] { 1.0 - logical } else { logical }
+            }
+        _ => match align { Align::Start | Align::Stretch => 0.0, Align::Center => 0.5, Align::End => 1.0 },
+    }
 }
 
 pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Parent) -> Result<Built> {
@@ -159,7 +204,7 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
                 Axis::X => (gap("column-gap")?, gap("row-gap")?),
                 Axis::Y => (gap("row-gap")?, gap("column-gap")?),
             };
-            let arrange = arrange(style.keyword("justify-content", "normal"))?;
+            let arrange = arrange(style.keyword("justify-content", "normal"), reverse)?;
             own_align = align(style.keyword("align-items", "normal"))?.unwrap_or(Align::Stretch);
             params.children_layout = match style.keyword("flex-wrap", "nowrap") {
                 "nowrap" => ChildrenLayout::Stack { axis: main, arrange, spacing: main_gap },
@@ -182,8 +227,8 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
     }
 
     // Placement as an item of its parent.
-    let absolute = match style.keyword("position", "relative") {
-        "relative" => {
+    let absolute = match style.keyword("position", "static") {
+        "relative" | "static" => {
             for side in ["left", "right", "top", "bottom"] {
                 if !matches!(style.value(side), None | Some(Value::Auto)) {
                     return unsupported("relative offsets");
@@ -198,56 +243,157 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
     let grow = style.number("flex-grow", 0.0)?;
     // Stacks keep declared sizes in negative free space. Read the CSS factor
     // for validation; the scoreboard still compares against the Chrome result.
-    style.number("flex-shrink", 1.0)?;
+    let shrink = style.number("flex-shrink", 1.0)?;
     let basis = style.value("flex-basis");
     let align_self = align(style.keyword("align-self", "auto"))?;
     let aspect = style.value("aspect-ratio");
 
     let mut declared = Xy::new(width, height);
     match context {
-        Parent::Viewport { definite } => {
-            for axis in [Axis::X, Axis::Y] {
-                if declared[axis].is_none() {
-                    declared[axis] = Some(if definite[axis] { Size::Fill } else { Size::FitContent });
-                }
-            }
-            params.position = Xy::new(Pos::Start, Pos::Start);
-            params.anchor = Xy::new(Anchor::Start, Anchor::Start);
-        }
-        _ if absolute => {
-            params.free_placement = true;
+        Parent::Viewport { size: window } => {
             for (axis, start, end) in [(Axis::X, "left", "right"), (Axis::Y, "top", "bottom")] {
-                let (pos, anchor) = match (style.value(start), style.value(end)) {
-                    (None | Some(Value::Auto), None | Some(Value::Auto)) => (Pos::Start, Anchor::Start),
-                    (Some(Value::Px(v)), None | Some(Value::Auto)) => (Pos::Pixels(v), Anchor::Start),
-                    (Some(Value::Percent(p)), None | Some(Value::Auto)) => (Pos::Frac(p), Anchor::Start),
-                    (None | Some(Value::Auto), Some(Value::Px(v))) if v == 0.0 => (Pos::End, Anchor::End),
-                    _ => return unsupported("absolute insets"),
+                let [before, after] = params.margin[axis].map(|m| m.as_px().unwrap_or(0.0));
+                let leading = inset(style.value(start))?;
+                let trailing = inset(style.value(end))?;
+                // The XML supplies a concrete viewport on definite axes. Its margins
+                // and opposing insets consume space before the root box is sized.
+                let length = window[axis];
+                if declared[axis].is_none() {
+                    declared[axis] = Some(match (length, leading, trailing) {
+                        (Some(w), Some((f, p)), Some((g, q))) if absolute =>
+                            Size::Pixels((w - (f * w + p) - (g * w + q) - before - after).max(0.0)),
+                        (Some(w), _, _) if !absolute && axis == Axis::X =>
+                            Size::Pixels((w - before - after).max(0.0)),
+                        _ => Size::FitContent,
+                    });
+                }
+                let (pos, anchor) = match (leading, trailing) {
+                    (Some((fraction, offset)), _) => at(fraction, offset + before, 0.0, false),
+                    (_, Some((fraction, offset))) => at(1.0 - fraction, -offset - after, 1.0, false),
+                    _ => at(0.0, before, 0.0, false),
                 };
                 params.position[axis] = pos;
                 params.anchor[axis] = anchor;
-                if declared[axis].is_none() {
-                    declared[axis] = Some(Size::FitContent);
-                }
+            }
+        }
+        _ if absolute => {
+            params.free_placement = true;
+            let parent_params = tree.params(parent).map_err(|e| e.to_string())?;
+            let parent_element = xml.parent_element().expect("fixture parent");
+            let parent_style = Style::new(parent_element);
+            // Native free placement is relative to the immediate parent. A CSS
+            // inset or percentage size under a static non-root parent can read
+            // a different ancestor; the no-inset static position still uses
+            // the local formatting context.
+            let parent_is_root = parent_element.parent_element().is_some_and(|p| p.has_tag_name("input"));
+            let upper_containing_block = !parent_is_root && parent_style.keyword("position", "static") == "static";
+            if upper_containing_block && (
+                ["left", "top", "right", "bottom"].iter().any(|key|
+                    !matches!(style.value(key), None | Some(Value::Auto)))
+                || ["width", "height", "min-width", "min-height", "max-width", "max-height"].iter()
+                    .any(|key| matches!(style.value(key), Some(Value::Percent(_))))
+            ) {
+                return unsupported("absolute coordinates relative to a non-parent containing block");
+            }
+            let alignment = match context {
+                Parent::Flex { align_items, .. } => align_self.unwrap_or(align_items),
+                _ => Align::Start,
+            };
+            for (axis, start, end) in [(Axis::X, "left", "right"), (Axis::Y, "top", "bottom")] {
+                let [before, after] = params.margin[axis].map(|m| m.as_px().unwrap_or(0.0));
+                let leading = inset(style.value(start))?;
+                let trailing = inset(style.value(end))?;
+                let (fraction, pixels, anchor) = match (leading, trailing) {
+                    (None, None) => {
+                        let f = static_alignment(parent_params, axis, alignment);
+                        (f, (1.0 - f) * before - f * after, f)
+                    }
+                    _ => {
+                        // CSS insets use the padding box. Native positions use the
+                        // content box, whose leading edge already includes padding.
+                        let pad_start = px(&parent_style, &format!("padding-{start}"))?;
+                        let pad_end = px(&parent_style, &format!("padding-{end}"))?;
+                        let (f, offset, anchor) = match (leading, trailing) {
+                            (Some((f, offset)), None) => (f, offset + before, 0.0),
+                            (None, Some((f, offset))) => (1.0 - f, -offset - after, 1.0),
+                            _ => return unsupported("opposing absolute insets"),
+                        };
+                        (f, offset - pad_start + f * (pad_start + pad_end), anchor)
+                    }
+                };
+                (params.position[axis], params.anchor[axis]) =
+                    at(fraction, pixels, anchor, parent_params.children_origin_flipped[axis]);
+                declared[axis].get_or_insert(Size::FitContent);
             }
         }
         Parent::Flex { main, align_items } => {
             let cross = main.other();
+            let parent_params = tree.params(parent).map_err(|e| e.to_string())?;
+            let explicit_basis = basis.filter(|basis| !matches!(basis, Value::Auto));
+            // A numeric basis is the starting flex size. A leaf's unbreakable text or
+            // fixed-size children still supply its automatic minimum on the main axis.
+            if explicit_basis.is_some() && declared[main].is_none() && params.min_size[main].is_none() {
+                let length = if main == Axis::X { "width" } else { "height" };
+                if let Some(value) = text {
+                    params.min_size[main] = Some(if main == Axis::X {
+                        Size::Pixels(AhemText::new(value).min_content_width() + params.padding.x.iter().sum::<f32>())
+                    } else { Size::FitContent });
+                } else if xml.first_element_child().is_some() && xml.children().filter(|node| node.is_element()).all(|node|
+                    node.attribute(length).is_some_and(|v| matches!(Value::parse(v), Value::Px(_)))
+                ) {
+                    params.min_size[main] = Some(Size::FitContent);
+                }
+            }
             if grow > 0.0 {
                 if !matches!(basis, Some(Value::Px(v)) if v == 0.0) && !matches!(basis, Some(Value::Percent(p)) if p == 0.0) {
                     return unsupported("flex-grow with a non-zero basis");
                 }
+                // CSS also uses the preferred main size to size an intrinsic flex
+                // container. Fill stores the zero basis and weight, but has no
+                // separate preferred contribution; a hard minimum would change it.
+                if matches!(parent_params.size[main], Size::FitContent)
+                    && matches!(declared[main], Some(Size::Pixels(value)) if value > 0.0)
+                {
+                    return unsupported("preferred main size with zero-basis growth in an intrinsic flex container");
+                }
                 declared[main] = Some(Size::Fill);
                 params.fill_weight = grow;
-            } else if let Some(basis) = basis {
+            } else if let Some(basis) = explicit_basis {
                 declared[main] = size(Some(basis), "flex-basis", extra(main))?;
+            }
+            // A sole shrinkable text item in a definite row takes its natural
+            // width up to the available width, keeping unbreakable runs intact.
+            if main == Axis::X && declared.x.is_none() && shrink == 1.0
+                && params.max_size.x.is_none() && aspect.is_none()
+                && matches!(parent_params.size.x, Size::Pixels(_))
+                && matches!(parent_params.children_layout, ChildrenLayout::Stack { .. })
+            {
+                if let Some(value) = text.filter(|_| xml.parent_element().is_some_and(|p|
+                    p.children().filter(|n| n.is_element() && n.attribute("position") != Some("absolute")
+                        && n.attribute("display") != Some("none")).count() == 1)) {
+                    let text = AhemText::new(value);
+                    let padding = params.padding.x.iter().sum::<f32>();
+                    declared.x = Some(Size::Fill);
+                    params.max_size.x = Some(Size::Pixels(text.max_content_width() + padding));
+                    params.min_size.x.get_or_insert(Size::Pixels(text.min_content_width() + padding));
+                }
             }
             if declared[main].is_none() {
                 declared[main] = Some(Size::FitContent);
             }
             let alignment = align_self.unwrap_or(align_items);
             if declared[cross].is_none() {
-                declared[cross] = Some(if alignment == Align::Stretch && aspect.is_none() { Size::Fill } else { Size::FitContent });
+                let stretch = alignment == Align::Stretch && aspect.is_none();
+                declared[cross] = Some(if stretch { Size::Fill } else { Size::FitContent });
+                // Stretch happens after line sizing. When content determines the
+                // line, contribute the item's hypothetical size before filling it.
+                if stretch && params.min_size[cross].is_none()
+                    && (matches!(parent_params.size[cross], Size::FitContent)
+                        || matches!(parent_params.min_size[cross], Some(Size::FitContent))
+                        || matches!(parent_params.children_layout, ChildrenLayout::Wrap { .. }))
+                {
+                    params.min_size[cross] = Some(Size::FitContent);
+                }
             }
             let (pos, anchor) = match alignment {
                 Align::Stretch | Align::Start => (Pos::Start, Anchor::Start),
@@ -275,6 +421,27 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
         }
     }
     params.size = Xy::new(declared.x.unwrap_or(Size::FitContent), declared.y.unwrap_or(Size::FitContent));
+
+    // CSS subtracts padding and borders from a border-box length and floors
+    // the content box at zero. Native Pixels is an explicit outer extent;
+    // express the CSS floor through native bounds, including on Fill items.
+    for axis in [Axis::X, Axis::Y] {
+        let floor = params.padding[axis][0] + params.padding[axis][1];
+        if floor <= 0.0 {
+            continue;
+        }
+        params.min_size[axis] = Some(match params.min_size[axis] {
+            None => Size::Pixels(floor),
+            Some(Size::Pixels(min)) => Size::Pixels(min.max(floor)),
+            Some(Size::FitContent) => Size::FitContent,
+            Some(_) => return unsupported("non-pixel minimum with padding/border floor"),
+        });
+        match params.max_size[axis] {
+            Some(Size::Pixels(max)) => params.max_size[axis] = Some(Size::Pixels(max.max(floor))),
+            Some(Size::FitContent) | None => {}
+            Some(_) => return unsupported("non-pixel maximum with padding/border floor"),
+        }
+    }
 
     let unread = style.unread();
     if !unread.is_empty() {

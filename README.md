@@ -32,6 +32,19 @@ Run `cargo bench --bench real_workloads` for browser, Linux compositor, and CAD 
 
 The benchmark handoff covers first solves, peer engines, application edits, and topological-order experiments. [Benchmark runners and adapters](benchmarks/README.md)
 
+## Application layouts
+
+Each sample runs a sequence of edits, checks expected geometry, and compares the retained tree with a fresh build. The authors recorded their first layout declarations before running the samples. The paired runs replay the same inputs with an alternative declaration.
+
+| Project | Geometry under test |
+| --- | --- |
+| [Editor workbench](examples/editor_workbench) | Weighted panes, measured tabs, wrapped source lines and a draggable terminal. |
+| [Check-in kiosk](examples/checkin_kiosk) | Translated booking text, validation, a compact summary and the one-pixel threshold at which appointment controls wrap. |
+| [Command palette](examples/command_palette) | Fitted, variable-width menus, a nested coordinate frame and the choice of edge when a popup cannot fit on either side of the pointer. |
+| [Mixing studio](examples/mixing_studio) | Track insertion, a removable send rack, selection overlays and two meters per channel. |
+
+For a free-positioned popup that should remain eight pixels inside the far edge as its parent resizes, use `Pos::Offset { fraction: 1.0, pixels: -8.0 }` with `Anchor::End` on that axis. Downstream code that exhaustively matches `Pos` must handle the new variant.
+
 ## Usage
 
 `keru_layout` has a trait-based API similar to Taffy's low-level API.

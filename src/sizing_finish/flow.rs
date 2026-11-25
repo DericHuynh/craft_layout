@@ -1146,7 +1146,14 @@ pub(crate) open spec fn block_items<A: FlowAccess>(access: &A, slot: Request<A::
 
 pub(crate) open spec fn block_result<A: FlowAccess>(access: &A, slot: Request<A::Id>) -> (A::Block, BlockMargins<A::Block>) {
     let (top, bottom) = block::edges(access, slot.node);
-    crate::block_flow::finish(crate::block_flow::replay(block_items(access, slot, cache_rows(access, slot).len()), top, bottom))
+    let flow = crate::block_flow::replay(block_items(access, slot, cache_rows(access, slot).len()), top, bottom);
+    let p = access.finish_layout(slot.node);
+    let bottom = match p.min_size.y {
+        Some(Size::Pixels(min)) => flow.collapse_bottom && (A::Float::word(min) & 0x7fff_ffff == 0 ||
+            A::Float::at_most(min, A::Float::sum(p.padding.y[0], A::lower(flow.end)))),
+        _ => flow.collapse_bottom,
+    };
+    crate::block_flow::finish(BlockFlow { collapse_bottom: bottom, ..flow })
 }
 }
 
@@ -1184,6 +1191,13 @@ fn block_flow<A: FlowAccess>(access: &mut A, slot: Request<A::Id>) -> f32 {
                     assert(sizing_requests::child_at(cache_rows(access, slot), cursor@).is_some());
                 }
                 assert(cursor@ == cache_rows(access, slot).len());
+            }
+            // A positive minimum separates the last margin only if the box
+            // actually needs extra height after laying out its children.
+            let p = access.params(slot.node);
+            if let Some(Size::Pixels(minimum)) = p.min_size.y {
+                let natural = A::Float::add(p.padding.y[0], A::lower_block(flow.end));
+                flow.collapse_bottom &= A::Float::is_zero(minimum) || A::Float::less_or_equal(minimum, natural);
             }
             let (height, margins) = flow.finish();
             block::store(access, slot.node, margins);

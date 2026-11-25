@@ -45,6 +45,7 @@ impl SameInput for Pos {
         use Pos::*;
         match (self, other) {
             (Pixels(a), Pixels(b)) | (Frac(a), Frac(b)) => a.same_input(b),
+            (Offset { fraction: a, pixels: x }, Offset { fraction: b, pixels: y }) => a.same_input(b) && x.same_input(y),
             (Start, Start) | (Center, Center) | (End, End) => true,
             _ => false,
         }

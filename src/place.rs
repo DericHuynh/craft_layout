@@ -268,7 +268,7 @@ impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placeme
         let layout = self.tree.node_layout_data(id);
         placement_modes::BlockItemInputs {
             bounds: placement_modes::BlockEdges {
-                padding: params.padding.y, collapse: block_can_collapse(params), zero_minimum: zero_minimum(params),
+                padding: params.padding.y, collapse: block_can_collapse(params), zero_minimum: zero_minimum(self.tree.read_size(id, Y, Kind::Min)),
             },
             height: layout.size().y, margins: margins(params, Y), children_empty: !layout.has_in_flow_children(),
         }
@@ -288,7 +288,7 @@ impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placeme
         placement_modes::BlockEdges {
             padding: params.padding.y,
             collapse: self.tree.node_layout_data(id).flags.is_block_item() && block_can_collapse(params),
-            zero_minimum: zero_minimum(params),
+            zero_minimum: zero_minimum(self.tree.read_size(id, Y, Kind::Min)),
         }
     }
 

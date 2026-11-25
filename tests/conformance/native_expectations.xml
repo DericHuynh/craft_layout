@@ -58,4 +58,288 @@
       </node>
     </node>
   </case>
+  <case reason="Width caps at 40. The explicit height rule AspectRatio(2) yields 20, even when the text needs six lines."
+        fixtures="block/block_aspect_ratio_fill_max_height__border_box_ltr
+                  block/block_aspect_ratio_fill_max_height__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="40" height="20"/>
+    </node>
+  </case>
+  <case reason="The block takes the available 100 width. The derived height reaches its 20 maximum without feeding the cap back into width."
+        fixtures="block/block_aspect_ratio_fill_max_width__border_box_ltr
+                  block/block_aspect_ratio_fill_max_width__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="100" height="20"/>
+    </node>
+  </case>
+  <case reason="The explicit 200-square child retains its size inside the 100-wide row. Its vertical margins give the row a 210 height."
+        fixtures="flex/bevy_issue_10343_block__border_box_ltr
+                  flex/bevy_issue_10343_block__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="100" height="210">
+        <node x="5" y="5" width="200" height="200">
+          <node x="0" y="0" width="200" height="0"/>
+        </node>
+      </node>
+    </node>
+  </case>
+  <case reason="The explicit 200-square child retains its size inside the 100-wide row. Its vertical margins give the row a 210 height."
+        fixtures="flex/bevy_issue_10343_flex__border_box_ltr
+                  flex/bevy_issue_10343_flex__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="100" height="210">
+        <node x="5" y="5" width="200" height="200">
+          <node x="0" y="0" width="0" height="200"/>
+        </node>
+      </node>
+    </node>
+  </case>
+  <case reason="The fixed 200-square grandchild overflows both dimensions of the 100-square parent."
+        fixtures="flex/nested_overflowing_child_in_constraint_parent__border_box_ltr
+                  flex/nested_overflowing_child_in_constraint_parent__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="100" height="100">
+        <node x="0" y="0" width="200" height="200"/>
+      </node>
+    </node>
+  </case>
+  <case reason="Two half-height rows share the inner height after the gap. Each full-width child independently requests all horizontal space left after its row gap."
+        fixtures="flex/bevy_issue_8017__border_box_ltr">
+    <node x="0" y="0" width="400" height="400">
+      <node x="8" y="8" width="384" height="188">
+        <node x="0" y="0" width="376" height="188"/>
+        <node x="384" y="0" width="376" height="188"/>
+      </node>
+      <node x="8" y="204" width="384" height="188">
+        <node x="0" y="0" width="376" height="188"/>
+        <node x="384" y="0" width="376" height="188"/>
+      </node>
+    </node>
+  </case>
+  <case reason="Two half-height rows share the inner height after the gap. Each full-width child independently requests all horizontal space left after its row gap."
+        fixtures="flex/bevy_issue_8017__content_box_ltr">
+    <node x="0" y="0" width="416" height="416">
+      <node x="8" y="8" width="400" height="196">
+        <node x="0" y="0" width="392" height="196"/>
+        <node x="400" y="0" width="392" height="196"/>
+      </node>
+      <node x="8" y="212" width="400" height="196">
+        <node x="0" y="0" width="392" height="196"/>
+        <node x="400" y="0" width="392" height="196"/>
+      </node>
+    </node>
+  </case>
+  <case reason="The fitted row has only a stretched child; its declared minimum of zero contributes no height. The half-height descendant therefore gets zero, and its fixed grandchild remains 50 high."
+        fixtures="blockflex/blockflex_percentage_height_in_auto_height_flex_item__border_box_ltr
+                  blockflex/blockflex_percentage_height_in_auto_height_flex_item__content_box_ltr">
+    <node x="0" y="0" width="100" height="0">
+      <node x="0" y="0" width="50" height="0">
+        <node x="0" y="0" width="50" height="0">
+          <node x="0" y="0" width="50" height="50"/>
+        </node>
+      </node>
+    </node>
+    <warning kind="FitContentCollapsed" path="root" axis="y"/>
+  </case>
+  <case reason="The fitted column has only a full-width row and no independent width. Its zero-width box centers at x=100. The row centers two fixed 50-wide children in that box."
+        fixtures="flex/percentage_container_in_wrapping_container__border_box_ltr
+                  flex/percentage_container_in_wrapping_container__content_box_ltr">
+    <node x="0" y="0" width="200" height="200">
+      <node x="100" y="75" width="0" height="50">
+        <node x="0" y="0" width="0" height="50">
+          <node x="-50" y="0" width="50" height="50"/>
+          <node x="0" y="0" width="50" height="50"/>
+        </node>
+      </node>
+    </node>
+    <warning kind="FitContentCollapsed" path="root.0" axis="x"/>
+  </case>
+  <case reason="A freely placed child at Start stays at (0,0) even after a 10 px in-flow sibling; it occupies no flow space. CSS assigns an unspecified block inset the hypothetical flow position y=10."
+        fixtures="block/block_absolute_no_styles__border_box_ltr
+                  block/block_absolute_no_styles__content_box_ltr">
+    <node x="0" y="0" width="50" height="10">
+      <node x="0" y="0" width="50" height="10"/>
+      <node x="0" y="0" width="0" height="0"/>
+    </node>
+  </case>
+  <case reason="Two 60 px stack children centered in 110 px start at -5 and 55. The independent 60 px overlay centers at x=25 and uses none of the shared space."
+        fixtures="flex/absolute_layout_child_order__border_box_ltr
+                  flex/absolute_layout_child_order__content_box_ltr">
+    <node x="0" y="0" width="110" height="100">
+      <node x="-5" y="30" width="60" height="40"/>
+      <node x="25" y="30" width="60" height="40"/>
+      <node x="55" y="30" width="60" height="40"/>
+    </node>
+  </case>
+  <case reason="The centered margin box spans 120 px in an 80 px row, so it starts at -20; the 100 px left margin places the declared 20 px child at x=80. Collapsing it to zero would discard the explicit size."
+        fixtures="flex/justify_content_row_max_width_and_margin__border_box_ltr
+                  flex/justify_content_row_max_width_and_margin__content_box_ltr">
+    <node x="0" y="0" width="80" height="20">
+      <node x="80" y="0" width="20" height="20"/>
+    </node>
+  </case>
+  <case reason="The 60 px overlay anchors at half of 60, x=30. Each child explicitly requests 100% of the overlay and therefore occupies 60 px; the second begins at x=60 inside it."
+        fixtures="flex/percent_absolute_position__border_box_ltr
+                  flex/percent_absolute_position__content_box_ltr">
+    <node x="0" y="0" width="60" height="50">
+      <node x="30" y="0" width="60" height="50">
+        <node x="0" y="0" width="60" height="50"/>
+        <node x="60" y="0" width="60" height="50"/>
+      </node>
+    </node>
+  </case>
+  <case reason="Each fixed 100 px content box plus 30 px edges is 130 px tall. The three panels start at 0, 130, and 260; their 30 px overlays align at local (15,15), (50,50), and (85,85)."
+        fixtures="flex/absolute_layout_static_container_static_position_content_box__content_box_ltr">
+    <node x="0" y="0" width="100" height="300">
+      <node x="0" y="0" width="130" height="130">
+        <node x="15" y="15" width="30" height="30"/>
+      </node>
+      <node x="0" y="130" width="130" height="130">
+        <node x="50" y="50" width="30" height="30"/>
+      </node>
+      <node x="0" y="260" width="130" height="130">
+        <node x="85" y="85" width="30" height="30"/>
+      </node>
+    </node>
+  </case>
+  <case reason="A 100 px height limit on the overlay ends at y=180, 20 px above the container bottom. Its fixed 150 px child keeps its size and overflows that box."
+        fixtures="flex/absolute_child_with_max_height_larger_shrinkable_grandchild__border_box_ltr
+                  flex/absolute_child_with_max_height_larger_shrinkable_grandchild__content_box_ltr">
+    <node x="0" y="0" width="100" height="200">
+      <node x="0" y="80" width="100" height="100">
+        <node x="0" y="0" width="100" height="150"/>
+      </node>
+    </node>
+  </case>
+  <case reason="The conflicting bounds resolve to the 50 × 60 minimum box at (40,30), 10 px from both far edges. Both axes report the conflict so the author can repair the declarations."
+        fixtures="block/block_absolute_minmax_bottom_right_min_max__border_box_ltr
+                  block/block_absolute_minmax_bottom_right_min_max__content_box_ltr
+                  block/block_absolute_minmax_bottom_right_min_max_preferred__border_box_ltr
+                  block/block_absolute_minmax_bottom_right_min_max_preferred__content_box_ltr
+                  flex/absolute_minmax_bottom_right_min_max__border_box_ltr
+                  flex/absolute_minmax_bottom_right_min_max__content_box_ltr
+                  flex/absolute_minmax_bottom_right_min_max_preferred__border_box_ltr
+                  flex/absolute_minmax_bottom_right_min_max_preferred__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="40" y="30" width="50" height="60"/>
+    </node>
+    <warning path="root.0" kind="MinAboveMax" axis="x"/>
+    <warning path="root.0" kind="MinAboveMax" axis="y"/>
+  </case>
+  <case reason="A 200 px minimum exceeds the 50 px maximum. Preserve the minimum and identify the conflicting child bounds."
+        fixtures="block/block_item_min_width_overrides_max_width__border_box_ltr
+                  block/block_item_min_width_overrides_max_width__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="200" height="50"/>
+    </node>
+    <warning kind="MinAboveMax" path="root.0" axis="x"/>
+  </case>
+  <case reason="A 100 px minimum exceeds the 50 px maximum. Parent and child take the minimum width, with zero intrinsic height."
+        fixtures="flex/min_width_overrides_max_width__border_box_ltr
+                  flex/min_width_overrides_max_width__content_box_ltr">
+    <node x="0" y="0" width="100" height="0">
+      <node x="0" y="0" width="100" height="0"/>
+    </node>
+    <warning kind="MinAboveMax" path="root.0" axis="x"/>
+  </case>
+  <case reason="A 100 px minimum exceeds the 50 px maximum. Parent and child take the minimum height, with zero intrinsic width."
+        fixtures="flex/min_height_overrides_max_height__border_box_ltr
+                  flex/min_height_overrides_max_height__content_box_ltr">
+    <node x="0" y="0" width="0" height="100">
+      <node x="0" y="0" width="0" height="100"/>
+    </node>
+    <warning kind="MinAboveMax" path="root.0" axis="y"/>
+  </case>
+  <case reason="An otherwise unbounded row fits the only independently declared 50 px basis. Both the row and the item are 50 × 100 px."
+        fixtures="flex/flex_basis_unconstraint_row__border_box_ltr
+                  flex/flex_basis_unconstraint_row__content_box_ltr">
+    <node x="0" y="0" width="50" height="100">
+      <node x="0" y="0" width="50" height="100"/>
+    </node>
+  </case>
+  <case reason="The only child takes a share of an intrinsically sized row with no width source. Both widths are zero, with a diagnostic on the row; the specified height is 100 px."
+        fixtures="flex/flex_grow_child__border_box_ltr
+                  flex/flex_grow_child__content_box_ltr">
+    <node x="0" y="0" width="0" height="100">
+      <node x="0" y="0" width="0" height="100"/>
+    </node>
+    <warning kind="FitContentCollapsed" path="root" axis="x"/>
+  </case>
+  <case reason="The 100 × 100 px container uses start alignment. Its intrinsic child has an empty grower as the sole width source, so both inner boxes remain 0 × 0 and the inner row diagnoses its unseeded width."
+        fixtures="flex/flex_grow_in_at_most_container__border_box_ltr
+                  flex/flex_grow_in_at_most_container__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="0" height="0">
+        <node x="0" y="0" width="0" height="0"/>
+      </node>
+    </node>
+    <warning kind="FitContentCollapsed" path="root.0" axis="x"/>
+  </case>
+  <case reason="The 100 px height cap applies to the column. The declared child heights of 100 and 50 px put the second child at y = 100, extending the stack by 50 px."
+        fixtures="flex/flex_grow_within_constrained_max_column__border_box_ltr
+                  flex/flex_grow_within_constrained_max_column__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="100" height="100"/>
+      <node x="0" y="100" width="100" height="50"/>
+    </node>
+  </case>
+  <case reason="The outer column is 200 px wide. Its capped inner row is 100 px wide and places the 50 px sibling after the 100 px item, preserving both widths."
+        fixtures="flex/flex_grow_within_constrained_max_row__border_box_ltr
+                  flex/flex_grow_within_constrained_max_row__content_box_ltr">
+    <node x="0" y="0" width="200" height="100">
+      <node x="0" y="0" width="100" height="100">
+        <node x="0" y="0" width="100" height="100"/>
+        <node x="100" y="0" width="50" height="100"/>
+      </node>
+    </node>
+  </case>
+  <case reason="The 100 px top margin positions the child at y = 100. The 80 px parent cap preserves the child’s declared 20 px height even outside the parent."
+        fixtures="flex/flex_shrink_by_outer_margin_with_max_size__border_box_ltr
+                  flex/flex_shrink_by_outer_margin_with_max_size__content_box_ltr">
+    <node x="0" y="0" width="20" height="80">
+      <node x="0" y="100" width="20" height="20"/>
+    </node>
+  </case>
+  <case reason="Each child explicitly requests 500 px. In a 500 px native stack the second starts at x = 500 and keeps its width."
+        fixtures="flex/flex_shrink_flex_grow_row__border_box_ltr
+                  flex/flex_shrink_flex_grow_row__content_box_ltr">
+    <node x="0" y="0" width="500" height="500">
+      <node x="0" y="0" width="500" height="100"/>
+      <node x="500" y="0" width="500" height="100"/>
+    </node>
+  </case>
+  <case reason="In the 75 px native row, each of the three declared 50 px items retains its width. Sibling origins are 0, 50 and 100 px."
+        fixtures="flex/flex_shrink_to_zero__border_box_ltr
+                  flex/flex_shrink_to_zero__content_box_ltr">
+    <node x="0" y="0" width="75" height="50">
+      <node x="0" y="0" width="50" height="50"/>
+      <node x="50" y="0" width="50" height="50"/>
+      <node x="100" y="0" width="50" height="50"/>
+    </node>
+  </case>
+  <case reason="The 50 px fixed child owns the first 50 px. The text requests its unwrapped 500 px advance and starts at x = 50. With no explicit shrink allocation in the native stack it overflows the 100 px parent."
+        fixtures="flex/measure_child_with_flex_shrink__border_box_ltr
+                  flex/measure_child_with_flex_shrink__content_box_ltr">
+    <node x="0" y="0" width="100" height="50">
+      <node x="0" y="0" width="50" height="50"/>
+      <node x="50" y="0" width="500" height="50"/>
+    </node>
+  </case>
+  <case reason="The only child requests half of each intrinsic parent axis. Neither axis has a length source, so both boxes are 0 × 0 and both parent axes report the collapse."
+        fixtures="flex/percentage_width_height_undefined_parent_size__border_box_ltr
+                  flex/percentage_width_height_undefined_parent_size__content_box_ltr">
+    <node x="0" y="0" width="0" height="0">
+      <node x="0" y="0" width="0" height="0"/>
+    </node>
+    <warning kind="FitContentCollapsed" path="root" axis="x"/>
+    <warning kind="FitContentCollapsed" path="root" axis="y"/>
+  </case>
+  <case reason="Width is only bounded between 0 and 100 px. The only child stretches into an intrinsic column with no preferred width; the least width is 0 px and the column diagnoses the missing width source."
+        fixtures="flex/undefined_width_with_min_max__border_box_ltr
+                  flex/undefined_width_with_min_max__content_box_ltr">
+    <node x="0" y="0" width="0" height="50">
+      <node x="0" y="0" width="0" height="0"/>
+    </node>
+    <warning kind="FitContentCollapsed" path="root" axis="x"/>
+  </case>
 </contracts>

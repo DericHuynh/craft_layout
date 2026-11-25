@@ -132,6 +132,7 @@ pub(crate) open spec fn arena_prefix<B: Scalar>(before: Seq<BlockMargins<B>>, af
 pub(crate) open spec fn basic_item<A: Storage + ?Sized>(tree: &A, node: A::Id) -> bool {
     let params = tree.layout_params(node);
     &&& !params.disabled && !params.free_placement
+    &&& (params.children_layout is Block || params.children_layout is Free)
     &&& params.image.is_none() && params.content_measure is None && params.min_size.y.is_none()
     &&& (params.children_layout is Block) == (tree.layout_record(node).flags.0 & crate::node_flags::NodeFlags::BLOCK_CONTAINER != 0)
 }
@@ -319,6 +320,7 @@ pub(crate) proof fn direct_y_measures_ordinary_leaf<A>(reference: &A, node: A::I
 /// shape checks used by the direct preflight.
 pub(crate) proof fn direct_edges_match_ordinary<F: FrameFloat>(params: LayoutParams, flags: crate::node_flags::NodeFlags, root: bool)
     requires supported_declarations(params, root), flags.is_block_item() == !root,
+        params.children_layout is Block || params.children_layout is Free,
         params.text is None, params.image.is_none(), params.content_measure is None,
         root ==> flags.0 & crate::node_flags::NodeFlags::BLOCK_PARENT_AUTO_HEIGHT == 0,
     ensures crate::dependencies::sizing_finish::block::edge_words::<F>(params, flags) == (
@@ -495,7 +497,8 @@ fn supports<A: Access + ?Sized>(tree: &A, node: A::Id, parent: f32, root: bool, 
     if depth == 0 { return false; }
     let p = tree.params(node);
     let data = tree.record(node);
-    if p.disabled || p.free_placement || p.image.is_some() || !matches!(p.content_measure, ContentMeasure::None)
+    if !matches!(p.children_layout, ChildrenLayout::Block | ChildrenLayout::Free)
+        || p.disabled || p.free_placement || p.image.is_some() || !matches!(p.content_measure, ContentMeasure::None)
         || !accepts_declarations(p, root)
         || !A::Float::finite(padding_for::<A::Float>(p, Y)) || data.flags.has_cycle()
         || data.flags.check_state(X, Kind::Final) != SOLVED || data.flags.check_state(Y, Kind::Final) != SOLVED

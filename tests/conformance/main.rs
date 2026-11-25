@@ -8,6 +8,7 @@
 //! cargo test --test conformance -- --filter flex/   # restrict by category or name
 //! cargo test --test conformance -- --verbose        # print every failure
 //! cargo test --test conformance -- --update         # rewrite the ratchet
+//! cargo test --test conformance -- --case-report cases.tsv
 //! ```
 //!
 //! Fixtures in `passing.txt` must match Chrome. Cases in
@@ -17,8 +18,9 @@ mod ahem;
 mod css;
 mod translate;
 
-use keru_layout::{NodeId, PixelScale, TreeError, Xy};
+use keru_layout::{Axis, LayoutWarning, NodeId, PixelScale, TreeError, Xy};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use translate::{Built, Parent, Tree};
 
@@ -53,19 +55,48 @@ fn expectation(node: roxmltree::Node) -> Expected {
 struct NativeCase<'a> {
     reason: &'a str,
     expected: Expected,
+    warnings: Vec<String>,
 }
 
 fn native_cases<'a>(document: &'a roxmltree::Document) -> BTreeMap<&'a str, NativeCase<'a>> {
     let mut cases = BTreeMap::new();
     for case in document.root_element().children().filter(|node| node.is_element()) {
-        let root = case.first_element_child().expect("native rectangle tree");
+        let root = case.children().find(|n| n.has_tag_name("node")).expect("native rectangle tree");
+        let mut warnings: Vec<_> = case.children().filter(|n| n.has_tag_name("warning")).map(|n| {
+            let path = n.attribute("path").expect("warning path");
+            let kind = n.attribute("kind").expect("warning kind");
+            format!("{kind}@{path}{}", n.attribute("axis").map(|axis| format!(".{axis}")).unwrap_or_default())
+        }).collect();
+        warnings.sort();
         let reason = case.attribute("reason").expect("native sizing rule");
         for name in case.attribute("fixtures").expect("fixture names").split_whitespace() {
-            let previous = cases.insert(name, NativeCase { reason, expected: expectation(root) });
+            let previous = cases.insert(name, NativeCase { reason, expected: expectation(root), warnings: warnings.clone() });
             assert!(previous.is_none(), "duplicate native expectation for {name}");
         }
     }
     cases
+}
+
+// The fixture generator measures out-of-flow positions from their CSS containing
+// block. Convert those reference coordinates to the parent-local frame used here.
+fn browser_positions(expected: &mut Expected, input: roxmltree::Node, parent: [f32; 2],
+    containing: [f32; 2], viewport: Option<[f32; 2]>) {
+    // The XML serializer omits the computed value "static".
+    let position = input.attribute("position").unwrap_or("static");
+    let reference = match (viewport, position) {
+        (Some(_), "absolute") => containing,
+        (Some(viewport), "fixed") => viewport,
+        _ => parent,
+    };
+    let absolute = [reference[0] + expected.rect[0], reference[1] + expected.rect[1]];
+    if reference != parent {
+        expected.rect[0] = absolute[0] - parent[0];
+        expected.rect[1] = absolute[1] - parent[1];
+    }
+    let next = if viewport.is_none() || position != "static" { absolute } else { containing };
+    for (node, child) in input.children().filter(|n| n.is_element()).zip(&mut expected.children) {
+        browser_positions(child, node, absolute, next, Some(viewport.unwrap_or(absolute)));
+    }
 }
 
 fn viewport_axis(raw: Option<&str>) -> Option<f32> {
@@ -78,7 +109,39 @@ fn measure(_: NodeId, text: Option<&mut ahem::AhemText>, wrap: Option<f32>) -> X
     Xy::new(width, height)
 }
 
-fn run(path: &Path, native: Option<&NativeCase>) -> Outcome {
+fn node_path(node: &NodeId, built: &Built) -> Option<String> {
+    if node == &built.node { return Some("root".into()); }
+    for (i, child) in built.children.iter().enumerate() {
+        if let Some(path) = node_path(node, child) {
+            return Some(format!("root.{i}{}", &path["root".len()..]));
+        }
+    }
+    None
+}
+
+fn diagnostic(warning: &LayoutWarning<NodeId>, built: &Built) -> String {
+    use LayoutWarning::*;
+    let (kind, node, axis) = match warning {
+        Cycle { node, axis } => ("Cycle", node, Some(axis)),
+        AspectRatioOnBothAxes { node } => ("AspectRatioOnBothAxes", node, None),
+        FitContentCollapsed { node, axis } => ("FitContentCollapsed", node, Some(axis)),
+        MinAboveMax { node, axis } => ("MinAboveMax", node, Some(axis)),
+        ImpossibleFracChildren { node, axis } => ("ImpossibleFracChildren", node, Some(axis)),
+        NotFinite { node, axis } => ("NotFinite", node, Some(axis)),
+        other => return format!("{other}"),
+    };
+    let path = node_path(node, built).unwrap_or_else(|| "viewport".to_owned());
+    let axis = match axis { Some(Axis::X) => ".x", Some(Axis::Y) => ".y", None => "" };
+    format!("{kind}@{path}{axis}")
+}
+
+#[derive(Default)]
+struct Details {
+    rectangles: Vec<String>,
+    warnings: Vec<String>,
+}
+
+fn run(path: &Path, native: Option<&NativeCase>, details: &mut Details, capture: bool) -> Outcome {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) => return Outcome::Fail(error.to_string()),
@@ -98,7 +161,7 @@ fn run(path: &Path, native: Option<&NativeCase>) -> Outcome {
     let mut tree = Tree::new();
     let root = tree.root();
     let Some(input_root) = input.first_element_child() else { return Outcome::Fail("empty input".into()) };
-    let context = Parent::Viewport { definite: Xy::new(window.x.is_some(), window.y.is_some()) };
+    let context = Parent::Viewport { size: window };
     let built = match translate::build(&mut tree, &root, input_root, context) {
         Ok(built) => built,
         Err(reason) => return Outcome::Unsupported(reason),
@@ -108,17 +171,23 @@ fn run(path: &Path, native: Option<&NativeCase>) -> Outcome {
     }
     let window = Xy::new(window.x.unwrap_or(UNBOUNDED), window.y.unwrap_or(UNBOUNDED));
     tree.solve_layout_with_measure(window, measure);
-    if let Some(warning) = tree.warnings().first() {
-        return Outcome::Fail(format!("warning: {warning}"));
-    }
-    let Some(expected) = expectations.first_element_child().map(expectation) else {
+    details.warnings = tree.warnings().iter().map(|w| diagnostic(w, &built)).collect();
+    details.warnings.sort();
+    let Some(mut expected) = expectations.first_element_child().map(expectation) else {
         return Outcome::Fail("no expectations".into());
     };
+    browser_positions(&mut expected, input_root, [0.0; 2], [0.0; 2], None);
     let mut failures = Vec::new();
-    compare(&tree, &built, &expected, Some([0.0, 0.0]), "root", &mut failures);
+    compare(&tree, &built, &expected, Some([0.0, 0.0]), "root", &mut failures,
+        &mut capture.then_some(&mut details.rectangles));
+    let expected_warnings = native.map(|case| case.warnings.as_slice()).unwrap_or_default();
+    if details.warnings != expected_warnings {
+        failures.push(format!("expected warnings {expected_warnings:?}, got {:?}", details.warnings));
+        return Outcome::Fail(failures.join("; "));
+    }
     if let Some(native) = native {
         let mut native_failures = Vec::new();
-        compare(&tree, &built, &native.expected, Some([0.0, 0.0]), "root", &mut native_failures);
+        compare(&tree, &built, &native.expected, Some([0.0, 0.0]), "root", &mut native_failures, &mut None);
         if !native_failures.is_empty() {
             return Outcome::Fail(format!("{} {}", native.reason, native_failures.join("; ")));
         }
@@ -129,7 +198,7 @@ fn run(path: &Path, native: Option<&NativeCase>) -> Outcome {
     if failures.is_empty() { Outcome::Pass } else { Outcome::Fail(failures.join("; ")) }
 }
 
-fn compare(tree: &Tree, built: &Built, expected: &Expected, origin: Option<[f32; 2]>, path: &str, failures: &mut Vec<String>) {
+fn compare(tree: &Tree, built: &Built, expected: &Expected, origin: Option<[f32; 2]>, path: &str, failures: &mut Vec<String>, rectangles: &mut Option<&mut Vec<String>>) {
     // A hidden subtree has zero boxes in the fixture and no published rectangles.
     let (actual, child_origin) = match (origin.filter(|_| !built.disabled), tree.layout(&built.node)) {
         (Some([x, y]), Ok(rect)) => (
@@ -146,6 +215,9 @@ fn compare(tree: &Tree, built: &Built, expected: &Expected, origin: Option<[f32;
             return;
         }
     };
+    if let Some(rectangles) = rectangles {
+        rectangles.push(format!("{path} {:?}", actual));
+    }
     if actual.iter().zip(expected.rect).any(|(a, e)| !((a - e).abs() < TOLERANCE)) {
         failures.push(format!("{path}: expected {:?}, got {:?}", expected.rect, actual));
     }
@@ -157,7 +229,7 @@ fn compare(tree: &Tree, built: &Built, expected: &Expected, origin: Option<[f32;
         return;
     }
     for (index, (child, expected)) in built.children.iter().zip(&expected.children).enumerate() {
-        compare(tree, child, expected, child_origin, &format!("{path}.{index}"), failures);
+        compare(tree, child, expected, child_origin, &format!("{path}.{index}"), failures, rectangles);
     }
 }
 
@@ -226,6 +298,12 @@ fn main() {
 
     let mut tallies: BTreeMap<String, Tally> = BTreeMap::new();
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+    let mut report = args.iter().position(|arg| arg == "--case-report").map(|i| {
+        let path = args.get(i + 1).expect("--case-report needs a TSV path");
+        let mut out = BufWriter::new(std::fs::File::create(path).expect("create case report"));
+        writeln!(out, "fixture\toutcome\treason\twarnings\tnative_rectangles").expect("write case report");
+        out
+    });
     let mut passing = Vec::new();
     let mut regressions = Vec::new();
     let mut required: BTreeSet<&str> = ratchet.iter().map(String::as_str)
@@ -238,7 +316,19 @@ fn main() {
         let tally = tallies.entry(category).or_default();
         required.remove(name.as_str());
         let native = native_cases.get(name.as_str());
-        let outcome = std::panic::catch_unwind(|| run(&path, native)).unwrap_or_else(|_| Outcome::Fail("panic".into()));
+        let mut details = Details::default();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&path, native, &mut details, report.is_some())))
+            .unwrap_or_else(|_| Outcome::Fail("panic".into()));
+        if let Some(out) = &mut report {
+            let (status, reason) = match &outcome {
+                Outcome::Pass => ("browser", native.map(|c| c.reason).unwrap_or("")),
+                Outcome::NativeMatch => ("native", native.unwrap().reason),
+                Outcome::Fail(why) => ("mismatch", why.as_str()),
+                Outcome::Unsupported(why) => ("unsupported", why.as_str()),
+            };
+            writeln!(out, "{name}\t{status}\t{}\t{}\t{}", reason.replace(['\t', '\n', '\r'], " "),
+                details.warnings.join("; "), details.rectangles.join("; ")).expect("write case report");
+        }
         match &outcome {
             Outcome::Pass => {
                 tally.pass += 1;
@@ -268,6 +358,7 @@ fn main() {
             regressions.push(format!("{name}: {outcome:?}"));
         }
     }
+    if let Some(out) = &mut report { out.flush().expect("flush case report"); }
     regressions.extend(required.into_iter().map(|name| format!("{name}: fixture missing")));
 
     println!("{:<12} {:>6} {:>6} {:>6} {:>12} {:>6}", "category", "pass", "native", "fail", "unsupported", "total");

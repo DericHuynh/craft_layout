@@ -784,7 +784,7 @@ pub(crate) fn unbounded_final_input(params: &LayoutParams, axis: Axis) -> Option
                 && final(access).finish_layout(slot.node) == old(access).finish_layout(slot.node),
     no_unwind
 ))]
-fn final_size<A: FinishAccess>(access: &mut A, slot: Request<A::Id>) -> f32 {
+fn final_size<A: IntrinsicRows>(access: &mut A, slot: Request<A::Id>) -> f32 {
     let min = bound(access, slot, Kind::Min);
     let max = bound(access, slot, Kind::Max);
     if let (Some(min), Some(max)) = (min, max) {
@@ -805,6 +805,7 @@ fn final_size<A: FinishAccess>(access: &mut A, slot: Request<A::Id>) -> f32 {
         && size <= padding_for::<A::Float>(access.params(slot.node), axis)
         && matches!(*access.params(slot.node).size.component(axis), Size::FitContent)
         && !matches!(access.params(slot.node).children_layout, ChildrenLayout::Block | ChildrenLayout::Wrap { .. })
+        && intrinsic::lacks_intrinsic_source(access, slot)
     {
         access.warn(slot, Warning::FitContentCollapsed);
     }

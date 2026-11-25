@@ -15,7 +15,7 @@ use crate::prepare_frame::FrameFloat;
 ///
 /// For example, an element with `Size::Pixels(10.0)` and `Pos::Pixels(0.0)` on an axis will be placed at `[0.0, 10.0]`, `[-5.0, 5.0]` or `[-10.0, 0.0]` if its `Anchor` is `Start`, `Center` or `End` respectively.
 ///
-/// Has no effect in a stack's main axis, or for `Pos` values other than `Pixels` and `Frac`.
+/// Has no effect in a stack's main axis, or with the edge and center alignment positions.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub enum Anchor {
     /// The left or top edge of the element's rectangle.
@@ -47,6 +47,16 @@ pub enum Pos {
     Pixels(f32),
     /// A fraction of the parent's size starting from its left or top side.
     Frac(f32),
+    /// Anchor at a fraction of the parent's inner extent plus a logical pixel offset.
+    /// Both components are measured from the same origin, including when that origin is flipped.
+    /// For example, `Offset { fraction: 1.0, pixels: -8.0 }` places the anchor eight pixels
+    /// before the far edge as the parent resizes.
+    Offset {
+        /// Fraction of the available range along this axis.
+        fraction: f32,
+        /// Additional distance from the origin, in logical pixels.
+        pixels: f32,
+    },
 }
 
 /// What to do if a freely placed node would extend past the edges of the window. It has no effect on the children of a `Stack` or a `Grid`, unless they are `free_placement`.
@@ -58,7 +68,10 @@ pub enum WindowOverflow {
     Ignore,
     /// Push the node back inside the window.
     Clamp,
-    /// Mirror the node to the other side of its anchor point, as a right-click context menu does. If the mirrored node also doesn't fit, push it back inside the window.
+    /// Keep the requested placement if it fits on this axis. On overflow, try the
+    /// opposite side of the anchor, as a context menu would. When neither side
+    /// fits, clamp the originally requested placement into the window. If the
+    /// node is as large as the window or larger, place its near edge at zero.
     Flip,
 }
 
@@ -208,6 +221,11 @@ pub(crate) open spec fn positioned<F: FrameFloat>(range: [f32; 2], position: Pos
             anchored::<F>(if !flipped { F::sum(origin, offset) }
                 else { F::difference(origin, offset) }, anchor, flipped, size)
         },
+        Pos::Offset { fraction, pixels } => {
+            let offset = F::sum(F::product(fraction, F::difference(inner_end, inner_start)), pixels);
+            anchored::<F>(if !flipped { F::sum(origin, offset) }
+                else { F::difference(origin, offset) }, anchor, flipped, size)
+        },
         Pos::Center => centered::<F>(inner_start, inner_end, size),
     }
 }
@@ -294,6 +312,11 @@ pub(crate) fn resolve_position<F: FrameFloat>(range: [f32; 2], position: Pos, an
         Pos::Frac(frac) => {
             let static_pos = F::multiply(frac, F::subtract(inner_end, inner_start));
             let reference = if !flipped { F::add(origin_edge, static_pos) } else { F::subtract(origin_edge, static_pos) };
+            position_at::<F>(reference, anchor, flipped, child_size)
+        }
+        Pos::Offset { fraction, pixels } => {
+            let offset = F::add(F::multiply(fraction, F::subtract(inner_end, inner_start)), pixels);
+            let reference = if !flipped { F::add(origin_edge, offset) } else { F::subtract(origin_edge, offset) };
             position_at::<F>(reference, anchor, flipped, child_size)
         }
         Pos::Center => centered_range::<F>(inner_start, inner_end, child_size),

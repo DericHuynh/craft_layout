@@ -30,11 +30,11 @@ pub(crate) open spec fn zero<F: FrameFloat>(value: f32) -> bool {
 }
 
 pub(crate) open spec fn collapse(p: &LayoutParams) -> bool {
-    p.text is None && p.image.is_none() && p.content_measure is None
+    (p.children_layout is Block || p.children_layout is Free) && p.text is None && p.image.is_none() && p.content_measure is None
 }
 
-pub(crate) open spec fn zero_bound<F: FrameFloat>(p: &LayoutParams) -> bool {
-    match p.min_size.y {
+pub(crate) open spec fn zero_bound<F: FrameFloat>(bound: Option<Size>) -> bool {
+    match bound {
         None => true,
         Some(Size::Pixels(v) | Size::Frac(v)) => zero::<F>(v),
         _ => false,
@@ -69,7 +69,9 @@ pub(crate) open spec fn edge_words<F: FrameFloat>(params: LayoutParams, flags: N
         flags.0 & NodeFlags::BLOCK_PARENT_AUTO_HEIGHT != 0);
     (adjoining && zero::<F>(params.padding.y[0]),
         adjoining && zero::<F>(params.padding.y[1]) && y is Some && y.unwrap() is FitContent
-            && zero_bound::<F>(&params))
+            && (params.min_size.y is Some && params.min_size.y.unwrap() is Pixels
+                || zero_bound::<F>(sizing_requests::resolved_size(params, true, Kind::Min, flags.is_block_item(),
+                    flags.0 & NodeFlags::BLOCK_PARENT_AUTO_HEIGHT != 0))))
 }
 
 pub(crate) open spec fn edges<A: FlowAccess>(access: &A, node: A::Id) -> (bool, bool) {
@@ -90,7 +92,8 @@ pub(crate) open spec fn item_words<F: FrameFloat, B: Scalar>(
     let size = record.values@[cycle_rules::slot_index(1, Kind::Final) as int];
     let adjoining = item_adjoins(zero::<F>(size),
         [zero::<F>(params.padding.y[0]), zero::<F>(params.padding.y[1])],
-        collapse(&params), zero_bound::<F>(&params));
+        collapse(&params), zero_bound::<F>(sizing_requests::resolved_size(params, true, Kind::Min, record.flags.is_block_item(),
+            record.flags.0 & NodeFlags::BLOCK_PARENT_AUTO_HEIGHT != 0)));
     model::item_from_edges(lift(F::margin_value(params.margin.y[0])),
         lift(F::margin_value(params.margin.y[1])), lift(size), adjoining,
         !child_word_has_flow(record), saved_margin::<F, B>(record, arena))
@@ -107,14 +110,14 @@ pub(crate) open spec fn item<A: FlowAccess>(access: &A, child: A::Id) -> BlockIt
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == collapse(params), no_unwind))]
 fn can_collapse(params: &LayoutParams) -> bool {
-    matches!(params.text, TextContent::None) && params.image.is_none() && matches!(params.content_measure, ContentMeasure::None)
+    matches!(params.children_layout, ChildrenLayout::Block | ChildrenLayout::Free) && matches!(params.text, TextContent::None) && params.image.is_none() && matches!(params.content_measure, ContentMeasure::None)
 }
 
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
-#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == zero_bound::<F>(params), no_unwind))]
-fn minimum_zero<F: FrameFloat>(params: &LayoutParams) -> bool {
-    match params.min_size.y {
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == zero_bound::<F>(bound), no_unwind))]
+fn minimum_zero<F: FrameFloat>(bound: Option<Size>) -> bool {
+    match bound {
         None => true,
         Some(Size::Pixels(value) | Size::Frac(value)) => F::is_zero(value),
         _ => false,
@@ -132,7 +135,8 @@ pub(super) fn start<A: FlowAccess>(access: &A, node: A::Id) -> BlockFlow<A::Bloc
     let fit = matches!(access.declaration(target(node, true, Kind::Regular)), Some(Size::FitContent));
     BlockFlow::from_edges(
         edge_adjoins(margins_adjoin, A::Float::is_zero(params.padding.y[0])),
-        edge_adjoins(margins_adjoin, A::Float::is_zero(params.padding.y[1])) && fit && minimum_zero::<A::Float>(params),
+        edge_adjoins(margins_adjoin, A::Float::is_zero(params.padding.y[1])) && fit && (matches!(params.min_size.y, Some(Size::Pixels(_))) ||
+            minimum_zero::<A::Float>(access.declaration(target(node, true, Kind::Min)))),
     )
 }
 
@@ -158,7 +162,7 @@ pub(super) fn read_child<A: FlowAccess>(access: &mut A, child: A::Id) -> BlockIt
     let size = cycle_rules::read_slot(&record.values, 1, Kind::Final);
     let adjoining = item_adjoins(A::Float::is_zero(size),
         [A::Float::is_zero(params.padding.y[0]), A::Float::is_zero(params.padding.y[1])],
-        can_collapse(params), minimum_zero::<A::Float>(params));
+        can_collapse(params), minimum_zero::<A::Float>(access.declaration(target(child, true, Kind::Min))));
     BlockItem::from_edges(A::lift_block(A::Float::margin(before)), A::lift_block(A::Float::margin(after)),
         A::lift_block(size), adjoining, !record.has_in_flow_children(), nested)
 }
