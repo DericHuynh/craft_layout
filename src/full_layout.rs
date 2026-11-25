@@ -103,26 +103,21 @@ pub(crate) fn run<T: Access + ?Sized, M: VecMemory, const REGISTERED_PIXELS: boo
     (sizing, placement)
 }
 
-/// Run the owned full solve with the selected preparation and cycle policies.
-#[inline(never)]
-#[cfg(any(feature = "incremental", verus_keep_ghost))]
+/// Run the ordinary full solve, committing placement only when sizing detects no dependency cycle.
+#[cfg(any(feature = "batch-pilot", verus_keep_ghost))]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(accepted =>
     requires old(tree).order().ordered(), old(tree).order().closed_subtrees(),
     ensures final(tree).order() == old(tree).order(),
-        !accepted ==> reject_cycles && !final(tree).packed_state().uniform_capture_open,
+        !accepted ==> !final(tree).packed_state().uniform_capture_open,
     no_unwind
 ))]
-pub(crate) fn run_owned<T: Access + ?Sized, M: VecMemory>(
-    tree: &mut T, window: Xy<f32>, registered_pixels: bool, reject_cycles: bool,
+pub(crate) fn run_acyclic<T: Access + ?Sized, M: VecMemory, const REGISTERED_PIXELS: bool>(
+    tree: &mut T, window: Xy<f32>,
 ) -> bool {
     begin::<T, M>(tree);
-    if registered_pixels {
-        sizing_pass::measure_full::<T, M, true>(tree, window);
-    } else {
-        sizing_pass::measure_full::<T, M, false>(tree, window);
-    }
-    if reject_cycles && *tree.sizing_flags().0 {
+    sizing_pass::measure_full::<T, M, REGISTERED_PIXELS>(tree, window);
+    if *tree.sizing_flags().0 {
         tree.packed_stack_leaves().uniform_capture_open = false;
         return false;
     }

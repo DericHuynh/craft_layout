@@ -130,18 +130,6 @@ pub trait TreeAdapter {
     #[cfg(feature = "incremental")]
     fn retains_output_rects(&self) -> bool { false }
 
-    /// Capacity hint for the checked Stack leaf preparation paths.
-    #[doc(hidden)]
-    #[cfg(feature = "batch-pilot")]
-    fn stack_leaf_count_hint(&self, node: Self::NodeId) -> u32 {
-        self.node_layout_data(node).n_placed_children
-    }
-
-    /// Estimated population available for reserving prepared leaf rows.
-    #[doc(hidden)]
-    #[cfg(feature = "batch-pilot")]
-    fn first_stack_population_hint(&self) -> u32 { 0 }
-
     /// Called when the layout solver finds a problem in a node's layout.
     /// 
     /// Depending on the use case, this can be reported to the user.

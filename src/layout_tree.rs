@@ -550,18 +550,11 @@ impl<T> LayoutTree<T> {
         let scale = self.layout_data.pixel_scale;
         match self.batch_start {
             BatchStart::First => {
-                let registered_pixels = self.layout_data.n_nodes_solved != 0;
-                let population = if registered_pixels {
-                    0
-                } else {
-                    u32::try_from(self.nodes.len()).unwrap_or(u32::MAX)
-                };
                 let previous_warnings = std::mem::take(&mut self.warnings);
                 let mut adapter = Adapter::new(self, text, content);
                 adapter.cache_text = WrappedHeightCache::for_flow(cache_text);
-                adapter.first_stack_population = population;
-                let accepted = crate::full_layout::run_owned::<_, crate::vec_memory::RustVec>(
-                    &mut adapter, window, registered_pixels, true,
+                let accepted = crate::full_layout::run_acyclic::<_, crate::vec_memory::RustVec, true>(
+                    &mut adapter, window,
                 );
                 self.tail_stack = None;
                 if accepted {
@@ -855,8 +848,6 @@ struct Adapter<'a, T, M, C> {
     text: M,
     content: C,
     cache_text: WrappedHeightCache,
-    #[cfg(feature = "batch-pilot")]
-    first_stack_population: u32,
     // The solver's borrowed-data interface is total. A missing internal key
     // has no links or callbacks and its writes stay in this adapter.
     missing_layout: NodeLayoutData,
@@ -889,12 +880,7 @@ impl WrappedHeightCache {
 
 impl<'a, T, M, C> Adapter<'a, T, M, C> {
     fn new(tree: &'a mut LayoutTree<T>, text: M, content: C) -> Self {
-        Self {
-            tree, text, content, cache_text: WrappedHeightCache::Disabled,
-            #[cfg(feature = "batch-pilot")]
-            first_stack_population: 0,
-            missing_layout: NodeLayoutData::new(),
-        }
+        Self { tree, text, content, cache_text: WrappedHeightCache::Disabled, missing_layout: NodeLayoutData::new() }
     }
 }
 
@@ -948,36 +934,10 @@ where
     type NodeId = NodeKey;
 
     fn solve_layout(&mut self, window_size: Xy<f32>) {
-        // Fresh trees can use the full solver's unregistered preparation.
-        let registered_pixels = self.tree.layout_data.n_nodes_solved != 0;
-        crate::full_layout::run_owned::<_, crate::vec_memory::RustVec>(
-            self, window_size, registered_pixels, false,
-        );
+        self.solve_full::<true>(window_size);
     }
 
     fn retains_output_rects(&self) -> bool { true }
-
-    #[cfg(feature = "batch-pilot")]
-    #[inline]
-    fn stack_leaf_count_hint(&self, id: NodeKey) -> u32 {
-        let Some(parent) = self.tree.nodes.get(id) else { return 0; };
-        let recorded = parent.layout.n_placed_children;
-        let capacity = self.first_stack_population;
-        if recorded != 0 || capacity == 0 { return recorded; }
-        if parent.first_child == parent.last_child { return 0; }
-        // Adjacent fresh allocations often describe a complete leaf group.
-        // The preparation kernels still check the actual sibling count.
-        let Some(first) = parent.first_child.and_then(|id| self.tree.nodes.get(id)) else { return 0; };
-        let Some(last) = parent.last_child.and_then(|id| self.tree.nodes.get(id)) else { return 0; };
-        if first.first_child.is_some() || last.first_child.is_some() { return 0; }
-        let first = incarnation(first.identity);
-        let last = incarnation(last.identity);
-        records::leaf_count_hint(first, last, capacity)
-    }
-
-    #[cfg(feature = "batch-pilot")]
-    #[inline(always)]
-    fn first_stack_population_hint(&self) -> u32 { self.first_stack_population }
 
     #[inline(always)]
     fn root(&self) -> NodeKey {
@@ -1200,56 +1160,6 @@ fn max_line_chars(wrap_width: Option<f32>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "batch-pilot")]
-    #[test]
-    fn batch_workspace_is_deferred_until_a_changed_solve() {
-        let scale = PixelScale::new(1.25);
-        let window = Xy::new(100.25, 50.75);
-        let words = |rect: XyRect| [rect.x, rect.y].map(|edges| edges.map(f32::to_bits));
-
-        for switch_to_legacy in [false, true] {
-            let mut tree = LayoutTree::<()>::new();
-            let root = tree.root();
-            let mut style = LayoutParams {
-                size: Xy::new_symm(Size::Pixels(10.375)),
-                ..LayoutParams::DEFAULT
-            };
-            let child = tree.add_node(&root, style).unwrap();
-            tree.set_pixel_scale(scale);
-            assert_eq!(tree.solve_layout_batch(window).unwrap(), BatchLayoutStats::default());
-            assert_eq!(tree.batch.capacity(), 0);
-            let initial = words(tree.layout(&child).unwrap());
-
-            assert_eq!(tree.solve_layout_batch(window).unwrap(), BatchLayoutStats::default());
-            assert_eq!(tree.batch.capacity(), 0);
-            tree.set_pixel_scale(PixelScale::new(2.0));
-            tree.set_pixel_scale(scale);
-            assert_eq!(tree.solve_layout_batch(window).unwrap(), BatchLayoutStats::default());
-            assert_eq!(tree.batch.capacity(), 0);
-            assert_eq!(words(tree.layout(&child).unwrap()), initial);
-
-            let changed_window = if switch_to_legacy {
-                let resized = Xy::new(120.25, 70.75);
-                tree.solve_layout(resized);
-                resized
-            } else {
-                style.position.x = Pos::End;
-                tree.update_node_params(&child, style).unwrap();
-                window
-            };
-            assert_eq!(tree.batch.capacity(), 0);
-            assert!(tree.solve_layout_batch(changed_window).unwrap().rebuilt_graph);
-            assert_eq!(tree.batch.len(), 1);
-            assert_ne!(words(tree.layout(&child).unwrap()), initial);
-
-            let mut full = tree.clone();
-            full.solve_layout(changed_window);
-            for key in [root.key(), child.key()] {
-                assert_eq!(tree.layout(&tree.node_id(key)).map(words), full.layout(&full.node_id(key)).map(words));
-            }
-        }
-    }
 
     #[test]
     fn absent_adapter_key_has_no_links_callbacks_or_live_layout_writes() {
