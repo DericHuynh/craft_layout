@@ -168,7 +168,7 @@ pub proof fn cyclic_boundary_accounts_for_nested_work(facts: Facts, child: bool,
 {}
 
 pub proof fn movement_and_local_changes_start_regions(change: StructuralChange)
-    ensures policy::starts_region(change) == (change is Moved || change is Subtree),
+    ensures policy::starts_region(change) == (change is Moved || change is Subtree || change is DormantGrid),
 {}
 
 pub proof fn a_clean_branch_gate_excludes_dirty_or_cyclic_nodes(change: StructuralChange, cyclic: bool)

@@ -2,7 +2,7 @@
 //! per-node metadata. The adapter's visible traversal supplies live indices.
 use vstd::prelude::*;
 #[path = "../src/margin_storage.rs"]
-mod kernel;
+pub(crate) mod kernel;
 
 verus! {
 

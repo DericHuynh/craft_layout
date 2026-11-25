@@ -1,8 +1,17 @@
 use super::*;
 use super::text_scan::AsciiWords;
+use super::text_scan::windows::{SVG_NUMBER_CACHE_BITS, next_svg_escape, separated_by_space, svg_color_bytes, svg_color_suffix, svg_number_index};
 use arrayvec::ArrayString;
 use std::fmt::{self, Write};
 use std::ops::Range;
+
+#[path = "svg_number_format.rs"]
+mod number_format;
+use number_format::{SVG_NUMBER_CAPACITY, write_svg_number};
+
+#[path = "svg_control.rs"]
+mod controller;
+use controller::{WordSpan, next_line, paint_nodes};
 
 #[cfg(target_arch = "x86_64")]
 #[path = "svg_words.rs"]
@@ -10,20 +19,26 @@ mod svg_words;
 #[cfg(target_arch = "x86_64")]
 use svg_words::MixedWords;
 #[cfg(target_arch = "x86_64")]
-use super::text_scan::windows::unicode_separator_width;
+use super::text_scan::{NativeBitLanes, text_avx2_supported};
+#[cfg(target_arch = "x86_64")]
+use super::text_scan::windows::boundaries::{active_tail32, pop_lane, single_space_end, tail_mask16, tail_mask32};
+#[cfg(target_arch = "x86_64")]
+use super::text_scan::windows::native::{load_avx, load_sse2};
+#[cfg(target_arch = "x86_64")]
+use super::text_scan::windows::{TextAvx2, partition_windows, take_full_window, unicode_separator_width};
 
 impl<T> LayoutTree<T> {
     fn write_svg_inner(&self, svg: &mut (impl Write + ?Sized), text: impl Fn(&T) -> &str) -> fmt::Result {
         let mut numbers = SvgNumbers::new();
-        let window = self.layout_data.window_size;
+        let window = self.published_window();
         writeln!(svg, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" font-family=\"monospace\" font-size=\"7.5\">", window.x, window.y)?;
         writeln!(svg, "<rect width=\"100%\" height=\"100%\" fill=\"#faf8f5\"/>")?;
-        let mut next = Some(self.root);
-        while let Some(i) = next {
-            let node = &self.nodes[i];
-            next = self.next_in_subtree(self.root, i, !node.params.disabled);
+        paint_nodes(self.root, self.nodes.len(), fmt::Error, &mut |i| {
+            let node = self.nodes.get(i).ok_or(fmt::Error)?;
+            let size_px = self.published_size(i, node);
+            let next = self.next_in_subtree(self.root, i, !node.params.disabled);
             if !node.has_published_rect() {
-                continue;
+                return Ok(next);
             }
             let color = node_color(i);
             let color = color.as_str();
@@ -38,8 +53,9 @@ impl<T> LayoutTree<T> {
             if node.params.text != TextContent::None && let Some(context) = self.context(node) {
                 let [left, right] = node.params.padding.x;
                 let wraps = node.params.text == TextContent::Wrapping && !matches!(node.params.size.x, Size::AspectRatio(_));
-                let wrap_width = wraps.then(|| (node.layout.size().x - left - right).max(0.0));
-                for (n, line) in wrapped_lines(text(context), wrap_width).enumerate() {
+                let wrap_width = wraps.then(|| (size_px.x - left - right).max(0.0));
+                let mut n = 0usize;
+                for line in wrapped_lines(text(context), wrap_width) {
                     let y = rect.y[0] + node.params.padding.y[0] + (n as f32 + 0.75) * LINE_HEIGHT;
                     let length = line.width_in_chars as f32 * CHAR_WIDTH;
                     numbers.write_fields(svg, [
@@ -49,6 +65,7 @@ impl<T> LayoutTree<T> {
                     svg.write_str("\" lengthAdjust=\"spacingAndGlyphs\" fill=\"#222\">")?;
                     line.write_text(svg)?;
                     writeln!(svg, "</text>")?;
+                    n = n.saturating_add(1);
                 }
             }
             numbers.write_fields(svg, [("<text x=\"", rect.x[0] + 2.25), ("\" y=\"", rect.y[0] + 9.0)])?;
@@ -57,7 +74,8 @@ impl<T> LayoutTree<T> {
             svg.write_str(" × ")?;
             numbers.write_size(svg, size.y)?;
             svg.write_str("</text>\n")?;
-        }
+            Ok(next)
+        })?;
         writeln!(svg, "</svg>")
     }
 
@@ -69,12 +87,15 @@ impl<T> LayoutTree<T> {
         } else {
             0
         };
-        let mut svg = String::new();
+        let mut svg = SvgString(String::new());
         // About 240 bytes of markup per node plus the header. A failed estimate
         // leaves the String free to grow as individual tags are written.
-        let _ = svg.try_reserve_exact(visible.saturating_mul(240).saturating_add(256));
-        self.write_svg_inner(&mut svg, text).expect("writing to a String cannot fail");
-        svg
+        let _ = svg.0.try_reserve_exact(visible.saturating_mul(240).saturating_add(256));
+        if self.write_svg_inner(&mut svg, text).is_err() {
+            svg.0.clear();
+            let _ = svg.write_str("<svg xmlns=\"http://www.w3.org/2000/svg\"/>\n");
+        }
+        svg.0
     }
 
     /// Writes the published layout rectangles to a caller-provided buffer or formatter.
@@ -85,6 +106,17 @@ impl<T> LayoutTree<T> {
     /// Draws an SVG image representing the layout rectangles from the last `solve_layout()`.
     pub fn to_svg(&self) -> String {
         self.svg_string(|_| "")
+    }
+}
+
+struct SvgString(String);
+
+impl Write for SvgString {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        // Reserve before appending so output size or allocation failure is a write error.
+        self.0.try_reserve(text.len()).map_err(|_| fmt::Error)?;
+        self.0.push_str(text);
+        Ok(())
     }
 }
 
@@ -128,10 +160,10 @@ impl WrappedLine<'_> {
         if self.ascii {
             write_words(svg, self.source, AsciiWords::new(self.source.as_bytes()))
         } else {
-            for (index, word) in self.source.split_whitespace().enumerate() {
-                if index != 0 {
-                    svg.write_char(' ')?;
-                }
+            let mut words = self.source.split_whitespace();
+            if let Some(first) = words.next() { write_escaped(svg, first)?; }
+            for word in words {
+                svg.write_char(' ')?;
                 write_escaped(svg, word)?;
             }
             Ok(())
@@ -139,9 +171,10 @@ impl WrappedLine<'_> {
     }
 }
 
-fn word_span(source: &str, word: &str) -> Range<usize> {
-    let start = word.as_ptr().addr() - source.as_ptr().addr();
-    start..start + word.len()
+fn word_span(source: &str, word: &str) -> Option<Range<usize>> {
+    let start = word.as_ptr().addr().checked_sub(source.as_ptr().addr())?;
+    let end = start.checked_add(word.len())?;
+    (end <= source.len()).then_some(start..end)
 }
 
 fn write_words(
@@ -151,14 +184,14 @@ fn write_words(
     let (mut start, mut end) = (first.start, first.end);
     for word in words {
         // Keep one borrowed span across separators that already need no edits.
-        if word.start != end + 1 || source.as_bytes()[end] != b' ' {
-            write_escaped(svg, &source[start..end])?;
+        if !separated_by_space(source.as_bytes(), end, word.start) {
+            write_escaped(svg, source.get(start..end).ok_or(fmt::Error)?)?;
             svg.write_char(' ')?;
             start = word.start;
         }
         end = word.end;
     }
-    write_escaped(svg, &source[start..end])
+    write_escaped(svg, source.get(start..end).ok_or(fmt::Error)?)
 }
 
 fn wrapped_lines(text: &str, wrap_width: Option<f32>) -> impl Iterator<Item = WrappedLine<'_>> {
@@ -193,20 +226,24 @@ fn wrapped_lines(text: &str, wrap_width: Option<f32>) -> impl Iterator<Item = Wr
     let unicode_text = text;
     let mut ascii_words = AsciiWords::new(text.as_bytes());
     let mut unicode_words = unicode_text.split_whitespace();
-    let mut words = std::iter::from_fn(move || {
+    let mut words = move || {
         #[cfg(target_arch = "x86_64")]
         if let Some(words) = &mut mixed_words {
-            return words.next();
+            let (span, width) = words.next()?;
+            return Some(WordSpan { start: span.start, end: span.end, width });
         }
         if ascii {
             let word = ascii_words.next()?;
-            let width = word.len();
-            Some((word, width))
+            let width = word.end.saturating_sub(word.start);
+            Some(WordSpan { start: word.start, end: word.end, width })
         } else {
             let word = unicode_words.next()?;
-            Some((word_span(text, word), word.chars().count()))
+            let span = word_span(text, word)?;
+            Some(WordSpan { start: span.start, end: span.end, width: word.chars().count() })
         }
-    }).peekable();
+    };
+    let mut pending = None;
+    let mut after = 0;
     let mut yielded = false;
     std::iter::from_fn(move || {
         if let Some((source, chars, needs_escaping)) = plain {
@@ -221,16 +258,11 @@ fn wrapped_lines(text: &str, wrap_width: Option<f32>) -> impl Iterator<Item = Wr
                 verbatim: !needs_escaping,
             });
         }
-        let (mut line, mut width) = words.next()?;
-        let mut single_spaces = true;
-        while let Some((next, chars)) = words.next_if(|(_, chars)| width + 1 + chars <= max) {
-            single_spaces &= next.start == line.end + 1 && text.as_bytes()[line.end] == b' ';
-            line.end = next.end;
-            width += 1 + chars;
-        }
+        let (line, single_spaces) = next_line(text.as_bytes(), max, after, &mut words, &mut pending)?;
+        after = line.end;
         Some(WrappedLine {
-            source: &text[line],
-            width_in_chars: width,
+            source: text.get(line.start..line.end)?,
+            width_in_chars: line.width,
             single_spaces,
             ascii,
             #[cfg(target_arch = "x86_64")]
@@ -248,7 +280,8 @@ fn plain_ascii_line(bytes: &[u8]) -> Option<bool> {
 
     let last = bytes.last_chunk::<16>()?;
     if last[15] == b' ' { return None; }
-    let (blocks, tail) = bytes.as_chunks::<16>();
+    let (prefix, tail) = partition_windows::<16>(bytes, false);
+    let mut rest = prefix;
     // SAFETY: SSE2 is available on x86-64, and every load uses a complete array.
     unsafe {
         let space = _mm_set1_epi8(b' ' as i8);
@@ -258,29 +291,28 @@ fn plain_ascii_line(bytes: &[u8]) -> Option<bool> {
         let control_limit = _mm_set1_epi8(i8::MIN + (b'\r' - b'\t' + 1) as i8);
         let mut specials = _mm_setzero_si128();
         let mut previous_space = 1u32;
-        let mut scan = |block: &[u8; 16], skip: usize| {
-            let value = _mm_loadu_si128(block.as_ptr().cast());
+        let mut scan = |block: &[u8; 16], count: usize| {
+            let value = load_sse2(block);
             // The signed bias identifies the ASCII whitespace controls 9–13.
             let controls = _mm_cmpgt_epi8(control_limit, _mm_sub_epi8(value, bias));
-            if _mm_movemask_epi8(_mm_or_si128(value, controls)) != 0 { return false; }
-            let spaces = (_mm_movemask_epi8(_mm_cmpeq_epi8(value, space)) as u32) >> skip;
-            if spaces & ((spaces << 1) | previous_space) != 0 { return false; }
-            previous_space = spaces >> (15 - skip);
+            if _mm_movemask_epi8(_mm_or_si128(value, controls)) != 0 { return None; }
+            let spaces = tail_mask16(_mm_movemask_epi8(_mm_cmpeq_epi8(value, space)) as u16, count);
+            previous_space = single_space_end(u32::from(spaces), previous_space, count)?;
             specials = _mm_or_si128(specials, _mm_or_si128(_mm_cmpeq_epi8(value, amp), _mm_cmpeq_epi8(value, lt)));
-            true
+            Some(())
         };
-        for block in blocks {
-            if !scan(block, 0) { return None; }
+        while let Some((block, _)) = take_full_window::<16>(&mut rest, prefix.len()) {
+            scan(block.first_chunk()?, 16)?;
         }
         // Only the space transitions must exclude any overlap with the preceding block.
-        if !tail.is_empty() && !scan(last, 16 - tail.len()) { return None; }
+        if !tail.is_empty() { scan(last, tail.len())?; }
         Some(_mm_movemask_epi8(specials) != 0)
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 fn plain_line(text: &str) -> Option<(usize, bool)> {
-    if text.len() >= 96 && is_x86_feature_detected!("avx2") {
+    if text.len() >= 96 && text_avx2_supported(TextAvx2::AsciiOrSvg) {
         // SAFETY: The feature detector checks both the CPU and operating system.
         return unsafe { plain_line_avx2(text) };
     }
@@ -301,7 +333,8 @@ unsafe fn plain_line_avx2(text: &str) -> Option<(usize, bool)> {
     if last[WIDTH - 1] == b' ' {
         return None;
     }
-    let (blocks, tail) = bytes.as_chunks::<WIDTH>();
+    let (prefix, tail) = partition_windows::<WIDTH>(bytes, false);
+    let mut rest = prefix;
     let space = _mm256_set1_epi8(b' ' as i8);
     let amp = _mm256_set1_epi8(b'&' as i8);
     let lt = _mm256_set1_epi8(b'<' as i8);
@@ -310,9 +343,8 @@ unsafe fn plain_line_avx2(text: &str) -> Option<(usize, bool)> {
     let mut specials = _mm256_setzero_si256();
     let mut previous_space = 1u32;
     let mut width_in_chars = text.len();
-    let mut scan = |block: &[u8; WIDTH], skip: usize| {
-        // SAFETY: The array supplies a full unaligned vector load.
-        let value = unsafe { _mm256_loadu_si256(block.as_ptr().cast()) };
+    let mut scan = |block: &[u8; WIDTH], count: usize, base: usize| {
+        let value = load_avx(block);
         let controls = _mm256_cmpgt_epi8(control_limit, _mm256_sub_epi8(value, bias));
         let exceptional = _mm256_movemask_epi8(_mm256_or_si256(value, controls)) as u32;
         if exceptional != 0 {
@@ -320,35 +352,29 @@ unsafe fn plain_line_avx2(text: &str) -> Option<(usize, bool)> {
             if exceptional != high {
                 return None;
             }
-            let remaining_lanes = u32::MAX << skip;
+            let remaining_lanes = active_tail32(count);
             let continuation = _mm256_movemask_epi8(_mm256_cmpgt_epi8(_mm256_set1_epi8(-64), value)) as u32;
-            width_in_chars -= (continuation & remaining_lanes).count_ones() as usize;
+            width_in_chars = width_in_chars.checked_sub((continuation & remaining_lanes).count_ones() as usize)?;
             // Non-ASCII Unicode whitespace starts with C2 or E1–E3. Decode
             // only those candidates and count all UTF-8 continuation bytes.
             let two_bytes = _mm256_cmpeq_epi8(value, _mm256_set1_epi8(0xc2_u8 as i8));
             let biased = _mm256_sub_epi8(value, _mm256_set1_epi8(0x61));
             let three_bytes = _mm256_cmpgt_epi8(_mm256_set1_epi8(-125), biased);
             let possible_spaces = _mm256_movemask_epi8(_mm256_or_si256(two_bytes, three_bytes)) as u32 & remaining_lanes;
-            if possible_spaces != 0 {
-                let base = block.as_ptr().addr() - bytes.as_ptr().addr();
-                if contains_unicode_whitespace(bytes, base, possible_spaces) { return None; }
-            }
+            if possible_spaces != 0 && contains_unicode_whitespace(bytes, base, possible_spaces) { return None; }
         }
-        let spaces = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(value, space)) as u32) >> skip;
-        if spaces & ((spaces << 1) | previous_space) != 0 {
-            return None;
-        }
-        previous_space = spaces >> (WIDTH - 1 - skip);
+        let spaces = tail_mask32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(value, space)) as u32, count);
+        previous_space = single_space_end(spaces, previous_space, count)?;
         let entities = _mm256_or_si256(_mm256_cmpeq_epi8(value, amp), _mm256_cmpeq_epi8(value, lt));
         specials = _mm256_or_si256(specials, entities);
         Some(())
     };
-    for block in blocks {
-        scan(block, 0)?;
+    while let Some((block, base)) = take_full_window::<WIDTH>(&mut rest, prefix.len()) {
+        scan(block.first_chunk()?, WIDTH, base)?;
     }
     // Only new lanes participate in the space transitions and Unicode decoding for an overlapping tail.
     if !tail.is_empty() {
-        scan(last, WIDTH - tail.len())?;
+        scan(last, tail.len(), bytes.len().checked_sub(WIDTH)?)?;
     }
     Some((width_in_chars, _mm256_movemask_epi8(specials) != 0))
 }
@@ -357,23 +383,28 @@ unsafe fn plain_line_avx2(text: &str) -> Option<(usize, bool)> {
 #[inline(never)]
 fn contains_unicode_whitespace(bytes: &[u8], base: usize, mut leading: u32) -> bool {
     while leading != 0 {
-        let offset = leading.trailing_zeros() as usize;
-        if unicode_separator_width(bytes, base + offset) != 0 {
+        let offset = pop_lane::<NativeBitLanes>(&mut leading);
+        if unicode_separator_width(bytes, base.saturating_add(offset as usize)) != 0 {
             return true;
         }
-        leading &= leading - 1;
     }
     false
 }
 
 fn write_escaped(svg: &mut (impl Write + ?Sized), text: &str) -> fmt::Result {
     let mut start = 0;
-    for index in memchr::memchr2_iter(b'&', b'<', text.as_bytes()) {
-        svg.write_str(&text[start..index])?;
-        svg.write_str(if text.as_bytes()[index] == b'&' { "&amp;" } else { "&lt;" })?;
-        start = index + 1;
+    while let Some(index) = next_svg_escape(text.as_bytes(), start) {
+        let prefix = text.get(start..index).ok_or(fmt::Error)?;
+        let entity = match text.as_bytes().get(index) {
+            Some(b'&') => "&amp;",
+            Some(b'<') => "&lt;",
+            _ => return Err(fmt::Error),
+        };
+        svg.write_str(prefix)?;
+        svg.write_str(entity)?;
+        start = index.checked_add(1).ok_or(fmt::Error)?;
     }
-    svg.write_str(&text[start..])
+    svg.write_str(text.get(start..).ok_or(fmt::Error)?)
 }
 
 fn node_color(i: NodeKey) -> SvgColor {
@@ -393,59 +424,52 @@ struct SvgColor {
 impl SvgColor {
     #[inline]
     fn from_hash(hash: u64) -> Self {
-        fn decimal_pair(value: u8) -> [u8; 2] {
-            [b'0' + value / 10, b'0' + value % 10]
-        }
-
-        let hue = (hash % 360) as u16;
-        let saturation = (45 + (hash >> 16) % 25) as u8;
-        let lightness = (32 + (hash >> 32) % 14) as u8;
-        let mut bytes = *b"hsl(000, 00%, 00%)";
-        bytes[4] += (hue / 100) as u8;
-        bytes[5..7].copy_from_slice(&decimal_pair((hue % 100) as u8));
-        bytes[9..11].copy_from_slice(&decimal_pair(saturation));
-        bytes[14..16].copy_from_slice(&decimal_pair(lightness));
-
-        // Shift the prefix over the hue's unused leading digits.
-        let start = usize::from(hue < 100) + usize::from(hue < 10);
-        bytes.copy_within(..4, start);
+        let (bytes, start) = svg_color_bytes(hash);
         Self { bytes, start }
     }
 
     fn as_str(&self) -> &str {
-        // SAFETY: The bounded hue and percentages fill an ASCII template with decimal digits.
-        unsafe { std::str::from_utf8_unchecked(&self.bytes[self.start..]) }
+        let suffix = svg_color_suffix(&self.bytes, self.start);
+        // SAFETY: svg_color_bytes establishes the suffix's verified ASCII precondition.
+        unsafe { std::str::from_utf8_unchecked(suffix) }
     }
 }
 
 // Coordinates, line lengths and dimensions recur across tags. Cache their exact Display
 // spellings for this render. Using the bits as keys keeps -0.0 distinct from +0.0.
-const NUMBER_CACHE_BITS: u32 = 6;
-struct SvgNumbers([(u32, ArrayString<64>); 1 << NUMBER_CACHE_BITS]);
+struct SvgNumbers([(u32, ArrayString<SVG_NUMBER_CAPACITY>); 1 << SVG_NUMBER_CACHE_BITS]);
 
 impl SvgNumbers {
     fn new() -> Self {
-        Self([(0, ArrayString::new()); 1 << NUMBER_CACHE_BITS])
+        Self([(0, ArrayString::new()); 1 << SVG_NUMBER_CACHE_BITS])
     }
 
-    fn number(&mut self, value: f32) -> &str {
+    fn number(&mut self, value: f32) -> Option<&str> {
         let bits = value.to_bits();
-        let hash = (bits ^ (bits >> 13)).wrapping_mul(0x9e37_79b9);
-        let index = hash >> (u32::BITS - NUMBER_CACHE_BITS);
-        let (key, text) = &mut self.0[index as usize];
+        let (key, text) = self.0.get_mut(svg_number_index(bits))?;
         if *key != bits || text.is_empty() {
             text.clear();
-            // Even negative subnormal f32s fit within 64 bytes in decimal notation.
-            write!(text, "{value}").unwrap();
+            if write_svg_number(text, value).is_err() {
+                text.clear();
+                return None;
+            }
             *key = bits;
         }
-        text.as_str()
+        Some(text.as_str())
+    }
+
+    fn write_number(&mut self, svg: &mut (impl Write + ?Sized), value: f32) -> fmt::Result {
+        if let Some(text) = self.number(value) {
+            svg.write_str(text)
+        } else {
+            write_svg_number(svg, value)
+        }
     }
 
     fn write_fields<const N: usize>(&mut self, svg: &mut (impl Write + ?Sized), fields: [(&str, f32); N]) -> fmt::Result {
         for (prefix, value) in fields {
             svg.write_str(prefix)?;
-            svg.write_str(self.number(value))?;
+            self.write_number(svg, value)?;
         }
         Ok(())
     }
@@ -462,7 +486,7 @@ impl SvgNumbers {
                 (value, "")
             }
         };
-        svg.write_str(self.number((value * 100.0).round() / 100.0))?;
+        self.write_number(svg, (value * 100.0).round() / 100.0)?;
         svg.write_str(suffix)
     }
 }
@@ -511,8 +535,8 @@ mod tests {
                 for sign in [0, 1 << 31] {
                     let value = f32::from_bits(sign | exponent << 23 | fraction);
                     let expected = value.to_string();
-                    assert_eq!(numbers.number(value), expected);
-                    assert_eq!(numbers.number(value), expected);
+                    assert_eq!(numbers.number(value), Some(expected.as_str()));
+                    assert_eq!(numbers.number(value), Some(expected.as_str()));
                 }
             }
         }

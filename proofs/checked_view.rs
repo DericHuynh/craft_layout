@@ -1,8 +1,10 @@
 //! Prove the checked layout's stream comparison, including order and length.
 use vstd::prelude::*;
+use crate::vec_memory::FallibleVecMemory;
 #[path = "../src/view_check.rs"]
-mod kernel;
-
+pub(crate) mod kernel;
+#[path = "../src/incremental/checked_view.rs"]
+pub(crate) mod adapter;
 
 verus! {
 
@@ -10,11 +12,53 @@ pub open spec fn agrees_on_prefix<T>(expected: Seq<T>, observed: Seq<T>) -> bool
     observed.len() <= expected.len() && expected.take(observed.len() as int) == observed
 }
 
+/// The capture sink records every callback in sequence until storage rejects a record.
+/// Later callbacks may continue the layout walk, but they leave the buffer intact.
+pub(crate) fn capture_stream<I: Copy, M: FallibleVecMemory>(
+    expected: &mut Vec<kernel::OutputRecord<I>>, observed: &[kernel::OutputRecord<I>],
+) -> (complete: bool)
+    ensures
+        complete ==> final(expected)@ == old(expected)@ + observed@,
+        !complete ==> exists |count: int| 0 <= count < observed.len()
+            && final(expected)@ == old(expected)@ + #[trigger] observed@.take(count),
+    no_unwind
+{
+    let mut check = kernel::start();
+    let mut i = 0;
+    proof! { assert((old(expected)@ + observed@.take(0)) =~= old(expected)@); }
+    while i < observed.len()
+        invariant i <= observed.len(), check.agrees,
+            expected@ == old(expected)@ + observed@.take(i as int),
+        decreases observed.len() - i,
+    {
+        check.capture_record::<_, M>(expected, observed[i]);
+        if !check.agrees {
+            proof! {
+                assert(exists |count: int| 0 <= count < observed.len()
+                    && expected@ == old(expected)@ + #[trigger] observed@.take(count)) by {
+                    assert(expected@ == old(expected)@ + observed@.take(i as int));
+                }
+            }
+            return false;
+        }
+        proof! {
+            assert(observed@.take(i as int).push(observed@[i as int]) =~= observed@.take(i as int + 1));
+            assert(expected@ =~= old(expected)@ + observed@.take(i as int + 1));
+        }
+        i += 1;
+    }
+    proof! { assert(observed@.take(i as int) =~= observed@); }
+    true
+}
+
 /// Each callback supplies equality of its node identity and eight rectangle bits
 /// with the saved record at the current cursor. A missing or extra callback
 /// cannot pass the comparison. The implementation never re-reads host output.
-pub fn check_stream(expected: &[u32], observed: &[u32]) -> (ok: bool)
+pub fn check_stream<I: kernel::OutputIdentity>(
+    expected: &[kernel::OutputRecord<I>], observed: &[kernel::OutputRecord<I>],
+) -> (ok: bool)
     ensures ok == (expected@ == observed@),
+    no_unwind
 {
     let mut check = kernel::start();
     let mut i = 0;
@@ -27,9 +71,7 @@ pub fn check_stream(expected: &[u32], observed: &[u32]) -> (ok: bool)
             check.agrees ==> check.position() == i,
         decreases observed.len() - i,
     {
-        let j = check.position();
-        let equal = j < expected.len() && expected[j] == observed[i];
-        check.compare(equal);
+        check.compare_record(expected, observed[i]);
         proof! {
             assert(observed@.take((i + 1) as int).take(i as int) =~= observed@.take(i as int));
             if agrees_on_prefix(expected@,observed@.take((i + 1) as int)) {

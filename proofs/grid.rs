@@ -16,6 +16,7 @@ mod grid_sparse;
 
 #[path = "grid_frame.rs"]
 pub mod frame;
+use frame::state as grid_state;
 
 verus! {
 
@@ -269,6 +270,47 @@ pub proof fn compacted_first_fit(board:Board,dropped:int,cols:int,h:int,w:int,st
     }
 }
 
+/// Search from the absolute forward edge even after dropping the rows
+/// preceding it. This is the inverse of compacted_first_fit.
+pub proof fn absolute_first_fit(board: Board, dropped: int, columns: int, h: int, w: int,
+    start: Cell, found: Cell,
+)
+    requires 0 <= dropped <= start.0,
+        first_fit(suffix(board, dropped), columns, h, w, (start.0 - dropped, start.1), found),
+    ensures first_fit(board, columns, h, w, start, (found.0 + dropped, found.1)),
+{
+    let live = suffix(board, dropped);
+    let absolute = (found.0 + dropped, found.1);
+    assert forall |q: Cell| q.0 >= dropped implies #[trigger] fits(board, q, h, w)
+        == fits(live, (q.0 - dropped, q.1), h, w) by {
+        let relative = (q.0 - dropped, q.1);
+        if !fits(board, q, h, w) {
+            let hit = choose |p: Cell| #[trigger] board.contains(p) && covers(q, h, w, p);
+            assert(live.contains((hit.0 - dropped, hit.1)));
+        }
+        if !fits(live, relative, h, w) {
+            let hit = choose |p: Cell| #[trigger] live.contains(p) && covers(relative, h, w, p);
+            assert(board.contains((hit.0 + dropped, hit.1)));
+        }
+    }
+    assert forall |q: Cell| legal(q, columns, w) && !before(q, start) && before(q, absolute)
+        implies !#[trigger] fits(board, q, h, w) by {
+        assert(!fits(live, (q.0 - dropped, q.1), h, w));
+    }
+}
+
+/// Recording a rectangle and compacting more rows commute because the
+/// rectangle starts in the currently live suffix.
+pub proof fn suffix_after_placement(board: Board, first: int, next: int, at: Cell, h: int, w: int)
+    requires 0 <= first <= next, first <= at.0,
+    ensures suffix(place(board, at, h, w), next) ==
+        suffix(place(suffix(board, first), (at.0 - first, at.1), h, w), next - first),
+{
+    let absolute = suffix(place(board, at, h, w), next);
+    let relative = suffix(place(suffix(board, first), (at.0 - first, at.1), h, w), next - first);
+    assert(absolute =~= relative);
+}
+
 /// When all spanned items fit on the first row, it is enough to track
 /// the trailing column and maximum height. This holds for either backfill mode.
 pub proof fn single_line_first_fit(board:Board, cols:int, h:int, w:int, tail:int, start:Cell)
@@ -357,6 +399,30 @@ pub proof fn empty_after(mem:Seq<u64>,stride:int,lines:int,r:int,c:int)
     ensures !packed(mem,stride).contains((r,c)),
 {
     assert(lines*stride<=r*stride) by(nonlinear_arith) requires stride>0, r>=lines;
+}
+
+/// A legal cursor at or before the start of the first empty row can always
+/// place the rectangle there. First-fit therefore cannot skip that row.
+pub proof fn first_fit_stays_within_rows(mem: Seq<u64>, stride: int, rows: int,
+    columns: int, h: int, w: int, start: Cell, result: Cell)
+    requires
+        stride > 0, 0 <= rows, rows * stride == mem.len(),
+        1 <= w <= columns <= stride * 64, h > 0,
+        !before((rows, 0int), start),
+        first_fit(packed(mem, stride), columns, h, w, start, result),
+    ensures result.0 <= rows,
+{
+    let empty = (rows, 0int);
+    let board = packed(mem, stride);
+    assert(fits(board, empty, h, w)) by {
+        assert forall |cell: Cell| #[trigger] board.contains(cell) implies !covers(empty, h, w, cell) by {
+            if covers(empty, h, w, cell) { empty_after(mem, stride, rows, cell.0, cell.1); }
+        }
+    }
+    if result.0 > rows {
+        assert(legal(empty, columns, w) && before(empty, result));
+        assert(!fits(board, empty, h, w));
+    }
 }
 
 pub proof fn one_word_open(mem:Seq<u64>,line:int,h:int,rows:Seq<u64>,blocked:u64)
@@ -555,7 +621,7 @@ pub type Limits = [[(u16,u16); grid_search::CACHED_SPANS]; grid_search::CACHED_S
 pub open spec fn valid_limits(limits:Limits,rows:int,columns:int)->bool {
     forall|i:int,j:int| 0<=i<grid_search::CACHED_SPANS && 0<=j<grid_search::CACHED_SPANS ==> {
         let p=#[trigger] limits[i][j];
-        p.0<=rows && p.1<=columns
+        (p.0 < rows || (rows == 0 && p == (0u16, 0u16))) && p.1 <= columns
     }
 }
 
@@ -612,7 +678,7 @@ pub open spec fn span_step(
     &&& first_fit(packed(original,stride as int),columns as int,h as int,w as int,
         span_start(old.first_row,old.forward,old.limits,h,w,backfill),
         (cell.0-old.first_row,cell.1 as int))
-    &&& old.first_row<=cell.0<=old.rows+1
+    &&& old.first_row<=cell.0<=old.rows
     &&& cell.1+w<=columns
     &&& new.rows==vstd::math::max(old.rows as int,cell.0+h)
     &&& new.first_row==if compacted(cell.0 as int,old.first_row as int,new.rows as int,backfill) {

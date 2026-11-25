@@ -76,7 +76,7 @@ fn wrap_reflows_on_resize_and_stretches_cross_fill_to_its_line() {
     assert_eq!(tree.layout(&free).unwrap(), rect([3.0, 1003.0], [5.0, 1005.0]));
     assert!(tree.warnings().is_empty());
 
-    assert_eq!(tree.solve_layout(Xy::new(130.0, 200.0)), IncrementalRelayoutOutcome::FallbackFlow);
+    assert!(matches!(tree.solve_layout(Xy::new(130.0, 200.0)), IncrementalRelayoutOutcome::Success { .. }));
     assert_eq!(tree.layout(&root).unwrap().y, [0.0, 31.0]);
     assert_eq!(tree.layout(&second).unwrap().y, [7.0, 22.0]);
     assert_eq!(tree.layout(&third).unwrap().x, [88.0, 118.0]);
@@ -275,7 +275,7 @@ fn nested_block_margins_collapse_with_parent_unless_padding_separates_them() {
     params.padding.y = [2.0, 3.0];
     tree.update_node_params(&parent, params).unwrap();
 
-    assert_eq!(tree.solve_layout(Xy::new_symm(100.0)), IncrementalRelayoutOutcome::FallbackFlow);
+    assert!(matches!(tree.solve_layout(Xy::new_symm(100.0)), IncrementalRelayoutOutcome::Success { .. }));
     assert_eq!(tree.layout(&parent).unwrap().y, [7.0, 52.0]);
     assert_eq!(tree.layout(&child).unwrap().y, [21.0, 31.0]);
     assert_eq!(tree.layout(&root).unwrap().y, [0.0, 60.0]);
@@ -382,9 +382,107 @@ fn wrap_reuses_measured_lines_for_arrangement_edits() {
     assert_eq!(tree.layout(&last).unwrap(), rect([55.0, 100.0], [10.0, 20.0]));
 
     tree.update_node_params(&root, flow(Arrange::End, 15.0, 0.0)).unwrap();
-    assert_eq!(tree.solve_layout(window), IncrementalRelayoutOutcome::FallbackFlow);
+    assert!(matches!(tree.solve_layout(window), IncrementalRelayoutOutcome::Success { .. }));
     assert_eq!(tree.layout(&last).unwrap().y, [20.0, 30.0]);
     tree.update_node_params(&root, flow(Arrange::End, 15.0, 3.0)).unwrap();
-    assert_eq!(tree.solve_layout(window), IncrementalRelayoutOutcome::FallbackFlow);
+    assert!(matches!(tree.solve_layout(window), IncrementalRelayoutOutcome::Success { .. }));
     assert_eq!(tree.layout(&last).unwrap().y, [26.0, 36.0]);
+}
+
+#[test]
+fn explicit_invalidation_remeasures_every_leaf_after_content_flow_replay() {
+    let mut tree = LayoutTree::<f32>::new();
+    let root = tree.root();
+    tree.update_node_params(&root, LayoutParams {
+        size: Xy::new(Size::Fill, Size::FitContent),
+        children_layout: ChildrenLayout::Block,
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+    let text = LayoutParams {
+        size: Xy::new(Size::Fill, Size::FitContent),
+        text: TextContent::Wrapping,
+        ..LayoutParams::DEFAULT
+    };
+    let edited = tree.add_node_with_context(&root, text, 4.5).unwrap();
+    let retained = tree.add_node_with_context(&root, text, 2.75).unwrap();
+    let window = Xy::new_symm(40.0);
+    let mut calls = 0;
+    let mut measure = |_: NodeId, content: Option<&mut f32>, _: Option<f32>| {
+        calls += 1;
+        Xy::new(0.0, content.copied().unwrap_or(0.0))
+    };
+    tree.solve_layout_with_measure(window, &mut measure);
+    tree.update_node_context(&edited, Some(7.0)).unwrap();
+    assert!(matches!(tree.solve_layout_with_measure(window, &mut measure), IncrementalRelayoutOutcome::Success { .. }));
+    tree.update_node_context(&edited, Some(8.0)).unwrap();
+    tree.invalidate();
+    assert_eq!(tree.solve_layout_with_measure(window, &mut measure), IncrementalRelayoutOutcome::FallbackInvalidated);
+    assert_eq!(calls, 5);
+    assert_eq!(tree.layout(&retained).unwrap().y, [8.0, 10.75]);
+}
+
+#[test]
+fn ordinary_block_root_replay_matches_a_fresh_reflow() {
+    let mut tree = LayoutTree::<f32>::new();
+    let root = tree.root();
+    tree.update_node_params(&root, LayoutParams {
+        children_layout: ChildrenLayout::Block,
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+    let section = LayoutParams {
+        size: Xy::new_symm(Size::Auto),
+        max_size: Xy::new(Some(Size::Pixels(55.25)), None),
+        margin: Xy::new([Margin::AUTO; 2], edges(5.0, -2.75)),
+        children_layout: ChildrenLayout::Block,
+        ..LayoutParams::DEFAULT
+    };
+    let page = tree.add_node(&root, section).unwrap();
+    let nested = tree.add_node(&page, section).unwrap();
+    let text = LayoutParams {
+        size: Xy::new(Size::Auto, Size::FitContent),
+        text: TextContent::Wrapping,
+        padding: Xy::new([1.25, 0.5], [0.75, 0.0]),
+        margin: Xy::new([Margin::ZERO; 2], edges(-2.0, 4.75)),
+        ..LayoutParams::DEFAULT
+    };
+    let edit = tree.add_node_with_context(&nested, text, 11.0).unwrap();
+    tree.add_node(&nested, LayoutParams {
+        size: Xy::new(Size::Pixels(-0.0), Size::Pixels(-0.0)),
+        margin: Xy::new([Margin::ZERO; 2], edges(2.25, -0.75)),
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+    tree.add_node(&page, section).unwrap();
+    tree.add_node_with_context(&page, text, 13.25).unwrap();
+    let mut section_with_padding = section;
+    section_with_padding.padding.x = [1.25, 2.0];
+    let scale = PixelScale::new(1.25).unwrap();
+    tree.set_pixel_scale(Some(scale));
+    let measure = |_: NodeId, value: Option<&mut f32>, width: Option<f32>| {
+        Xy::new(0.0, value.copied().unwrap_or(0.0) + width.unwrap_or(0.0) * 0.125)
+    };
+    let view = |tree: &LayoutTree<f32>| {
+        let mut output = Vec::new();
+        let mut next = vec![tree.root()];
+        while let Some(node) = next.pop() {
+            let rectangle = tree.layout(&node).unwrap();
+            output.push([rectangle.x.map(f32::to_bits), rectangle.y.map(f32::to_bits)]);
+            let mut children: Vec<_> = tree.children(&node).unwrap().map(NodeId::from).collect();
+            children.reverse();
+            next.extend(children);
+        }
+        output
+    };
+    tree.solve_layout_with_measure(Xy::new(72.0, 96.0), measure);
+    for (i, width) in [75.75, 41.125, 41.125, 81.25, 23.75].into_iter().enumerate() {
+        tree.update_node_context(&edit, Some(5.75 + i as f32)).unwrap();
+        if i == 2 { tree.update_node_params(&page, section_with_padding).unwrap(); }
+        let window = Xy::new(width, 96.0 + i as f32);
+        let mut fresh = tree.clone();
+        fresh.invalidate();
+        fresh.solve_layout_with_measure(window, measure);
+        assert!(matches!(tree.solve_layout_with_measure(window, measure), IncrementalRelayoutOutcome::Success { .. }));
+        assert_eq!(view(&tree), view(&fresh));
+        assert!(tree.warnings().is_empty());
+        assert!(fresh.warnings().is_empty());
+    }
 }

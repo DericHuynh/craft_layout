@@ -1,14 +1,10 @@
 use crate::*;
-use crate::solve::dependency_rules::{self, Form, Input};
-use crate::solve::cycle_rules::{self, Route};
 use crate::Axis::{X, Y};
-#[path = "placement_work.rs"]
-mod placement_work;
-pub(crate) use placement_work::{PlacementWork, update_scale_dirty};
+use crate::vec_memory::{RustVec, VecMemory};
+pub(crate) use crate::placement_work::PlacementWork;
 
 #[path = "registration_rules.rs"]
 mod registration_rules;
-use registration_rules::{AxisEdits, Context as SeedContext, Seeds};
 #[path = "region_list.rs"]
 mod region_list;
 #[path = "queue_storage.rs"]
@@ -17,58 +13,31 @@ pub(crate) use queue_storage::WorkQueue;
 mod inputs;
 mod checked_view;
 mod publication;
+mod numeric;
+pub(crate) mod tape;
+pub(crate) mod tape_plan;
+mod intake;
+pub(crate) mod readers;
+mod register;
+use readers::Filter;
+pub(crate) use readers::NodeChange;
+use numeric::{QueueActions, QueueModel, QueuePoll};
+mod regional;
+#[cfg(feature = "batch-pilot")]
+pub(crate) use regional::block::{accepts_declarations as accepts_block_declarations, width as resolve_block_width};
+mod plan;
+pub(crate) use plan::{SubtreeCounts, Suspended};
 pub(crate) use checked_view::OutputRecord;
 use checked_view::CheckedView;
-use publication::{Publication, publication_route};
+pub use publication::IncrementalRelayoutOutcome;
+use publication::{FrameActions, FrameInputs, same_viewport};
+pub(crate) use publication::{FrameResult, enter_frame};
 pub(crate) use inputs::SameInput;
-
-/// What `solve_layout_incremental` did. The `Fallback` variants give the reason for a full solve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IncrementalRelayoutOutcome {
-    /// The relayout was incremental.
-    Success {
-        /// Slot computations.
-        computed: u32,
-    },
-    /// The checked pass found different sizing values or output rectangles.
-    /// The tree keeps the result of the canonical full solve.
-    CheckedIncrementalRelayoutMismatch,
-    /// The incremental relayout fell back to a full relayout because the full layout was never solved before.
-    FallbackNeverSolved,
-    /// Legacy outcome retained for API compatibility. Structural edits use incremental measurement.
-    FallbackStructuralChange,
-    /// The previous solve found a cycle and this pass has no structural edits to rebuild its dependencies.
-    FallbackCycle,
-    /// A block or wrapping flow must rebuild its line or collapsed-margin data.
-    FallbackFlow,
-    /// The queued work exceeded its budget, or a dependency rank exceeded the queue's representable ordering.
-    FallbackTooMuchWork,
-    /// The incremental relayout fell back to a full relayout because `LayoutTree::invalidate()` was called explicitly.
-    FallbackInvalidated,
-}
 
 pub(crate) use crate::structural_changes::StructuralChange;
 
-impl NodeLayoutData {
-    pub(crate) fn mark_moved(&mut self) {
-        self.structural_change = self.structural_change.with_move();
-    }
-
-    pub(crate) fn mark_subtree_changed(&mut self) {
-        self.structural_change = StructuralChange::Subtree;
-    }
-
-    pub(crate) fn mark_children_changed(&mut self) {
-        self.structural_change = self.structural_change.with_children();
-    }
-
-    pub(crate) fn mark_placement_changed(&mut self) {
-        self.placement = PlacementWork::Subtree;
-    }
-}
-
 impl<I> LayoutData<I> {
-    pub(crate) fn record_node_change(&mut self, i: I, old: &LayoutParams, new: &LayoutParams, node: &mut NodeLayoutData) -> bool {
+    pub(crate) fn record_node_change(&mut self, i: I, old: &LayoutParams, new: &LayoutParams, node: &mut NodeLayoutData) -> bool where I: Copy {
         if !self.tracks_structure() { return false; }
         let change = NodeChange::between(old, new, self.tracks_sizes());
         if self.record_change(i, change) {
@@ -80,8 +49,7 @@ impl<I> LayoutData<I> {
     }
 
     pub(crate) fn tracks_structure(&self) -> bool {
-        use IncrementalRelayoutOutcome::*;
-        matches!(self.pending_full_solve, None | Some(FallbackFlow | FallbackTooMuchWork))
+        register::tracks_structure(self.pending_full_solve)
     }
 
     fn tracks_sizes(&self) -> bool {
@@ -90,95 +58,73 @@ impl<I> LayoutData<I> {
 
     // A queued node can be deleted before the next solve. Mark it on the live tree
     // as well, so a later structural pass can discard all queued IDs safely.
-    fn record_change(&mut self, i: I, change: Option<NodeChange>) -> bool {
+    fn record_change(&mut self, i: I, change: Option<NodeChange>) -> bool where I: Copy {
         match change {
             None => true,
             // While a sizing fallback is pending, between() only checks for a change
             // of rule. Retain the live mark if the batch later includes a tree edit.
             Some(_) if self.pending_full_solve.is_some() => true,
             Some(change) if change != NodeChange::default() => {
-                if self.accept_sizing_change() && !self.children_changed {
-                    self.node_changes.push((i, change));
-                }
+                self.submit_edit(register::Edit::Declaration(i, change));
                 true
             }
             Some(_) => false,
         }
     }
 
-    fn record_content(&mut self, i: I) -> bool {
+    fn record_content(&mut self, i: I) -> bool where I: Copy {
         if !self.tracks_structure() { return false; }
-        if self.accept_sizing_change() && !self.children_changed {
-            self.content_changes.push(i);
-        }
+        self.submit_edit(register::Edit::Content(i));
         true
     }
 
-    pub(crate) fn record_content_change(&mut self, i: I, node: &mut NodeLayoutData) {
+    pub(crate) fn record_content_change(&mut self, i: I, node: &mut NodeLayoutData) where I: Copy {
         if self.record_content(i) { node.mark_subtree_changed(); }
     }
 
-    pub(crate) fn start_children_change(&mut self) -> bool {
-        if !self.tracks_structure() { return false; }
-        // Regional measurement includes earlier sizing marks, regardless of edit order.
-        self.pending_full_solve = None;
-        self.children_changed = true;
-        true
+    pub(crate) fn start_children_change(&mut self) -> bool where I: Copy {
+        self.numeric_tape.invalidate::<RustVec>();
+        self.numeric_wrap = None;
+        register::start_children_change(&mut self.pending_full_solve, &mut self.children_changed, &mut self.replay_pending)
     }
 
-    pub(crate) fn record_children_change(&mut self, node: &mut NodeLayoutData) {
+    pub(crate) fn record_children_change(&mut self, node: &mut NodeLayoutData) where I: Copy {
         if self.start_children_change() {
             node.mark_children_changed();
         }
     }
 
-    /// Check the fallback before growing a change list that the solver would discard.
-    fn accept_sizing_change(&mut self) -> bool {
-        use registration_rules::Intake;
-        let at_limit = self.node_changes.len() + self.content_changes.len() >= (self.n_nodes_solved / 2) as usize;
-        match registration_rules::intake(!self.tracks_sizes(), self.has_cycle, self.children_changed, self.has_flow, at_limit) {
-            Intake::Region | Intake::Queue => true,
-            Intake::Pending | Intake::Cycle => false,
-            Intake::Flow => {
-                self.pending_full_solve = Some(IncrementalRelayoutOutcome::FallbackFlow);
-                false
-            }
-            Intake::Budget => {
-                self.pending_full_solve = Some(IncrementalRelayoutOutcome::FallbackTooMuchWork);
-                false
-            }
-        }
+    fn submit_edit(&mut self, edit: register::Edit<I, NodeChange>) where I: Copy {
+        let limits = register::Limits {
+            structural: self.children_changed, cycle: self.has_cycle, flow: self.has_flow && self.numeric_wrap != Some(true), population: self.n_nodes_solved,
+        };
+        register::submit::<_, _, RustVec>(
+            &mut self.pending_full_solve, &mut self.replay_pending, &mut self.node_changes, &mut self.content_changes,
+            limits, edit,
+        );
     }
 
     /// An explicit full solve takes priority over a fallback inferred from sizing edits.
-    pub(crate) fn request_full_solve(&mut self, reason: IncrementalRelayoutOutcome) {
-        if self.tracks_structure() {
-            self.pending_full_solve = Some(reason);
-        }
+    pub(crate) fn request_full_solve(&mut self, reason: IncrementalRelayoutOutcome) where I: Copy {
+        self.numeric_tape.invalidate::<RustVec>();
+        self.numeric_wrap = None;
+        register::request_full_solve(&mut self.pending_full_solve, &mut self.replay_pending, reason);
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) where I: Copy {
+        self.numeric_tape.invalidate::<RustVec>();
+        self.replay_pending = false;
         self.children_changed = false;
         self.unknown_structure = false;
-        self.node_changes.clear();
-        self.content_changes.clear();
+        RustVec::clear(&mut self.node_changes);
+        RustVec::clear(&mut self.content_changes);
     }
-}
-
-/// The sizing inputs that changed. Placement reads the latest params directly.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct NodeChange {
-    declared: u8,
-    inner: Xy<bool>,
-    margin: Xy<bool>,
-    fill_weight: bool,
-    content: bool,
 }
 
 impl NodeChange {
     /// A structural change requires rebuilding the affected dependencies.
-    fn between(old: &LayoutParams, new: &LayoutParams, track_sizes: bool) -> Option<Self> {
-        if is_structural(old, new) {
+    pub(crate) fn between(old: &LayoutParams, new: &LayoutParams, track_sizes: bool) -> Option<Self> {
+        if registration_rules::sizing_structure_changed(old, new) {
             return None;
         }
 
@@ -186,14 +132,8 @@ impl NodeChange {
         if !track_sizes {
             return Some(change);
         }
+        change.declared = registration_rules::size_declaration_mask::<crate::placement_geometry::RustFloat>(old, new);
         for axis in [X, Y] {
-            for (kind, changed) in [
-                (Kind::Regular, !old.size[axis].same_input(&new.size[axis])),
-                (Kind::Min, !old.min_size[axis].same_input(&new.min_size[axis])),
-                (Kind::Max, !old.max_size[axis].same_input(&new.max_size[axis])),
-            ] {
-                change.declared = registration_rules::register_declaration(change.declared, slot_index(axis, kind), changed);
-            }
             change.inner[axis] = !old.padding[axis].same_input(&new.padding[axis]);
             change.margin[axis] = !new.free_placement && old.margin[axis] != new.margin[axis];
         }
@@ -222,310 +162,11 @@ impl NodeChange {
     }
 }
 
-/// True if the change can change the dependencies between the slots.
-fn is_structural(old: &LayoutParams, new: &LayoutParams) -> bool {
-    use std::mem::discriminant;
-    let same_kind = |a: Option<Size>, b: Option<Size>| a.map(|a| discriminant(&a)) == b.map(|b| discriminant(&b));
-    let same_layout = match (old.children_layout, new.children_layout) {
-        (ChildrenLayout::Free, ChildrenLayout::Free) => true,
-        (ChildrenLayout::Block, ChildrenLayout::Block) => true,
-        (ChildrenLayout::Stack { axis: a, .. }, ChildrenLayout::Stack { axis: b, .. }) => a == b,
-        (ChildrenLayout::Wrap { axis: a, .. }, ChildrenLayout::Wrap { axis: b, .. }) => a == b,
-        // The `Count` grid cells are assigned in `prepare`.
-        (ChildrenLayout::Grid { columns: MainAxisCellSize::Count(a), main_axis: main_a, backfill: backfill_a, .. }, ChildrenLayout::Grid { columns: MainAxisCellSize::Count(b), main_axis: main_b, backfill: backfill_b, .. }) => a == b && main_a == main_b && backfill_a == backfill_b,
-        (ChildrenLayout::Grid { columns: MainAxisCellSize::Width(_), main_axis: main_a, backfill: backfill_a, .. }, ChildrenLayout::Grid { columns: MainAxisCellSize::Width(_), main_axis: main_b, backfill: backfill_b, .. }) => main_a == main_b && backfill_a == backfill_b,
-        _ => false,
-    };
-    old.disabled != new.disabled
-        || old.free_placement != new.free_placement
-        || old.grid_span != new.grid_span
-        || old.text != new.text
-        || old.content_measure != new.content_measure
-        || old.image.is_some() != new.image.is_some()
-        || ! same_layout
-        || [X, Y].into_iter().any(|axis| {
-            ! same_kind(Some(old.size[axis]), Some(new.size[axis]))
-                || ! same_kind(old.min_size[axis], new.min_size[axis])
-                || ! same_kind(old.max_size[axis], new.max_size[axis])
-        })
-}
-
-/// Disjoint subtrees to measure in document order, plus live counts for the next solve.
-pub(crate) struct StructuralPlan<I> {
-    regions: Vec<I>,
-    retained: SubtreeCounts,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct PlanFrame<I> {
-    node: I,
-    next: Option<I>,
-    start: usize,
-    retained: SubtreeCounts,
-    independent: Option<bool>,
-    changed_children: bool,
-    coupled: bool,
-    placement: PlacementWork,
-}
-
-pub(crate) enum PlanStep<I> {
-    Done(bool),
-    Children(PlanFrame<I>),
-}
-
-#[derive(Default, Clone, Copy)]
-pub(crate) struct SubtreeCounts {
-    pub(crate) nodes: u32,
-    pub(crate) blocks: usize,
-    pub(crate) has_flow: bool,
-    has_cycle: bool,
-}
-
-impl SubtreeCounts {
-    pub(crate) fn include(&mut self, flags: NodeFlags) {
-        // A disabled node has no solved slots. An enabled node has both final sizes.
-        if flags != NodeFlags::EMPTY {
-            self.nodes = cycle_rules::add_count(self.nodes, 1);
-            self.blocks = self.blocks.saturating_add(usize::from(flags.is_block_container()));
-            self.has_flow |= flags.has_flow();
-            self.has_cycle |= flags.has_cycle();
-        }
-    }
-}
-
 pub(crate) trait Incremental: Solve {
-    fn measure_structure(&mut self, window_size: Xy<f32>) -> IncrementalRelayoutOutcome {
-        // Reconciliation can use the cleared region buffer for its style edits.
-        let mut regions = std::mem::take(&mut self.layout_data().regions);
-        if self.layout_data().unknown_structure && self.reconcile_topology(&mut regions)
-            && let Some(snapshot) = self.layout_data().topology.take()
-        {
-            let mut tickets_valid = true;
-            let outcome = self.measure_structure_regions(window_size, regions, |tree, region| {
-                let ticket = tree.node_layout_data(region).topology_index;
-                let sizes = tree.measure_subtree(region);
-                // Sizing can reset records only inside this retained region.
-                tickets_valid = tickets_valid && snapshot.restore_region_tickets(tree, region, ticket);
-                sizes
-            });
-            if tickets_valid {
-                self.layout_data().topology = Some(snapshot);
-            } else {
-                self.layout_data().topology = Some(TopologySnapshot::new());
-                self.remember_topology();
-            }
-            outcome
-        } else {
-            let outcome = self.measure_structure_regions(window_size, regions, Self::measure_subtree);
-            self.remember_topology();
-            outcome
-        }
-    }
-
-    fn measure_structure_regions(
-        &mut self, window_size: Xy<f32>, regions: Vec<Self::NodeId>,
-        mut measure_region: impl FnMut(&mut Self, Self::NodeId) -> (u32, u32, usize),
-    ) -> IncrementalRelayoutOutcome {
-        let root = self.root();
-        let old_window = std::mem::replace(&mut self.layout_data().window_size, window_size);
-        if [X, Y].into_iter().any(|axis| !old_window[axis].same_input(&window_size[axis])
-            && DECLARED_SIZES.into_iter().any(|kind| self.read_size(root, axis, kind).is_some_and(|size| size.is_flex())))
-        {
-            self.node_layout_data_mut(root).mark_subtree_changed();
-        }
-        let mut plan = StructuralPlan {
-            regions,
-            retained: SubtreeCounts::default(),
-        };
-        self.plan_subtree(root, &mut plan);
-        let data = self.layout_data();
-        // Pending queues can reference removed IDs. The live nodes carried the same edits.
-        data.clear();
-        data.has_flow = plan.retained.has_flow;
-        data.has_cycle = plan.retained.has_cycle;
-        let mut computed: u32 = 0;
-        for &region in &plan.regions {
-            let (nodes, slots, blocks) = measure_region(self, region);
-            self.node_layout_data_mut(region).placement = PlacementWork::Subtree;
-            plan.retained.nodes = cycle_rules::add_count(plan.retained.nodes, nodes);
-            plan.retained.blocks = plan.retained.blocks.saturating_add(blocks);
-            computed = computed.saturating_add(slots);
-        }
-        self.layout_data().n_nodes_solved = plan.retained.nodes;
-        self.compact_block_margins(plan.retained.blocks);
-        plan.regions.clear();
-        self.layout_data().regions = plan.regions;
-        IncrementalRelayoutOutcome::Success { computed }
-    }
-
-    /// Discover sizing regions in sibling order. A completed child can force
-    /// the parent to replace its tentative child regions with one enclosing cut.
-    fn plan_subtree(&mut self, node: Self::NodeId, plan: &mut StructuralPlan<Self::NodeId>) {
-        let mut step = self.begin_plan(node, plan);
-        let mut parents = work_stack::work_stack::<_, 8>(Vec::new());
-        loop {
-            let mut frame = match step {
-                PlanStep::Children(frame) => frame,
-                PlanStep::Done(size_changed) => {
-                    let Some((mut frame, child)) = parents.pop() else { return; };
-                    self.include_planned_child(&mut frame, child, size_changed);
-                    frame
-                }
-            };
-            while let Some(child) = frame.next {
-                frame.next = self.next_sibling(child);
-                // Clean leaves need no planner frame or cache writes.
-                let cached = self.node_layout_data(child);
-                if cached.structural_change == StructuralChange::Clean && cached.placement == PlacementWork::Clean
-                    && self.first_child(child).is_none()
-                {
-                    plan.retained.include(cached.flags);
-                    continue;
-                }
-                match self.begin_plan(child, plan) {
-                    PlanStep::Done(changed) => self.include_planned_child(&mut frame, child, changed),
-                    PlanStep::Children(child_frame) => {
-                        parents.push((frame, child));
-                        frame = child_frame;
-                    }
-                }
-            }
-            step = PlanStep::Done(self.finish_plan(frame, plan));
-        }
-    }
-
-    fn begin_plan(&mut self, node: Self::NodeId, plan: &mut StructuralPlan<Self::NodeId>) -> PlanStep<Self::NodeId> {
-        let mark = self.node_layout_data(node).structural_change;
-        if region_policy::starts_region(mark) {
-            self.node_layout_data_mut(node).placement = PlacementWork::Subtree;
-            plan.regions.push(node);
-            return PlanStep::Done(true);
-        }
-        if self.node_layout_params(node).disabled {
-            self.node_layout_data_mut(node).placement = PlacementWork::Clean;
-            return PlanStep::Done(false);
-        }
-        let independent = (mark == StructuralChange::Children).then(|| self.try_refresh_independent_parent(node));
-        // A changed, coupled child list already requires measuring the whole region.
-        // prepare() will visit and count those descendants, including any pending edits.
-        let start = plan.regions.len();
-        if independent == Some(false) {
-            return PlanStep::Done(self.rebuild_region(node, plan, start));
-        }
-        let retained = plan.retained;
-        plan.retained.include(self.node_layout_data(node).flags);
-        let changed_children = mark == StructuralChange::Children;
-        let coupled = self.node_layout_params(node).children_layout != ChildrenLayout::Free;
-        let placement = self.node_layout_data(node).placement.for_parent(changed_children, coupled);
-        PlanStep::Children(PlanFrame {
-            node, next: self.first_child(node), start, retained, independent, changed_children, coupled, placement,
-        })
-    }
-
-    #[inline]
-    fn include_planned_child(&self, frame: &mut PlanFrame<Self::NodeId>, child: Self::NodeId, size_changed: bool) {
-        frame.changed_children |= size_changed;
-        if frame.placement != PlacementWork::Subtree {
-            let free = size_changed && frame.coupled && self.node_layout_params(child).free_placement;
-            let coupled_size_change = placement_work::coupled_child_changed(frame.coupled, size_changed, free);
-            frame.placement = frame.placement.with_child(self.node_layout_data(child).placement, coupled_size_change);
-        }
-    }
-
-    fn finish_plan(&mut self, frame: PlanFrame<Self::NodeId>, plan: &mut StructuralPlan<Self::NodeId>) -> bool {
-        let node = frame.node;
-        let flags = self.node_layout_data(node).flags;
-        if self.node_layout_data(node).placement != frame.placement {
-            self.node_layout_data_mut(node).placement = frame.placement;
-        }
-        // Replay the enclosing cycle if a descendant may have read a provisional value.
-        match region_policy::after_children(frame.changed_children, flags.has_cycle(), plan.regions.len() > frame.start) {
-            region_policy::AfterChildren::Keep => return false,
-            region_policy::AfterChildren::Refresh => {
-                if frame.independent.unwrap_or_else(|| self.try_refresh_independent_parent(node)) {
-                    self.node_layout_data_mut(node).structural_change = StructuralChange::Clean;
-                    return false;
-                }
-            }
-            region_policy::AfterChildren::Rebuild => {}
-        }
-        plan.retained = frame.retained;
-        self.rebuild_region(node, plan, frame.start)
-    }
-
-    /// Return true if a rebuilt subtree can change the parent's sizing inputs.
-    fn rebuild_region(&mut self, node: Self::NodeId, plan: &mut StructuralPlan<Self::NodeId>, start: usize) -> bool {
-        self.node_layout_data_mut(node).placement = PlacementWork::Subtree;
-        region_list::replace_descendants(&mut plan.regions, start, node);
-        // A parent's collapsed margins or line metrics are shared by its whole
-        // in-flow list. Use the live attachment when selecting a region.
-        let in_flow = !self.node_layout_params(node).free_placement;
-        let flow_parent = in_flow && self.parent(node).is_some_and(|parent| {
-            matches!(self.node_layout_params(parent).children_layout, ChildrenLayout::Wrap { .. } | ChildrenLayout::Block)
-        });
-        let in_parent_flow = region_policy::attached_flow_child(in_flow, flow_parent);
-        // A parent can enter a cyclic region through a different slot than the
-        // region's own traversal would. Include it when those sizes are coupled.
-        let flags = self.node_layout_data(node).flags;
-        region_policy::affects_parent(flags.has_cycle(), self.size_depends_on_children(node), flags.is_block_item(), in_parent_flow)
-    }
-
     // Rebuilding a block can replace a saved collapsed margin; deleting one drops
     // its owner. Bound the arena by the live block count across repeated edits.
     fn compact_block_margins(&mut self, blocks: usize) {
-        let data = self.layout_data();
-        if blocks == 0 {
-            data.block_margins.clear();
-            return;
-        }
-        if data.block_margins.len() <= blocks.saturating_mul(2) { return; }
-        let old = std::mem::take(&mut data.block_margins);
-        let mut live = std::mem::take(&mut data.margin_scratch);
-        let mut next = Some(self.root());
-        while let Some(node) = next {
-            next = self.tree_traversal_next(node);
-            if !self.node_layout_params(node).disabled
-                && let Some(index) = self.node_layout_data(node).block_margin_index()
-            {
-                let next_index = margin_storage::copy_margin(&old, &mut live, index);
-                self.node_layout_data_mut(node).set_block_margin_index(next_index);
-            }
-        }
-        let data = self.layout_data();
-        data.block_margins = live;
-        data.margin_scratch = old;
-        data.margin_scratch.clear();
-    }
-
-    fn measure_sizes_incremental(&mut self, window_size: Xy<f32>) -> IncrementalRelayoutOutcome {
-        let root = self.root();
-        let data = self.layout_data();
-        let last_window_size = std::mem::replace(&mut data.window_size, window_size);
-        if last_window_size.same_input(&window_size) && data.node_changes.is_empty() && data.content_changes.is_empty() {
-            return IncrementalRelayoutOutcome::Success { computed: 0 };
-        }
-        let max_computed = data.n_nodes_solved / 2;
-
-        // Borrow the change lists independently while queuing slots through the adapter.
-        let mut changes = std::mem::take(&mut data.node_changes);
-        let mut content_changes = std::mem::take(&mut data.content_changes);
-        for axis in [X, Y] {
-            if !last_window_size[axis].same_input(&window_size[axis]) {
-                self.queue_declared(root, axis, |size| size.is_flex());
-            }
-        }
-        for (i, change) in changes.drain(..) {
-            self.node_layout_data_mut(i).structural_change = StructuralChange::Clean;
-            self.queue_node_change(i, change);
-        }
-        for i in content_changes.drain(..) {
-            self.node_layout_data_mut(i).structural_change = StructuralChange::Clean;
-            self.queue_content_change(i);
-        }
-        let data = self.layout_data();
-        data.node_changes = changes;
-        data.content_changes = content_changes;
-        self.run_queue(max_computed)
+        crate::sizing_pass::compact_margins::<_, RustVec>(self, blocks);
     }
 
     /// Records a change in the params of a node.
@@ -565,255 +206,602 @@ pub(crate) trait Incremental: Solve {
     /// Runs the selected pass. Checked passes also compare the ordered view
     /// and sizing slots against a canonical full solve.
     fn solve_incremental(&mut self, window_size: Xy<f32>, verify: bool) -> IncrementalRelayoutOutcome {
-        let data = self.layout_data();
-        let needs_topology = data.topology.is_some() && !data.track_topology;
-        data.track_topology = true;
-        let structural = data.children_changed;
-        let same_window = data.window_size.same_input(&window_size);
-        let partial_placement = placement_work::partial_placement(
-            structural, needs_topology, same_window, data.placement_scale_changed,
-        );
-        let outcome = if let Some(reason) = data.pending_full_solve {
-            reason
-        } else {
-            match cycle_rules::route(structural, data.has_cycle, data.has_flow, !same_window) {
-                Route::Structural => self.measure_structure(window_size),
-                Route::Cycle => IncrementalRelayoutOutcome::FallbackCycle,
-                Route::Flow => IncrementalRelayoutOutcome::FallbackFlow,
-                Route::Queue => self.measure_sizes_incremental(window_size),
-            }
-        };
-        let succeeded = matches!(outcome, IncrementalRelayoutOutcome::Success { .. });
-        match publication_route(succeeded, verify, partial_placement, || self.retains_output_rects()) {
-            Publication::Rebuild => self.solve_layout(window_size),
-            Publication::Checked => {
-                if !self.run_full_solve_and_compare(window_size) {
-                    return IncrementalRelayoutOutcome::CheckedIncrementalRelayoutMismatch;
-                }
-            }
-            Publication::Retained => self.place_nodes::<true>(),
-            Publication::All => self.place_nodes::<false>(),
-        }
-        if needs_topology && !structural && !verify && succeeded {
-            self.remember_topology();
-        }
-        outcome
-    }
-
-    fn run_full_solve_and_compare(&mut self, window_size: Xy<f32>) -> bool {
-        // Compare values that belong to the solver. Empty special-purpose slots may
-        // hold an arena index or a leaf's temporary retained measurement constraint.
-        let bits = |tree: &Self, i| {
-            let mut bits = tree.node_layout_data(i).values.map(f32::to_bits);
-            match tree.node_layout_params(i).children_layout {
-                ChildrenLayout::Block => bits[slot_index(X, Kind::EvenShare)] = 0,
-                ChildrenLayout::Free | ChildrenLayout::Stack { .. } => bits[slot_index(Y, Kind::Flow)] = 0,
-                _ => {}
-            }
-            bits
-        };
-        let data = self.layout_data();
-        let mut incremental = std::mem::take(&mut data.checked_values);
-        let mut expected = std::mem::take(&mut data.checked_view);
-        incremental.reserve(data.n_nodes_solved as usize);
-        let mut next = Some(self.root());
-        while let Some(i) = next {
-            incremental.push((i, bits(self, i)));
-            next = self.tree_traversal_next(i);
-        }
-        expected.reserve(incremental.len());
-        CheckedView::capture(self, &mut expected).place_nodes::<false>();
-        let mut reference = CheckedView::compare(self, &mut expected);
-        reference.solve_full::<false>(window_size);
-        let matches = reference.agrees() && incremental.iter().all(|(i, values)| bits(self, *i) == *values);
-        incremental.clear();
-        expected.clear();
-        let data = self.layout_data();
-        data.checked_values = incremental;
-        data.checked_view = expected;
-        matches
-    }
-
-    /// Queues the slots affected by the sizing inputs that changed.
-    fn queue_node_change(&mut self, i: Self::NodeId, change: NodeChange) {
-        if self.node_layout_params(i).disabled {
-            return;
-        }
-        let mut fraction_changed = Xy::new_symm(false);
-        for axis in [X, Y] {
-            for kind in DECLARED_SIZES {
-                if registration_rules::declaration_changed(change.declared, slot_index(axis, kind)) {
-                    self.queue(Slot { node: i, axis, kind });
-                    if kind == Kind::Regular {
-                        fraction_changed[axis] = matches!(self.node_layout_params(i).size[axis], Size::Frac(_));
-                    }
-                }
-            }
-        }
-        if !change.inner.x && !change.inner.y && !change.margin.x && !change.margin.y
-            && !change.content && !change.fill_weight && !fraction_changed.x && !fraction_changed.y
-        {
-            return;
-        }
-        let parent = self.parent(i);
-        let parent_layout = parent.map(|p| self.node_layout_params(p).children_layout);
-        let parent_stack = parent.and_then(|p| self.stack_axis(p));
-        let stack = self.stack_axis(i);
-        let grid = self.width_grid_main_axis(i);
-        let mut seeds = Xy::new_symm(Seeds::default());
-        for axis in [X, Y] {
-            let params = self.node_layout_params(i);
-            let edits = AxisEdits {
-                inner: change.inner[axis], other_inner: change.inner[axis.other()], content: change.content,
-                margin: change.margin[axis], weight: change.fill_weight,
-                regular_fraction: fraction_changed[axis],
-            };
-            let work = edits.seeds(SeedContext {
-                in_flow: !params.free_placement,
-                placed_parent: parent_layout.is_some_and(|layout| layout != ChildrenLayout::Free),
-                parent_stack_axis: parent_stack == Some(axis),
-                stack_axis: stack == Some(axis),
-                width_grid: grid.is_some(), grid_main: grid == Some(axis), wraps_text: self.text_wraps(i, axis),
-            });
-            seeds[axis] = work;
-            if work.own_intrinsic || work.own_fill {
-                self.queue_declared(i, axis, |s| work.own_intrinsic && s == Size::FitContent || work.own_fill && s.is_fill());
-            }
-            if work.own_final { self.queue(Slot { node: i, axis, kind: Kind::Final }); }
-            if work.own_share { self.queue(Slot { node: i, axis, kind: Kind::EvenShare }); }
-            if let Some(parent) = parent {
-                if work.parent_intrinsic { self.queue_declared(parent, axis, |s| s == Size::FitContent); }
-                if work.parent_share { self.queue(Slot { node: parent, axis, kind: Kind::EvenShare }); }
-            }
-        }
-        if seeds.x.child_available || seeds.y.child_available {
-            for_each_layout_child!(self, i, child, {
-                let free = self.node_layout_params(child).free_placement;
-                for axis in [X, Y] {
-                    if seeds[axis].child_available {
-                        let in_stack = stack == Some(axis) && !free;
-                        self.queue_declared(child, axis, |s| matches!(s.dependency_form().input(in_stack), Input::ParentFinal));
-                    }
-                }
-            });
-        }
-    }
-
-    fn queue_content_change(&mut self, i: Self::NodeId) {
-        if self.node_layout_params(i).disabled {
-            return;
-        }
-        for axis in [X, Y] {
-            self.queue_declared(i, axis, |size| size == Size::FitContent);
-        }
+        enter_frame(self, window_size, verify).outcome
     }
 
     fn queue(&mut self, slot: Slot<Self::NodeId>) {
         let Slot { node, axis, kind } = slot;
         let data = self.node_layout_data_mut(node);
-        if data.flags.check_state(axis, kind) != SOLVED {
+        let Some(level) = numeric::invalidate_solved(&data.levels, &mut data.flags.0, axis.index(), kind) else {
             return;
+        };
+        let data = self.layout_data();
+        if !data.queue.try_push(level, slot) {
+            data.request_full_solve(IncrementalRelayoutOutcome::FallbackTooMuchWork);
         }
-        data.flags.set_state(axis, kind, UNSOLVED);
-        let level = data.levels[slot_index(axis, kind)];
-        self.layout_data().queue.push(level, slot);
     }
 
-    /// Computes slots in increasing rank and queues the readers of changed results.
-    /// A saturated rank or exhausted computation budget switches to a full solve.
-    fn run_queue(&mut self, max_computed: u32) -> IncrementalRelayoutOutcome {
-        let mut computed = 0;
-        loop {
-            let data = self.layout_data();
-            let Some(slot) = data.queue.pop() else { break };
-            let Some(next) = dependency_rules::charge_queue_slot(computed, max_computed) else {
-                data.queue.clear();
-                return IncrementalRelayoutOutcome::FallbackTooMuchWork;
-            };
-            computed = next;
-            let k = slot_index(slot.axis, slot.kind);
-            let old = self.node_layout_data(slot.node);
-            if !dependency_rules::queueable(old.levels[k]) {
-                self.layout_data().queue.clear();
-                return IncrementalRelayoutOutcome::FallbackTooMuchWork;
-            }
-            let old_value = old.values[k];
-            let old_grid = (slot.kind == Kind::Final
-                && grid_state::writes_width_grid(true, self.width_grid_main_axis(slot.node) == Some(slot.axis)))
-                .then(|| old.grid_line_bits());
-            // The level of the slot stays the same.
-            self.finish_slot(slot);
-            let new = self.node_layout_data(slot.node);
-            // A width grid can move its children even if its own size stays the same.
-            if new.values[k].to_bits() != old_value.to_bits() || old_grid.is_some_and(|counts| grid_state::count_changed(counts, new.grid_line_bits())) {
-                self.queue_dependents(slot);
-            }
-        }
-        IncrementalRelayoutOutcome::Success { computed }
-    }
-
-    /// Queues every slot that reads `slot`. It is the reverse of `solve_all_dependencies`, and it has to stay in sync with it.
+    /// Queue the reverse dependency requests for one computed slot.
     fn queue_dependents(&mut self, slot: Slot<Self::NodeId>) {
-        let Slot { node: i, axis, kind } = slot;
-        match kind {
-            Kind::EvenShare => {
-                for_each_layout_child!(self, i, child, {
-                    if self.is_in_stack(child, axis) {
-                        self.queue_declared(child, axis, |size| matches!(size.dependency_form().input(true), Input::ParentShare));
-                    }
-                });
-            }
-            Kind::Final => {
-                let other = axis.other();
-                let grid_main = self.width_grid_main_axis(i) == Some(axis);
-                let constrained = dependency_rules::reads_intrinsic_constraint(
-                    self.node_layout_params(i).intrinsic_reads_other_axis(other), grid_main,
-                );
-                self.queue_declared(i, other, |size| size.dependency_form().reads_opposite_final(constrained));
-                if self.stack_axis(i) == Some(axis) {
-                    self.queue(Slot { node: i, axis, kind: Kind::EvenShare });
-                }
-                for_each_layout_child!(self, i, child, {
-                    for child_axis in [X, Y] {
-                        // A placed child of a width grid also reads the main axis for its other axis.
-                        if dependency_rules::reads_parent_axis(child_axis == axis, !self.node_layout_params(child).free_placement, grid_main) {
-                            let in_stack = self.is_in_stack(child, child_axis);
-                            self.queue_declared(child, child_axis, |size| matches!(size.dependency_form().input(in_stack), Input::ParentFinal));
-                        }
-                    }
-                });
-                if let Some(parent) = self.stack_parent(i, axis) && ! self.any_size_is_fill(i, axis) {
-                    self.queue(Slot { node: parent, axis, kind: Kind::EvenShare });
-                }
-            }
-            Kind::Flow => unreachable!("flow currently uses full measurement"),
-            declared => {
-                self.queue(Slot { node: i, axis, kind: Kind::Final });
-                if ! self.node_layout_params(i).free_placement && let Some(parent) = self.parent(i) {
-                    let size = self.read_size(i, axis, declared).unwrap();
-                    if self.stack_axis(parent) == Some(axis) && self.any_size_is_fill(i, axis) && size.dependency_form().contributes_to_share() {
-                        self.queue(Slot { node: parent, axis, kind: Kind::EvenShare });
-                    }
-                    if size.dependency_form().contributes_to_intrinsic() {
-                        self.queue_declared(parent, axis, |size| matches!(size.dependency_form(), Form::Intrinsic));
-                    }
-                }
-            }
-        }
+        readers::notify(self, slot.node, slot.axis, slot.kind);
     }
 
-    /// Queues the declared slots of a node on `axis` whose size matches `filter`.
-    #[inline(always)]
-    fn queue_declared(&mut self, i: Self::NodeId, axis: Axis, filter: impl Fn(Size) -> bool) {
-        for kind in DECLARED_SIZES {
-            if let Some(size) = self.read_size(i, axis, kind) && filter(size) {
-                self.queue(Slot { node: i, axis, kind });
-            }
-        }
-    }
 }
 
 impl<T: TreeAdapter + ?Sized> Incremental for T {}
+
+impl<T: Incremental + ?Sized> readers::Model for T {
+    type Id = T::NodeId;
+}
+
+impl<T: Incremental + ?Sized> readers::Access for T {
+    #[inline]
+    fn parameters(&self, node: T::NodeId) -> &LayoutParams { self.node_layout_params(node) }
+
+    #[inline]
+    fn read_declaration(&self, node: T::NodeId, axis: Axis, kind: Kind) -> Option<Size> {
+        self.read_size(node, axis, kind)
+    }
+
+    #[inline]
+    fn parent_id(&self, node: T::NodeId) -> Option<T::NodeId> { self.parent(node) }
+
+    #[inline]
+    fn first_id(&self, node: T::NodeId) -> Option<T::NodeId> { self.first_child(node) }
+
+    #[inline]
+    fn following_id(&self, node: T::NodeId) -> Option<T::NodeId> { self.next_sibling(node) }
+
+    #[inline]
+    fn enqueue(&mut self, node: T::NodeId, axis: Axis, kind: Kind) {
+        self.queue(Slot { node, axis, kind });
+    }
+}
+
+impl<T: Incremental + ?Sized> checked_view::SizingModel<N_SLOTS> for T {}
+
+impl<T: Incremental + ?Sized> checked_view::SizingSource<N_SLOTS> for T {
+    #[inline]
+    fn first_size(&self) -> Option<T::NodeId> { Some(self.root()) }
+
+    #[inline]
+    fn next_size(&self, node: T::NodeId) -> Option<T::NodeId> { self.tree_traversal_next(node) }
+
+    #[inline]
+    fn sizing_words(&self, node: T::NodeId) -> [u32; N_SLOTS] {
+        checked_view::sizing_projection(self.node_layout_params(node).children_layout, &self.node_layout_data(node).values)
+    }
+}
+
+impl<T: Incremental + ?Sized> checked_view::ReferenceModel<N_SLOTS> for T {}
+
+impl<T: Incremental + ?Sized> checked_view::Reference<Xy<f32>, N_SLOTS> for T {
+    #[inline]
+    fn take_scratch(&mut self) -> checked_view::Scratch<T::NodeId, N_SLOTS> {
+        let data = self.layout_data();
+        checked_view::Scratch {
+            values: RustVec::take(&mut data.checked_values),
+            rectangles: RustVec::take(&mut data.checked_view),
+            hint: data.n_nodes_solved as usize,
+        }
+    }
+
+    #[inline]
+    fn recycle_scratch(&mut self, buffers: checked_view::Scratch<T::NodeId, N_SLOTS>) {
+        let data = self.layout_data();
+        data.checked_values = buffers.values;
+        data.checked_view = buffers.rectangles;
+    }
+
+    #[inline]
+    fn capture_rectangles(&mut self, expected: &mut Vec<OutputRecord<T::NodeId>>) -> bool {
+        let mut capture = CheckedView::capture(self, expected);
+        capture.place_nodes::<false>();
+        capture.captured()
+    }
+
+    #[inline]
+    fn compare_reference(&mut self, window: Xy<f32>, expected: &mut Vec<OutputRecord<T::NodeId>>) -> bool {
+        let mut reference = CheckedView::compare(self, expected);
+        reference.solve_full::<false>(window);
+        reference.agrees()
+    }
+
+    #[inline]
+    fn publish_reference(&mut self, window: Xy<f32>) {
+        self.solve_full::<false>(window);
+    }
+}
+
+impl<T: TreeAdapter + ?Sized> region_policy::RefreshModel for T {
+    type Id = T::NodeId;
+}
+
+impl<T: TreeAdapter + ?Sized> region_policy::RefreshSource for T {
+    #[inline]
+    fn old_flags(&self, parent: T::NodeId) -> NodeFlags {
+        self.node_layout_data(parent).flags
+    }
+
+    #[inline]
+    fn params(&self, node: T::NodeId) -> &LayoutParams {
+        self.node_layout_params(node)
+    }
+
+    #[inline]
+    fn first(&self, parent: T::NodeId) -> Option<T::NodeId> {
+        self.first_child(parent)
+    }
+
+    #[inline]
+    fn following(&self, child: T::NodeId) -> Option<T::NodeId> {
+        self.next_sibling(child)
+    }
+}
+
+impl<T: Incremental + ?Sized> intake::Model for T {
+    type Change = NodeChange;
+}
+
+impl<T: Incremental + ?Sized> intake::Access for T {
+    #[inline]
+    fn window_seed(&mut self, root: Self::Id, axis: usize) {
+        let axis = if axis == X as usize { X } else { Y };
+        readers::declarations(self, root, axis, Filter::Flexible);
+    }
+
+    #[inline]
+    fn clear_mark(&mut self, node: Self::Id) {
+        self.node_layout_data_mut(node).structural_change = StructuralChange::Clean;
+    }
+
+    #[inline]
+    fn declaration_seed(&mut self, node: Self::Id, change: NodeChange) {
+        readers::edited(self, node, change);
+        if self.layout_data().numeric_wrap == Some(true) {
+            readers::wrap_edit(self, node, change);
+        }
+    }
+
+    #[inline]
+    fn content_seed(&mut self, node: Self::Id) {
+        readers::content_edited(self, node);
+    }
+}
+
+impl<T: Incremental + ?Sized> intake::WindowInputs<Xy<f32>> for T {}
+
+impl<T: Incremental + ?Sized> intake::ChangeBuffers<Xy<f32>> for T {
+    #[inline]
+    fn numeric_root(&self) -> Self::Id { self.root() }
+
+    #[inline]
+    fn set_window(&mut self, window: Xy<f32>) -> intake::WindowChange {
+        let data = self.layout_data();
+        intake::replace_viewport(
+            &mut data.window_size.x, &mut data.window_size.y, window.x, window.y,
+            !data.node_changes.is_empty() || !data.content_changes.is_empty(), data.n_nodes_solved,
+        )
+    }
+
+    #[inline]
+    fn take_changes(&mut self) -> intake::Changes<Self::Id, NodeChange> {
+        let data = self.layout_data();
+        intake::Changes {
+            declarations: RustVec::take(&mut data.node_changes),
+            content: RustVec::take(&mut data.content_changes),
+        }
+    }
+
+    #[inline]
+    fn recycle_changes(&mut self, edits: intake::Changes<Self::Id, NodeChange>) {
+        let data = self.layout_data();
+        data.node_changes = edits.declarations;
+        data.content_changes = edits.content;
+    }
+}
+
+impl<T: Incremental + ?Sized> plan::SourceModel for T {
+    type Refresh = T;
+}
+
+impl<T: Incremental + ?Sized> plan::Source for T {
+    type Memory = RustVec;
+
+    #[inline]
+    fn parent_id(&self, node: T::NodeId) -> Option<T::NodeId> { self.parent(node) }
+
+    #[inline]
+    fn refresh_source(&self, _node: T::NodeId) -> &T { self }
+}
+
+impl<T: Incremental + ?Sized> regional::block::Storage for T { type Block = f32; }
+
+impl<T: Incremental + ?Sized> regional::block::Access for T {
+    type BlockMemory = RustVec;
+
+    #[inline(always)]
+    fn scalar(value: f32) -> f32 { value }
+
+    #[inline(always)]
+    fn word(value: f32) -> f32 { value }
+
+    #[inline]
+    fn text_height(&mut self, node: T::NodeId, width: Option<f32>) -> f32 {
+        self.measure_text_height(node, width)
+    }
+
+    #[inline]
+    fn warn_height(&mut self, node: T::NodeId) {
+        self.warn(LayoutWarning::NotFinite { node, axis: Y });
+    }
+
+    #[inline(always)]
+    fn block_margins(&mut self) -> &mut Vec<BlockMargins> { &mut self.layout_data().block_margins }
+
+    #[inline(always)]
+    fn update_block_record(&mut self, node: T::NodeId) -> &mut NodeLayoutData { self.node_layout_data_mut(node) }
+}
+
+impl<T: Incremental + ?Sized> regional::Scene for T {
+    type Window = Xy<f32>;
+    type Snapshot = TopologySnapshot<T::NodeId>;
+
+    #[inline]
+    fn scene_root(&self) -> T::NodeId { self.root() }
+
+    #[inline]
+    fn pending_full(&mut self) -> &mut Option<IncrementalRelayoutOutcome> {
+        &mut self.layout_data().pending_full_solve
+    }
+
+    #[inline]
+    fn viewport(&mut self) -> &mut Xy<f32> {
+        &mut self.layout_data().window_size
+    }
+
+    #[inline]
+    fn viewport_changes(&mut self, window: Xy<f32>) -> (bool, bool) {
+        let data = self.layout_data();
+        let change = intake::replace_viewport(
+            &mut data.window_size.x, &mut data.window_size.y, window.x, window.y, false, 0,
+        );
+        (change.horizontal, change.vertical)
+    }
+
+    #[inline]
+    fn declared_size(&self, node: T::NodeId, axis: Axis, kind: Kind) -> Option<Size> {
+        self.read_size(node, axis, kind)
+    }
+
+    #[inline]
+    fn take_regions(&mut self) -> Vec<T::NodeId> { RustVec::take(&mut self.layout_data().regions) }
+
+    #[inline]
+    fn recycle_regions(&mut self, regions: Vec<T::NodeId>) { self.layout_data().regions = regions; }
+
+    #[inline]
+    fn take_plan_spill(&mut self) -> Vec<plan::Suspended<T::NodeId>> {
+        RustVec::take(&mut self.layout_data().plan_spill)
+    }
+
+    #[inline]
+    fn keep_plan_spill(&mut self, spill: Vec<plan::Suspended<T::NodeId>>) {
+        self.layout_data().plan_spill = spill;
+    }
+
+    #[inline]
+    fn reset_edits(&mut self, retained: SubtreeCounts) {
+        let data = self.layout_data();
+        // Pending queues can reference removed IDs. Live nodes carry the edits.
+        data.clear();
+        data.has_flow = retained.has_flow;
+        data.has_cycle = retained.has_cycle;
+    }
+
+    #[inline]
+    fn restore_tickets(&mut self, snapshot: &Self::Snapshot, root: T::NodeId, ticket: u64) -> bool {
+        snapshot.restore_region_tickets(self, root, ticket)
+    }
+
+    #[inline]
+    fn update_population(&mut self, totals: regional::Totals) {
+        self.layout_data().n_nodes_solved = totals.nodes;
+        self.compact_block_margins(totals.blocks);
+    }
+
+    #[inline]
+    fn unknown_topology(&mut self) -> bool { self.layout_data().unknown_structure }
+
+    #[inline]
+    fn reconcile(&mut self, styles: &mut Vec<T::NodeId>) -> bool { self.reconcile_topology(styles) }
+
+    #[inline]
+    fn take_topology(&mut self) -> Option<Self::Snapshot> { self.layout_data().topology.take() }
+
+    #[inline]
+    fn keep_topology(&mut self, snapshot: Self::Snapshot) { self.layout_data().topology = Some(snapshot); }
+
+    #[inline]
+    fn refresh_topology(&mut self, obsolete: Option<Self::Snapshot>) {
+        if obsolete.is_some() {
+            self.layout_data().topology = Some(TopologySnapshot::new());
+        }
+        self.remember_topology();
+    }
+}
+
+impl<T: Incremental + ?Sized> QueueModel for T {
+    type Slot = (u16, Slot<T::NodeId>);
+}
+
+struct OutputAncestors<'a, T: ?Sized>(&'a mut T);
+
+impl<T: TreeAdapter + ?Sized> layout_tree::solve_frame::MarkModel for OutputAncestors<'_, T> {
+    type Id = T::NodeId;
+}
+
+impl<T: TreeAdapter + ?Sized> layout_tree::solve_frame::MarkAncestors for OutputAncestors<'_, T> {
+    #[inline]
+    fn mark_ancestor(&mut self, node: Self::Id) -> Option<Self::Id> {
+        let data = self.0.node_layout_data_mut(node);
+        data.placement = data.placement.with_child(PlacementWork::Subtree, false);
+        self.0.parent(node)
+    }
+}
+
+impl<T: Incremental + ?Sized> numeric::produce::Access for T {
+    #[inline(always)]
+    fn finish_retaining_grid(&mut self, slot: crate::solve::sizing_requests::Request<Self::Id>)
+        -> crate::solve::sizing_finish::StoredSize<Self::Id>
+    {
+        self.finish_numeric_slot(slot)
+    }
+}
+
+impl<T: Incremental + ?Sized> QueueActions for T {
+    type BudgetMemory = RustVec;
+
+    #[inline(always)]
+    fn take_budget_nodes(&mut self) -> Vec<Self::Id> {
+        RustVec::take(&mut self.layout_data().numeric_touched)
+    }
+
+    #[inline(always)]
+    fn recycle_budget_nodes(&mut self, nodes: Vec<Self::Id>) {
+        self.layout_data().numeric_touched = nodes;
+    }
+
+    #[inline(always)]
+    fn budget_mark(&self, node: Self::Id) -> bool {
+        numeric::marked(self.node_layout_data(node).prepared_placement)
+    }
+
+    #[inline(always)]
+    fn mark_budget_node(&mut self, node: Self::Id, marked: bool) {
+        numeric::mark_record(self.node_layout_data_mut(node), marked);
+    }
+
+    #[inline]
+    fn poll(&mut self) -> QueuePoll<Self::Slot> {
+        let data = self.layout_data();
+        numeric::poll_queue::<_, RustVec>(&mut data.queue, data.pending_full_solve)
+    }
+
+    #[inline]
+    fn position(&self, (rank, slot): Self::Slot) -> (Self::Id, usize, Kind, u16) {
+        (slot.node, slot.axis.index(), slot.kind, rank)
+    }
+
+    #[inline]
+    fn slot_record(&self, (_, slot): Self::Slot) -> &NodeLayoutData {
+        self.node_layout_data(slot.node)
+    }
+
+    #[inline]
+    fn writes_width_grid(&self, (_, slot): Self::Slot) -> bool {
+        self.width_grid_main_axis(slot.node) == Some(slot.axis)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn simple_wrap_queue(&mut self) -> bool {
+        self.layout_data().numeric_wrap == Some(true)
+    }
+
+    #[inline]
+    fn writes_wrap_lines(&self, (_, slot): Self::Slot) -> bool {
+        matches!(self.node_layout_params(slot.node).children_layout, ChildrenLayout::Wrap { axis, .. } if axis == slot.axis)
+    }
+
+    #[inline(always)]
+    fn ranked_slot(&self, step: tape_plan::Ranked<Self::Id>) -> Self::Slot {
+        let request = step.request;
+        (step.rank, Slot { node: request.node, axis: request.axis(), kind: request.kind })
+    }
+
+    #[inline]
+    fn compute(&mut self, (_, slot): Self::Slot) {
+        numeric::produce::compute(
+            self, crate::solve::sizing_requests::target(slot.node, slot.axis == Y, slot.kind),
+        );
+    }
+
+    #[inline]
+    fn send_to_readers(&mut self, (_, slot): Self::Slot) {
+        self.queue_dependents(slot);
+        if self.layout_data().numeric_wrap == Some(true) {
+            readers::wrap_notify(self, slot.node, slot.axis, slot.kind);
+        }
+    }
+
+    #[inline]
+    fn mark_output(&mut self, node: Self::Id, sibling_extent_changed: bool) {
+        // An in-flow size can change its siblings' cursor, even when the
+        // parent keeps the same outer size.
+        let affected = match self.parent(node) {
+            Some(parent) if sibling_extent_changed && !self.node_layout_params(node).free_placement
+                && !matches!(self.node_layout_params(parent).children_layout, ChildrenLayout::Free) => parent,
+            _ => node,
+        };
+        self.node_layout_data_mut(affected).mark_placement_changed();
+        let above = self.parent(affected);
+        layout_tree::solve_frame::mark_parents(&mut OutputAncestors(self), above);
+    }
+
+    #[inline]
+    fn discard_queue(&mut self) {
+        self.layout_data().queue.clear();
+    }
+}
+
+
+pub(crate) struct TapeEquality<T: ?Sized>(core::marker::PhantomData<T>);
+
+impl<T: Incremental + ?Sized> tape::EditEquality<T::NodeId, NodeChange> for TapeEquality<T> {
+    #[inline(always)]
+    fn same_id(left: T::NodeId, right: T::NodeId) -> bool { left == right }
+
+    #[inline(always)]
+    fn same_change(left: NodeChange, right: NodeChange) -> bool { left == right }
+}
+
+impl<T: Incremental + ?Sized> tape_plan::Equal<T::NodeId> for TapeEquality<T> {
+    #[inline(always)]
+    fn same_node(left: T::NodeId, right: T::NodeId) -> bool { left == right }
+}
+
+struct TapeReader<'a, T: Incremental + ?Sized> {
+    tree: &'a T,
+    work: &'a mut tape_plan::Work<T::NodeId>,
+}
+
+impl<T: Incremental + ?Sized> readers::Model for TapeReader<'_, T> {
+    type Id = T::NodeId;
+}
+
+impl<T: Incremental + ?Sized> readers::Access for TapeReader<'_, T> {
+    #[inline(always)]
+    fn parameters(&self, node: T::NodeId) -> &LayoutParams { self.tree.node_layout_params(node) }
+
+    #[inline(always)]
+    fn read_declaration(&self, node: T::NodeId, axis: Axis, kind: Kind) -> Option<Size> {
+        self.tree.read_size(node, axis, kind)
+    }
+
+    #[inline(always)]
+    fn parent_id(&self, node: T::NodeId) -> Option<T::NodeId> { self.tree.parent(node) }
+
+    #[inline(always)]
+    fn first_id(&self, node: T::NodeId) -> Option<T::NodeId> { self.tree.first_child(node) }
+
+    #[inline(always)]
+    fn following_id(&self, node: T::NodeId) -> Option<T::NodeId> { self.tree.next_sibling(node) }
+
+    #[inline]
+    fn enqueue(&mut self, node: T::NodeId, axis: Axis, kind: Kind) {
+        tape_plan::discover_from_record::<_, TapeEquality<T>, RustVec>(
+            self.work, node, axis, kind, self.tree.node_layout_data(node),
+        );
+    }
+}
+
+impl<T: Incremental + ?Sized> tape_plan::EventModel for T {}
+
+impl<T: Incremental + ?Sized> tape_plan::Events for T {
+    #[inline]
+    fn viewport(&self, work: &mut tape_plan::Work<T::NodeId>, root: T::NodeId, axis: Axis) {
+        readers::declarations(&mut TapeReader { tree: self, work }, root, axis, Filter::Flexible);
+    }
+
+    #[inline]
+    fn declaration(&self, work: &mut tape_plan::Work<T::NodeId>, node: T::NodeId, change: NodeChange) {
+        let wrap = work.wrap;
+        let mut inbox = TapeReader { tree: self, work };
+        tape_plan::dispatch_declaration(&mut inbox, node, change, wrap);
+    }
+
+    #[inline]
+    fn content(&self, work: &mut tape_plan::Work<T::NodeId>, node: T::NodeId) {
+        readers::content_edited(&mut TapeReader { tree: self, work }, node);
+    }
+
+    #[inline]
+    fn readers(&self, work: &mut tape_plan::Work<T::NodeId>, step: tape_plan::Ranked<T::NodeId>) {
+        let wrap = work.wrap;
+        let request = step.request;
+        let mut inbox = TapeReader { tree: self, work };
+        tape_plan::dispatch_readers(&mut inbox, request, wrap);
+    }
+}
+
+impl<T: Incremental + ?Sized> numeric::CachedQueue<Xy<f32>> for T {
+    type Equality = TapeEquality<T>;
+
+    #[inline]
+    fn take_tape(&mut self) -> tape::Tape<T::NodeId, NodeChange, tape_plan::Ranked<T::NodeId>> {
+        core::mem::replace(&mut self.layout_data().numeric_tape, tape::Tape::new())
+    }
+
+    #[inline]
+    fn keep_tape(&mut self, tape: tape::Tape<T::NodeId, NodeChange, tape_plan::Ranked<T::NodeId>>) {
+        self.layout_data().numeric_tape = tape;
+    }
+
+    #[inline]
+    fn numeric_context(&mut self) -> numeric::NumericContext {
+        let data = self.layout_data();
+        numeric::NumericContext { wrap: data.numeric_wrap == Some(true), clean: !data.sizing_warned }
+    }
+}
+
+impl<T: Incremental + ?Sized> FrameActions<Xy<f32>> for T {
+    #[inline]
+    fn frame_inputs(&mut self, window: Xy<f32>) -> (FrameInputs, &mut bool) {
+        let data = self.layout_data();
+        let flow_request = matches!(data.pending_full_solve, Some(IncrementalRelayoutOutcome::FallbackFlow));
+        let inspect = data.has_flow && data.numeric_wrap.is_none() && !data.children_changed && !data.has_cycle
+            && (data.pending_full_solve.is_none() || flow_request && data.replay_pending);
+        if inspect {
+            let supported = crate::sizing_pass::numeric_wrap_shape(self);
+            self.layout_data().numeric_wrap = Some(supported);
+        }
+        let data = self.layout_data();
+        let inputs = FrameInputs {
+            pending: data.pending_full_solve,
+            has_topology: data.topology.is_some(),
+            structural: data.children_changed,
+            unknown_structure: data.unknown_structure,
+            replay_pending: data.replay_pending,
+            same_window: same_viewport(data.window_size.x, data.window_size.y, window.x, window.y),
+            scale_changed: data.placement_scale_changed,
+            has_cycle: data.has_cycle,
+            has_flow: data.has_flow && (data.numeric_wrap != Some(true) || flow_request),
+        };
+        (inputs, &mut data.track_topology)
+    }
+
+    #[inline]
+    fn retains_rectangles(&self) -> bool {
+        self.retains_output_rects()
+    }
+
+    #[inline]
+    fn publish_full_solve(&mut self, window: Xy<f32>) {
+        self.solve_layout(window);
+    }
+
+    #[inline]
+    fn publish_placement(&mut self, partial: bool) -> crate::place::placement_entry::RootPlacement<T::NodeId> {
+        if partial { self.place_nodes::<true>() } else { self.place_nodes::<false>() }
+    }
+
+    #[inline]
+    fn remember(&mut self) {
+        self.remember_topology();
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -859,22 +847,355 @@ mod tests {
         let mut queue = WorkQueue::new();
         let slot = |node| Slot { node, axis: X, kind: Kind::Regular };
         for (level, id) in [(4000, 1), (3999, 2), (3990, 3), (3999, 4)] {
-            queue.push(level, slot(id));
+            assert!(queue.try_push(level, slot(id)));
         }
-        assert_eq!(queue.pop().unwrap().node, 3);
-        queue.push(4001, slot(5));
-        assert_eq!(queue.pop().unwrap().node, 4);
-        queue.push(4000, slot(6));
+        assert_eq!(queue.pop().map(|(rank, slot)| (rank, slot.node)), Some((3990, 3)));
+        assert!(!queue.try_push(3989, slot(9)));
+        assert!(queue.try_push(4001, slot(5)));
+        assert_eq!(queue.pop().map(|(rank, slot)| (rank, slot.node)), Some((3999, 4)));
+        assert!(!queue.try_push(3998, slot(10)));
+        assert!(queue.try_push(4000, slot(6)));
         for expected in [2, 6, 1, 5] {
-            assert_eq!(queue.pop().unwrap().node, expected);
+            assert_eq!(queue.pop().unwrap().1.node, expected);
         }
         assert!(queue.pop().is_none());
 
-        queue.push(65535, slot(7));
+        assert!(queue.try_push(65535, slot(7)));
         queue.clear();
-        queue.push(0, slot(8));
-        assert_eq!(queue.pop().unwrap().node, 8);
+        assert!(queue.try_push(0, slot(8)));
+        assert_eq!(queue.pop().map(|(rank, slot)| (rank, slot.node)), Some((0, 8)));
         assert!(queue.pop().is_none());
+    }
+
+    #[derive(Clone)]
+    struct ViewportFixture {
+        params: Vec<LayoutParams>,
+        records: Vec<NodeLayoutData>,
+        rectangles: Vec<(XyRect, XyRect)>,
+        layout: LayoutData<usize>,
+    }
+
+    impl ViewportFixture {
+        fn new(fractions: usize) -> Self {
+            let pixels = LayoutParams { size: Xy::new_symm(Size::Pixels(8.0)), ..LayoutParams::DEFAULT };
+            let mut params = vec![pixels; 30];
+            params[0] = LayoutParams::DEFAULT;
+            for params in &mut params[1..=fractions] {
+                params.size.x = Size::Frac(0.5);
+            }
+            Self {
+                params,
+                records: vec![NodeLayoutData::new(); 30],
+                rectangles: vec![(Xy::new_symm([0.0; 2]), Xy::new_symm([0.0; 2])); 30],
+                layout: LayoutData::new(),
+            }
+        }
+
+        fn assert_budget_cleared(&self) {
+            assert!(self.layout.numeric_touched.is_empty());
+            assert!(self.records.iter().all(|record| !numeric::marked(record.prepared_placement)));
+        }
+
+        fn assert_same_rectangles(&self, full: &Self) {
+            let words = |(absolute, local): &(XyRect, XyRect)| {
+                [absolute.x, absolute.y, local.x, local.y].map(|edges| edges.map(f32::to_bits))
+            };
+            for (left, right) in self.rectangles.iter().zip(&full.rectangles) {
+                assert_eq!(words(left), words(right));
+            }
+        }
+    }
+
+    impl TreeAdapter for ViewportFixture {
+        type NodeId = usize;
+
+        fn retains_output_rects(&self) -> bool { self.layout.topology.is_none() }
+
+        fn root(&self) -> usize { 0 }
+        fn parent(&self, node: usize) -> Option<usize> { (node != 0).then_some(0) }
+        fn first_child(&self, node: usize) -> Option<usize> { (node == 0).then_some(1) }
+        fn next_sibling(&self, node: usize) -> Option<usize> {
+            if node > 0 && node + 1 < self.params.len() { Some(node + 1) } else { None }
+        }
+        fn node_layout_params(&self, node: usize) -> &LayoutParams { &self.params[node] }
+        fn node_layout_data(&self, node: usize) -> &NodeLayoutData { &self.records[node] }
+        fn node_layout_data_mut(&mut self, node: usize) -> &mut NodeLayoutData { &mut self.records[node] }
+        fn layout_data(&mut self) -> &mut LayoutData<usize> { &mut self.layout }
+        fn write_output_rect(&mut self, node: usize, rect: XyRect, local: XyRect) {
+            self.rectangles[node] = (rect, local);
+        }
+    }
+
+    #[test]
+    fn viewport_queue_budgets_distinct_nodes_and_matches_full_bits() {
+        let mut tree = ViewportFixture::new(10);
+        let initial = Xy::new(100.0, 90.0);
+        tree.solve_layout(initial);
+        let mut full = tree.clone();
+        for width in [160.25, 100.0, 201.5] {
+            let window = Xy::new(width, initial.y);
+            // Root and ten fraction leaves use two slots each. Twenty-two
+            // slots exceed the old limit of fifteen, with eleven owners.
+            assert_eq!(tree.solve_layout_incremental(window), IncrementalRelayoutOutcome::Success { computed: 22 });
+            full.solve_layout(window);
+            tree.assert_same_rectangles(&full);
+            for (left, right) in tree.records.iter().zip(&full.records) {
+                assert_eq!(left.values.map(f32::to_bits), right.values.map(f32::to_bits));
+            }
+            tree.assert_budget_cleared();
+        }
+    }
+
+    #[test]
+    fn excess_intake_edits_replay_before_the_queue_changes_any_slots() {
+        let mut tree = ViewportFixture::new(10);
+        let window = Xy::new(100.0, 90.0);
+        tree.solve_layout(window);
+        let before = tree.records.clone();
+        for i in 1..=18 {
+            let old = tree.params[i];
+            tree.params[i].size.x = if i <= 10 { Size::Frac(0.25) } else { Size::Pixels(23.0) };
+            tree.register_node_change(i, &old);
+        }
+        assert_eq!(tree.layout.pending_full_solve, Some(IncrementalRelayoutOutcome::FallbackTooMuchWork));
+        assert!(tree.layout.replay_pending);
+        assert_eq!(tree.layout.node_changes.len(), 15);
+        for (old, current) in before.iter().zip(&tree.records) {
+            assert_eq!(old.values.map(f32::to_bits), current.values.map(f32::to_bits));
+        }
+        let mut full = tree.clone();
+        let resized = Xy::new(124.25, window.y);
+        full.solve_layout(resized);
+        assert!(matches!(tree.solve_layout_incremental(resized), IncrementalRelayoutOutcome::Success { .. }));
+        tree.assert_same_rectangles(&full);
+        tree.assert_budget_cleared();
+        assert!(!tree.layout.replay_pending);
+        assert!(tree.layout.node_changes.is_empty());
+        let old = tree.params[1];
+        tree.params[1].size.x = Size::Frac(0.75);
+        tree.register_node_change(1, &old);
+        full.params[1] = tree.params[1];
+        full.solve_layout(resized);
+        assert!(matches!(tree.solve_layout_incremental(resized), IncrementalRelayoutOutcome::Success { .. }));
+        tree.assert_same_rectangles(&full);
+    }
+
+    #[test]
+    fn numeric_declarations_budget_distinct_nodes_and_match_full_bits() {
+        let window = Xy::new(720.0, 128.0);
+        for grid in [false, true] {
+            let mut tree = ViewportFixture::new(0);
+            tree.params[0].children_layout = if grid {
+                ChildrenLayout::Grid {
+                    main_axis: X, columns: MainAxisCellSize::Count(4),
+                    spacing_x: 2.0, spacing_y: 3.0, backfill: false,
+                }
+            } else {
+                ChildrenLayout::Stack { axis: X, arrange: Arrange::Start, spacing: 1.0 }
+            };
+            for params in &mut tree.params[1..=10] {
+                params.size.x = Size::Fill;
+            }
+            for params in &mut tree.params[11..] {
+                params.free_placement = true;
+            }
+            if !grid {
+                tree.params[1].min_size.x = Some(Size::Pixels(40.0));
+            }
+            tree.solve_layout(window);
+            let mut full = tree.clone();
+            for wide in [true, false, true, false] {
+                let edited = if grid { 0 } else { 1 };
+                let old = tree.params[edited];
+                if grid {
+                    tree.params[edited].children_layout = ChildrenLayout::Grid {
+                        main_axis: X, columns: MainAxisCellSize::Count(4),
+                        spacing_x: if wide { 14.5 } else { 2.0 }, spacing_y: 3.0, backfill: false,
+                    };
+                } else {
+                    tree.params[edited].min_size.x = Some(Size::Pixels(if wide { 120.0 } else { 40.0 }));
+                }
+                tree.register_node_change(edited, &old);
+                assert!(!tree.layout.children_changed);
+                let before = tree.rectangles[2];
+                let outcome = tree.solve_layout_incremental(window);
+                // More than half the population in slot computations is
+                // compatible with fewer than half the nodes being affected.
+                assert!(matches!(outcome, IncrementalRelayoutOutcome::Success { computed: 16.. }), "{outcome:?}");
+                assert_ne!(tree.rectangles[2], before);
+                full.params[edited] = tree.params[edited];
+                full.solve_layout(window);
+                tree.assert_same_rectangles(&full);
+                for (left, right) in tree.records.iter().zip(&full.records) {
+                    assert_eq!(left.values.map(f32::to_bits), right.values.map(f32::to_bits));
+                }
+                tree.assert_budget_cleared();
+            }
+        }
+    }
+
+    #[test]
+    fn viewport_fallback_releases_budget_marks_before_full_solve() {
+        let window = Xy::new(160.25, 90.0);
+        for (fractions, bad_rank) in [(20, None), (10, Some(u16::MAX)), (10, Some(0))] {
+            let mut tree = ViewportFixture::new(fractions);
+            tree.solve_layout(Xy::new(100.0, 90.0));
+            if let Some(rank) = bad_rank {
+                tree.records[1].levels[slot_index(X, Kind::Regular)] = rank;
+            }
+            // Inspect the attempt itself. A later full preparation could
+            // otherwise clear a leaked mark and hide a cleanup regression.
+            assert_eq!(
+                numeric::measure::<_, _, RustVec>(&mut tree, window, false),
+                IncrementalRelayoutOutcome::FallbackTooMuchWork,
+            );
+            assert!(tree.layout.numeric_touched.capacity() > 0);
+            tree.assert_budget_cleared();
+        }
+    }
+
+    #[test]
+    fn broad_viewport_sizing_reuses_only_the_matching_live_tape() {
+        let mut tree = ViewportFixture::new(0);
+        tree.params.resize(100, tree.params[1]);
+        tree.records.resize(100, NodeLayoutData::new());
+        tree.rectangles.resize(100, (Xy::new_symm([0.0; 2]), Xy::new_symm([0.0; 2])));
+        for params in &mut tree.params[1..=40] {
+            params.size.x = Size::Frac(0.25);
+        }
+        tree.solve_layout(Xy::new(100.0, 90.0));
+        let mut full = tree.clone();
+        for width in [160.25, 215.5, 121.0] {
+            let window = Xy::new(width, 90.0);
+            assert_eq!(tree.solve_layout_incremental(window), IncrementalRelayoutOutcome::Success { computed: 82 });
+            assert!(tree.layout.numeric_tape.axes.horizontal);
+            assert_eq!(tree.layout.numeric_tape.steps.len(), 82);
+            full.solve_layout(window);
+            tree.assert_same_rectangles(&full);
+            for (left, right) in tree.records.iter().zip(&full.records) {
+                assert_eq!(left.values.map(f32::to_bits), right.values.map(f32::to_bits));
+            }
+            tree.assert_budget_cleared();
+        }
+        tree.register_structural_change();
+        assert!(tree.layout.numeric_tape.steps.is_empty());
+        let window = Xy::new(206.75, 90.0);
+        full.solve_layout(window);
+        tree.solve_layout_incremental(window);
+        tree.assert_same_rectangles(&full);
+    }
+
+    #[test]
+    fn rejected_tape_never_invalidates_the_ordinary_ranked_inputs() {
+        let mut tree: LayoutTree = LayoutTree::new();
+        let root = tree.root();
+        let clamped = LayoutParams {
+            size: Xy::new(Size::Fill, Size::Pixels(12.0)),
+            max_size: Xy::new(Some(Size::Pixels(12.0)), None),
+            ..LayoutParams::DEFAULT
+        };
+        let child = LayoutParams {
+            size: Xy::new(Size::Frac(0.5), Size::Pixels(3.0)),
+            ..LayoutParams::DEFAULT
+        };
+        for _ in 0..36 {
+            let group = tree.add_node(&root, clamped).unwrap();
+            for _ in 0..3 { tree.add_node(&group, child).unwrap(); }
+        }
+        tree.solve_layout(Xy::new(100.0, 120.0));
+        let mut full = tree.clone();
+        for width in [140.0, 110.0, 160.0, 190.0, 205.0] {
+            let viewport = Xy::new(width, 120.0);
+            // The clamped parent Finals stop numeric propagation. A
+            // conservative schedule also sees their fraction grandchildren
+            // and must decline without consuming the live queue's budget.
+            assert_eq!(tree.solve_layout(viewport), IncrementalRelayoutOutcome::Success { computed: 74 });
+            assert!(tree.layout_data.numeric_tape.steps.is_empty());
+            assert!(tree.layout_data.numeric_tape.axes.horizontal);
+            full.invalidate();
+            full.solve_layout(viewport);
+            for id in tree.nodes.keys() {
+                let actual = tree.layout(&tree.node_id(id)).unwrap();
+                let expected = full.layout(&full.node_id(id)).unwrap();
+                assert_eq!([actual.x, actual.y].map(|axis| axis.map(f32::to_bits)),
+                    [expected.x, expected.y].map(|axis| axis.map(f32::to_bits)));
+            }
+        }
+    }
+
+    #[test]
+    fn simple_wrap_numeric_rebuilds_line_boundaries_and_cross_metrics() {
+        let mut tree = ViewportFixture::new(0);
+        tree.params[0] = LayoutParams {
+            size: Xy::new(Size::Fill, Size::FitContent),
+            children_layout: ChildrenLayout::Wrap { axis: X, arrange: Arrange::Start, spacing: 2.5, line_spacing: 4.75 },
+            ..LayoutParams::DEFAULT
+        };
+        for (i, p) in tree.params[1..].iter_mut().enumerate() {
+            p.size = Xy::new(Size::Pixels(17.0 + (i % 3) as f32), Size::Pixels(9.0 + (i % 5) as f32));
+        }
+        tree.solve_layout(Xy::new(100.0, 90.0));
+        let mut full = tree.clone();
+        for (iteration, width) in [72.25, 215.5, 85.0, 115.625].into_iter().enumerate() {
+            let window = Xy::new(width, 90.0);
+            let old_root = tree.params[0];
+            tree.params[0].children_layout = ChildrenLayout::Wrap {
+                axis: X, arrange: Arrange::Start, spacing: 2.5, line_spacing: 4.75 + iteration as f32,
+            };
+            tree.register_node_change(0, &old_root);
+            let old_child = tree.params[3];
+            tree.params[3].margin.y[0] = Margin::px(6.25 - iteration as f32).unwrap();
+            tree.register_node_change(3, &old_child);
+            assert!(matches!(tree.solve_layout_incremental(window), IncrementalRelayoutOutcome::Success { .. }));
+            assert_eq!(tree.layout.numeric_wrap, Some(true));
+            full.params.clone_from(&tree.params);
+            full.solve_layout(window);
+            tree.assert_same_rectangles(&full);
+            for (left, right) in tree.records.iter().zip(&full.records) {
+                assert_eq!(left.flags.starts_wrap_line(), right.flags.starts_wrap_line());
+                assert_eq!(left.parent_flow, right.parent_flow);
+                assert_eq!(left.values.map(f32::to_bits), right.values.map(f32::to_bits));
+            }
+        }
+        let old_child = tree.params[3];
+        tree.params[3].size.y = Size::Fill;
+        tree.register_node_change(3, &old_child);
+        assert_eq!(tree.layout.numeric_wrap, None);
+    }
+
+    #[test]
+    fn rebuilt_wrap_partition_marks_retained_output_with_unchanged_final_words() {
+        let mut tree = ViewportFixture::new(0);
+        tree.layout.topology = None;
+        tree.layout.set_pixel_scale(Some(PixelScale::try_from(1.25).unwrap()));
+        tree.params[0].children_layout = ChildrenLayout::Wrap {
+            axis: X, arrange: Arrange::Start, spacing: 0.0, line_spacing: 2.75,
+        };
+        for params in &mut tree.params[1..] {
+            params.size = Xy::new(Size::Pixels(17.0), Size::Pixels(9.25));
+        }
+        let window = Xy::new(80.25, 175.5);
+        tree.solve_layout(window);
+        assert_eq!(tree.solve_layout_incremental(window), IncrementalRelayoutOutcome::Success { computed: 0 });
+        assert_eq!(tree.layout.numeric_wrap, Some(true));
+        assert!(tree.records.iter().all(|record| record.placement == PlacementWork::Clean));
+
+        let old = tree.params[0];
+        let previous_child = tree.rectangles[4];
+        let final_words = |data: &NodeLayoutData| [data.size().x.to_bits(), data.size().y.to_bits()];
+        let previous_sizes: Vec<_> = tree.records.iter().map(final_words).collect();
+        tree.params[0].children_layout = ChildrenLayout::Wrap {
+            axis: X, arrange: Arrange::Start, spacing: 8.0, line_spacing: 2.75,
+        };
+        tree.register_node_change(0, &old);
+        let mut full = tree.clone();
+
+        let outcome = tree.solve_layout_incremental(window);
+        assert!(matches!(outcome, IncrementalRelayoutOutcome::Success { computed } if computed > 0));
+        assert_eq!(tree.records.iter().map(final_words).collect::<Vec<_>>(), previous_sizes);
+        full.solve_layout(window);
+        tree.assert_same_rectangles(&full);
+        assert_ne!(tree.rectangles[4], previous_child);
     }
 
     #[test]
@@ -896,6 +1217,32 @@ mod tests {
         assert_eq!(tree.solve_layout(window), IncrementalRelayoutOutcome::FallbackTooMuchWork);
         assert_eq!(tree.layout(&child).unwrap(), full.layout(&full.node_id(child.key())).unwrap());
         assert_ne!(tree.nodes[child.key()].layout.levels[slot_index(X, Kind::Regular)], u16::MAX);
+    }
+
+    #[test]
+    fn a_dependency_behind_the_queue_cursor_recovers_with_a_full_solve() {
+        let mut tree: LayoutTree = LayoutTree::new();
+        let root = tree.root();
+        let mut params = LayoutParams { size: Xy::new_symm(Size::Pixels(10.0)), ..LayoutParams::DEFAULT };
+        let early = tree.add_node(&root, params).unwrap();
+        let late = tree.add_node(&root, params).unwrap();
+        for _ in 0..16 { tree.add_node(&root, LayoutParams::DEFAULT).unwrap(); }
+        let window = Xy::new_symm(120.0);
+        tree.solve_layout(window);
+
+        // The first edit advances the queue from rank zero. Inject a second
+        // edit whose Final would be enqueued behind the cursor.
+        tree.nodes[early.key()].layout.levels[slot_index(X, Kind::Regular)] = 0;
+        tree.nodes[late.key()].layout.levels[slot_index(X, Kind::Regular)] = 10;
+        tree.nodes[late.key()].layout.levels[slot_index(X, Kind::Final)] = 1;
+        params.size.x = Size::Pixels(20.0);
+        tree.update_node_params(&early, params).unwrap();
+        tree.update_node_params(&late, params).unwrap();
+        assert_eq!(tree.solve_layout(window), IncrementalRelayoutOutcome::FallbackTooMuchWork);
+        for child in [&early, &late] {
+            assert_eq!(tree.layout(child).unwrap().x, [50.0, 70.0]);
+        }
+        assert_eq!(tree.solve_layout(window), IncrementalRelayoutOutcome::Success { computed: 0 });
     }
 
     #[test]
@@ -930,7 +1277,12 @@ mod tests {
             structural.update_node_params(&structural.node_id(item.key()), params).unwrap();
             structural.invalidate();
             assert_eq!(structural.solve_layout(window), FallbackInvalidated);
-            assert_eq!(tree.solve_layout(window), fallback);
+            if fallback == FallbackCycle {
+                assert_eq!(tree.solve_layout(window), FallbackCycle);
+            } else {
+                assert!(tree.layout_data.replay_pending);
+                assert!(matches!(tree.solve_layout(window), Success { .. }));
+            }
         }
     }
 }

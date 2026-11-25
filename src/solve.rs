@@ -8,47 +8,61 @@ mod grid_words;
 mod grid_sparse;
 #[path = "grid_state.rs"]
 pub(crate) mod grid_state;
+#[cfg(feature = "incremental")]
+#[path = "grid_width.rs"]
+mod grid_width;
 #[path = "fill_collection.rs"]
 mod fill_collection;
 #[path = "fill_compaction.rs"]
-mod fill_compaction;
-#[path = "root_requests.rs"]
-mod root_requests;
-use root_requests::visit_sizing_roots;
+pub(crate) mod fill_compaction;
 #[path = "sizing_stack.rs"]
 mod sizing_stack;
+#[path = "sizing_child.rs"]
+mod sizing_child;
+#[path = "sizing_requests.rs"]
+pub(crate) mod sizing_requests;
+#[path = "sizing_finish.rs"]
+pub(crate) mod sizing_finish;
+#[path = "sizing_fill.rs"]
+pub(crate) mod sizing_fill;
+#[path = "prepare_walk.rs"]
+pub(crate) mod prepare_walk;
 use crate::*;
 use crate::flow::wrap_metrics;
+use crate::prepare_nodes;
+#[cfg(test)]
+use crate::prepare_nodes::RetainedSizing;
+use crate::vec_memory::{RustVec, VecMemory};
 #[path = "wrap_schedule.rs"]
 mod wrap_schedule;
-use crate::Axis::{X, Y};
+#[cfg(any(feature = "incremental", test))]
+use crate::Axis::X;
+use crate::Axis::Y;
+use crate::placement_geometry::RustFloat;
+use sizing_finish::phase::{self, OpenSlot};
+
+pub(crate) type SizingTask<I> = sizing_stack::Task<sizing_requests::Request<I>, OpenSlot<I>>;
 
 #[path = "dependency_rules.rs"]
 pub(crate) mod dependency_rules;
 #[path = "block_schedule.rs"]
-mod block_schedule;
-use block_schedule::{BlockSchedule, Request as BlockRequest, ScheduleModel};
-use dependency_rules::{Form, Input};
+pub(crate) mod block_schedule;
+use dependency_rules::Form;
 #[cfg(feature = "incremental")]
 #[path = "leaf_retention.rs"]
-mod leaf_retention;
+pub(crate) mod leaf_retention;
 #[path = "cycle_rules.rs"]
 pub(crate) mod cycle_rules;
 pub(crate) use cycle_rules::{Kind, N_SLOTS, SOLVED, UNSOLVED};
-use cycle_rules::{Entry, IN_PROGRESS};
-#[cfg(feature = "incremental")]
-use cycle_rules::CHECK_INTRINSIC;
-#[cfg(feature = "incremental")]
-use crate::fixed_leaf_cache::{self, Summary as FixedLeafSummary};
-
+#[cfg(test)]
+use cycle_rules::Entry;
 pub(crate) const DECLARED_SIZES: [Kind; 3] = cycle_rules::declaration_order(Kind::Regular, Kind::Min, Kind::Max);
 
-#[inline(always)]
-pub(crate) const fn slot_index(axis: Axis, kind: Kind) -> usize {
-    cycle_rules::slot_index(axis as usize, kind)
-}
-
-const _: () = assert!(X as usize == 0 && Y as usize == 1);
+pub(crate) use crate::node_flags::NodeFlags;
+#[cfg(any(feature = "incremental", test))]
+pub(crate) use crate::node_flags::slot_index;
+pub use crate::node_data::NodeLayoutData;
+use crate::node_data::EMPTY_VALUES;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Slot<I> {
@@ -57,239 +71,7 @@ pub(crate) struct Slot<I> {
     pub kind: Kind,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct OpenSlot<I> {
-    slot: Slot<I>,
-    previous: f32,
-    #[cfg(feature = "incremental")]
-    outer_level: u16,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum SizingTask<I> {
-    Enter(Slot<I>),
-    Finish(OpenSlot<I>, bool),
-}
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct NodeFlags(u32);
-
-impl NodeFlags {
-    pub(crate) const EMPTY: NodeFlags = NodeFlags(0);
-
-    const IN_CYCLE_X: u32 = 1 << (2 * N_SLOTS);
-    const IN_CYCLE_Y: u32 = 1 << (2 * N_SLOTS + 1);
-    const FLEX_CHILD_X: u32 = 1 << (2 * N_SLOTS + 2);
-    const FLEX_CHILD_Y: u32 = 1 << (2 * N_SLOTS + 3);
-    const GRID_SPANS: u32 = 1 << (2 * N_SLOTS + 4);
-    const BLOCK_ITEM: u32 = 1 << (2 * N_SLOTS + 5);
-    const BLOCK_PARENT_AUTO_HEIGHT: u32 = 1 << (2 * N_SLOTS + 6);
-    const BLOCK_CONTAINER: u32 = 1 << (2 * N_SLOTS + 7);
-    const WRAP_CONTAINER: u32 = 1 << (2 * N_SLOTS + 8);
-    const WRAP_LINE_START: u32 = 1 << (2 * N_SLOTS + 9);
-    const DESCENDANTS_NEED_SOLVE: u32 = 1 << (2 * N_SLOTS + 10);
-    const FIXED_LEAF: u32 = 1 << (2 * N_SLOTS + 11);
-
-    pub(crate) fn is_block_item(self) -> bool {
-        self.0 & Self::BLOCK_ITEM != 0
-    }
-
-    #[cfg(feature = "incremental")]
-    pub(crate) fn has_cycle(self) -> bool {
-        self.0 & (Self::IN_CYCLE_X | Self::IN_CYCLE_Y) != 0
-    }
-
-    #[cfg(feature = "incremental")]
-    pub(crate) fn has_flow(self) -> bool {
-        self.0 & (Self::BLOCK_CONTAINER | Self::WRAP_CONTAINER) != 0
-    }
-
-    #[cfg(feature = "incremental")]
-    pub(crate) fn is_block_container(self) -> bool {
-        self.0 & Self::BLOCK_CONTAINER != 0
-    }
-
-    pub(crate) fn starts_wrap_line(self) -> bool {
-        wrap_metrics::is_start(self.0, Self::WRAP_LINE_START)
-    }
-
-    #[inline(always)]
-    fn in_cycle(axis: Axis) -> u32 {
-        match axis {
-            X => NodeFlags::IN_CYCLE_X,
-            Y => NodeFlags::IN_CYCLE_Y,
-        }
-    }
-
-    #[inline(always)]
-    fn flex_child(axis: Axis) -> u32 {
-        match axis {
-            X => NodeFlags::FLEX_CHILD_X,
-            Y => NodeFlags::FLEX_CHILD_Y,
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn check_state(self, axis: Axis, kind: Kind) -> u32 {
-        cycle_rules::read_state(self.0, slot_index(axis, kind) as u32)
-    }
-
-    #[inline(always)]
-    pub(crate) fn set_state(&mut self, axis: Axis, kind: Kind, state: u32) {
-        self.0 = cycle_rules::write_state(self.0, slot_index(axis, kind) as u32, state);
-    }
-}
-
-const _: () = assert!(2 * N_SLOTS + 12 <= 32, "The slot states and the flags don't fit in NodeFlags");
-
-const EMPTY_VALUES: [f32; N_SLOTS] = {
-    let mut values = [f32::from_bits(cycle_rules::provisional_bits(false)); N_SLOTS];
-    values[slot_index(X, Kind::Max)] = f32::from_bits(cycle_rules::provisional_bits(true));
-    values[slot_index(Y, Kind::Max)] = f32::from_bits(cycle_rules::provisional_bits(true));
-    values
-};
-
-
-impl Size {
-    #[inline(always)]
-    pub(crate) fn dependency_form(self) -> Form {
-        match self {
-            Size::Pixels(_) => Form::Constant,
-            Size::AspectRatio(_) => Form::Ratio,
-            Size::Frac(_) => Form::Fraction,
-            Size::Fill => Form::Fill,
-            Size::FitContent | Size::Auto => Form::Intrinsic,
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn is_fill(&self) -> bool {
-        *self == Size::Fill
-    }
-
-    #[inline(always)]
-    pub(crate) fn is_flex(&self) -> bool {
-        matches!(self, Size::Frac(_) | Size::Fill)
-    }
-}
-
-impl LayoutParams {
-    #[inline(always)]
-    fn text_wraps_on(&self, axis: Axis) -> bool {
-        axis == Y && self.text == TextContent::Wrapping && !matches!(self.size.x, Size::AspectRatio(_))
-    }
-
-    #[inline(always)]
-    pub(crate) fn intrinsic_reads_other_axis(&self, axis: Axis) -> bool {
-        self.text_wraps_on(axis) || self.content_measure.reads_other_axis(axis)
-    }
-}
-
-macro_rules! for_each_layout_child {
-    ($solver:expr, $i:expr, $child:ident, $body:block) => {
-        for_each_layout_child!(@from $solver, $solver.first_child($i), $child, $body)
-    };
-    (@from $solver:expr, $first:expr, $child:ident, $body:block) => {{
-        let mut next = $first;
-        walk_siblings!(; (next, $child); {}; $solver.next_sibling($child); $solver.node_layout_params($child).disabled; $body);
-    }};
-    (@until $solver:expr, $first:expr, $stop:expr, $child:ident, $body:block) => {{
-        let mut next = $first;
-        let stop = $stop;
-        walk_siblings!(; (next, $child); { if Some($child) == stop { break; } };
-            $solver.next_sibling($child); $solver.node_layout_params($child).disabled; $body);
-    }};
-}
-
-/// Per-node data used by the layout solver.
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct NodeLayoutData {
-    // Traversal reads the flags, placement work, cached style, and Final sizes
-    // together. Keep those fields ahead of the dependency levels and ticket.
-    /// The state of every slot.
-    pub(crate) flags: NodeFlags,
-    #[cfg(feature = "incremental")]
-    pub(crate) placement: PlacementWork,
-    #[cfg(feature = "incremental")]
-    pub(crate) structural_change: StructuralChange,
-    // Prepared from live declarations only for the owned tree. Declaration and
-    // inherited visibility changes clear it along with the fixed-pixel marker.
-    #[cfg(feature = "incremental")]
-    fixed_leaf_summary: FixedLeafSummary,
-    /// The value of every slot. Mapped by `slot_index()`.
-    pub(crate) values: [f32; N_SLOTS],
-    /// A grid item's two cell coordinates, or a wrap item's line metric.
-    parent_flow: [u32; 2],
-    /// How many children aren't free-placement.
-    pub(crate) n_placed_children: u32,
-    /// The dependency level of every slot. Mapped by `slot_index()`.
-    /// 
-    /// The "level" is the longest chain of dependencies of dependencies flowing into a slot. This is used for efficient incremental relayout.
-    #[cfg(feature = "incremental")]
-    pub(crate) levels: [u16; N_SLOTS],
-    // Identifies this record in a custom adapter's last solved topology.
-    #[cfg(feature = "incremental")]
-    pub(crate) topology_index: u64,
-}
-
-#[cfg(feature = "incremental")]
-#[inline]
-fn fixed_leaf_summary(params: &LayoutParams) -> FixedLeafSummary {
-    if params.free_placement {
-        fixed_leaf_cache::record(true, false, false)
-    } else {
-        let spans = params.grid_span.x > 1 || params.grid_span.y > 1;
-        let simple_start = params.position == Xy::new_symm(Pos::Start)
-            && params.margin == Xy::new_symm([Margin::ZERO; 2]);
-        fixed_leaf_cache::record(false, spans, simple_start)
-    }
-}
-
 impl NodeLayoutData {
-    #[cfg(feature = "incremental")]
-    const FIXED_REGISTERED_FLAGS: u32 = {
-        assert!(slot_index(X, Kind::Regular) == 0 && slot_index(Y, Kind::Regular) == 1
-            && slot_index(X, Kind::Final) == 2 && slot_index(Y, Kind::Final) == 3);
-        assert!(SOLVED < 4 && NodeFlags::FIXED_LEAF & 0xff == 0);
-        fixed_leaf_cache::registered_flags(NodeFlags::FIXED_LEAF, SOLVED)
-    };
-
-    /// Creates a new empty [`NodeLayoutData`].
-    pub const fn new() -> Self {
-        NodeLayoutData {
-            #[cfg(feature = "incremental")]
-            topology_index: 0,
-            #[cfg(feature = "incremental")]
-            structural_change: StructuralChange::Clean,
-            #[cfg(feature = "incremental")]
-            placement: PlacementWork::Clean,
-            #[cfg(feature = "incremental")]
-            fixed_leaf_summary: FixedLeafSummary::EMPTY,
-            values: EMPTY_VALUES,
-            flags: NodeFlags::EMPTY,
-            #[cfg(feature = "incremental")]
-            levels: [0; N_SLOTS],
-            n_placed_children: 0,
-            parent_flow: wrap_metrics::INITIAL_WORDS,
-        }
-    }
-
-    #[cfg(feature = "incremental")]
-    pub(crate) fn forget_fixed_pixels(&mut self) {
-        fixed_leaf_cache::invalidate(&mut self.flags.0, NodeFlags::FIXED_LEAF, &mut self.fixed_leaf_summary);
-    }
-
-    // LayoutTree clears the marker on every declaration change, even with a full
-    // solve pending. The caller has also checked that this is still an ordinary leaf.
-    #[cfg(feature = "incremental")]
-    #[inline]
-    fn reuse_registered_pixels(&mut self) -> bool {
-        fixed_leaf_cache::reuse_registered(self.flags.0, Self::FIXED_REGISTERED_FLAGS, &self.parent_flow,
-            &mut self.structural_change)
-    }
-
     #[cfg(feature = "incremental")]
     #[inline]
     pub(crate) fn cached_stack_start(&self) -> bool {
@@ -297,103 +79,16 @@ impl NodeLayoutData {
     }
 
     /// Initializes independent pixel slots and returns whether both final sizes are ready.
+    #[cfg(any(feature = "incremental", test))]
     #[inline(always)]
     fn seed_pixels(&mut self, params: &LayoutParams, block_item: bool, width_grid_axis: Option<Axis>) -> bool {
-        let mut both_axes_fixed = true;
-        for axis in [X, Y] {
-            let Size::Pixels(pixels) = params.size[axis] else {
-                both_axes_fixed = false;
-                continue;
-            };
-            self.publish_slot(slot_index(axis, Kind::Regular), pixels);
-            if cycle_rules::ready_pixel_finals(
-                pixels.is_finite(), params.min_size[axis].is_some(), params.max_size[axis].is_some(),
-                block_item, width_grid_axis == Some(axis),
-            )
-            {
-                let final_size = slot_index(axis, Kind::Final);
-                self.publish_slot(final_size, pixels);
-                #[cfg(feature = "incremental")]
-                {
-                    // A pixel value has no dependencies, and Final reads only Regular.
-                    self.levels[final_size] = 1;
-                }
-            } else {
-                both_axes_fixed = false;
-            }
-        }
-        both_axes_fixed
+        prepare_nodes::seed_pixels::<RustFloat>(self, params, block_item, width_grid_axis)
     }
 
-    /// Resolve a leaf's cross-axis Fill or Frac against its stack’s fixed inner
-    /// extent. Its own aspect ratio can read that result without visiting the parent.
+    #[cfg(test)]
     #[inline]
-    fn seed_stack_leaf(&mut self, params: &LayoutParams, cross: Axis, inner_cross: f32) -> bool {
-        if params.min_size[cross].is_some() || params.max_size[cross].is_some() { return false; }
-        let cross_size = match params.size[cross] {
-            Size::Fill => {
-                let [start, end] = margins(params, cross);
-                let margin = start + end;
-                if margin == 0.0 || params.free_placement { inner_cross } else { (inner_cross - margin).max(0.0) }
-            }
-            Size::Frac(fraction) => inner_cross * fraction,
-            _ => return false,
-        };
-        if !cross_size.is_finite() { return false; }
-        // The parent's pixel Regular and Final have levels zero and one.
-        self.seed_unbounded_axis(cross, cross_size, 2);
-        let main = cross.other();
-        if let Size::AspectRatio(ratio) = params.size[main]
-            && params.min_size[main].is_none() && params.max_size[main].is_none()
-        {
-            let size = if main == X { cross_size * ratio } else { cross_size / ratio };
-            if size.is_finite() { self.seed_unbounded_axis(main, size, 4); }
-        }
-        self.flags.check_state(main, Kind::Final) == SOLVED
-    }
-
-    #[inline]
-    fn seed_unbounded_axis(&mut self, axis: Axis, size: f32, _regular_level: u16) {
-        self.publish_axis(axis, size, size, _regular_level);
-    }
-
-    #[inline(always)]
-    fn publish_slot(&mut self, index: usize, value: f32) {
-        cycle_rules::publish_finished_slot(&mut self.flags.0, &mut self.values[index], index as u32, value);
-    }
-
-    #[inline(always)]
-    fn publish_axis(&mut self, axis: Axis, regular: f32, resolved: f32, _regular_level: u16) {
-        let regular_index = slot_index(axis, Kind::Regular);
-        let final_index = slot_index(axis, Kind::Final);
-        cycle_rules::publish_finished_pair(
-            &mut self.flags.0, &mut self.values, (regular_index, regular), (final_index, resolved),
-        );
-        #[cfg(feature = "incremental")]
-        dependency_rules::publish_levels(&mut self.levels, regular_index, final_index, _regular_level);
-    }
-
-    #[inline]
-    fn reset_fixed_leaf(&mut self, mut prepared: Self) {
-        prepared.flags.0 |= NodeFlags::FIXED_LEAF;
-        // A fallback can occur between updating Regular and Final. Compare all four
-        // slots, including the sign of zero. Grid and wrap may have set parent_flow.
-        let pixel_bits = |data: &Self| {
-            [slot_index(X, Kind::Regular), slot_index(Y, Kind::Regular),
-             slot_index(X, Kind::Final), slot_index(Y, Kind::Final)].map(|i| data.values[i].to_bits())
-        };
-        if self.flags == prepared.flags && self.parent_flow == [0; 2] && pixel_bits(self) == pixel_bits(&prepared) {
-            #[cfg(feature = "incremental")]
-            if self.fixed_leaf_summary != prepared.fixed_leaf_summary {
-                self.fixed_leaf_summary = prepared.fixed_leaf_summary;
-            }
-            #[cfg(feature = "incremental")]
-            if self.structural_change != StructuralChange::Clean {
-                self.structural_change = StructuralChange::Clean;
-            }
-            return;
-        }
-        *self = prepared;
+    fn reset_fixed_leaf(&mut self, prepared: Self) {
+        prepare_nodes::install_fixed::<RustFloat>(self, prepared);
     }
 
     /// The live declaration proves these four slots independent if both pixel sizes
@@ -403,175 +98,18 @@ impl NodeLayoutData {
         if params.disabled || !matches!(params.children_layout, ChildrenLayout::Free | ChildrenLayout::Stack { .. }) { return None; }
         let mut data = Self::new();
         if !data.seed_pixels(params, false, None) { return None; }
-        for axis in [X, Y] {
-            for kind in [Kind::Regular, Kind::Final] {
-                let slot = slot_index(axis, kind);
-                if self.flags.check_state(axis, kind) != SOLVED || self.values[slot].to_bits() != data.values[slot].to_bits() {
-                    return None;
-                }
-            }
-        }
+        if !cycle_rules::same_solved_pixels(self.flags.0, &self.values, &data.values) { return None; }
         if leaf {
             data.flags.0 |= NodeFlags::FIXED_LEAF;
         }
         Some(data)
     }
 
-    /// Carry forward only slots whose entire dependency chain stays inside this leaf.
-    /// The parent can change the space available on either axis, or the leaf's grid
-    /// cell or wrap line, without changing any of these values or dependency levels.
-    #[cfg(feature = "incremental")]
-    fn retain_leaf_slots(&mut self, old: &Self, params: &LayoutParams) -> u32 {
-        let block_context = NodeFlags::BLOCK_ITEM | NodeFlags::BLOCK_PARENT_AUTO_HEIGHT;
-        if !matches!(old.structural_change, StructuralChange::Clean | StructuralChange::Moved)
-            || old.n_placed_children != 0
-            || old.flags.has_cycle() || (old.flags.0 ^ self.flags.0) & block_context != 0
-            || old.flags.check_state(X, Kind::Final) != SOLVED || old.flags.check_state(Y, Kind::Final) != SOLVED
-        {
-            return 0;
-        }
-        let declarations = |axis| [Some(params.size[axis]), params.min_size[axis], params.max_size[axis]];
-        let block_item = self.flags.is_block_item();
-        let input = |axis, kind, size: Size| {
-            let form = match size {
-                Size::Auto if axis == X && kind == Kind::Regular && block_item => Form::Fill,
-                Size::Auto => Form::Intrinsic,
-                size => size.dependency_form(),
-            };
-            leaf_retention::input(form, form == Form::Intrinsic && params.intrinsic_reads_other_axis(axis))
-        };
-        // At most one cross-axis step can close an acyclic dependency inside a leaf.
-        let independent = |axis| {
-            DECLARED_SIZES.into_iter().zip(declarations(axis)).all(|(kind, size)| {
-                size.is_none_or(|size| input(axis, kind, size).stable(false))
-            })
-        };
-        let independent = Xy::new(independent(X), independent(Y));
-        let mut retained = 0;
-        for axis in [X, Y] {
-            let mut all_local = true;
-            for (kind, size) in DECLARED_SIZES.into_iter().zip(declarations(axis)) {
-                let Some(size) = size else { continue };
-                let stable = input(axis, kind, size).stable(independent[axis.other()]);
-                if stable && old.flags.check_state(axis, kind) == SOLVED {
-                    retained += self.retain_slot(old, axis, kind);
-                } else {
-                    all_local = false;
-                    if matches!(size, Size::FitContent | Size::Auto) && params.intrinsic_reads_other_axis(axis)
-                        && !params.intrinsic_reads_other_axis(axis.other())
-                        && !(size == Size::Auto && axis == X && kind == Kind::Regular && block_item)
-                        && old.flags.check_state(axis, kind) == SOLVED
-                    {
-                        // This leaf only ever needs one opposite-axis constraint. Check it
-                        // after the new grid cells, fill shares or wrap lines are known.
-                        self.values[slot_index(Y, Kind::Flow)] = old.values[slot_index(axis.other(), Kind::Final)];
-                        let index = slot_index(axis, kind);
-                        self.values[index] = old.values[index];
-                        self.flags.set_state(axis, kind, CHECK_INTRINSIC);
-                    }
-                }
-            }
-            // Leave warning-producing Final slots to the solver so it emits them again.
-            if all_local && old.values[slot_index(axis, Kind::Final)].is_finite()
-                && old.values[slot_index(axis, Kind::Min)] <= old.values[slot_index(axis, Kind::Max)]
-            {
-                retained += self.retain_slot(old, axis, Kind::Final);
-            }
-        }
-        retained
-    }
-
-    #[cfg(feature = "incremental")]
-    fn retain_slot(&mut self, old: &Self, axis: Axis, kind: Kind) -> u32 {
-        if self.flags.check_state(axis, kind) == SOLVED { return 0; }
-        let index = slot_index(axis, kind);
-        self.publish_slot(index, old.values[index]);
-        self.levels[index] = old.levels[index];
-        1
-    }
-
-    /// A common fill item needs only its parent's new share. Keep its measured
-    /// cross-axis slots in place as we invalidate the two slots that read the share.
-    #[cfg(feature = "incremental")]
-    fn reset_intrinsic_fill_leaf(&mut self, intrinsic: Axis) -> bool {
-        let solved_axis = |axis| (SOLVED << (2 * slot_index(axis, Kind::Regular)))
-            | (SOLVED << (2 * slot_index(axis, Kind::Final)));
-        if self.structural_change != StructuralChange::Clean
-            || self.flags.0 & !NodeFlags::WRAP_LINE_START != (solved_axis(X) | solved_axis(Y))
-            || self.n_placed_children != 0 || !self.values[slot_index(intrinsic, Kind::Final)].is_finite()
-        {
-            return false;
-        }
-        self.flags = NodeFlags(solved_axis(intrinsic));
-        self.parent_flow = wrap_metrics::INITIAL_WORDS;
-        for kind in [Kind::Regular, Kind::Final] {
-            let index = slot_index(intrinsic.other(), kind);
-            self.values[index] = 0.0;
-            self.levels[index] = 0;
-        }
-        true
-    }
-
-    pub(crate) fn size(&self) -> Xy<f32> {
-        let values = &self.values;
-        Xy::new(values[slot_index(X, Kind::Final)], values[slot_index(Y, Kind::Final)])
-    }
-
-    pub(crate) fn grid_cell(&self) -> Xy<f32> {
-        let (x, y) = grid_state::published_cell(self.parent_flow);
-        Xy::new(f32::from_bits(x), f32::from_bits(y))
-    }
-
-    fn set_grid_cell(&mut self, main: Axis, position: usize, line: u64) {
-        self.parent_flow = grid_state::physical_pair(
-            (position as f32).to_bits(), (line as f32).to_bits(), main == Y,
-        );
-    }
-
-    // Grids use neither the stack EvenShare slot nor the block/wrap Flow slot.
-    // They hold the track dimensions until sizing and placement consume them.
-    fn set_grid_lines(&mut self, lines: Xy<f32>) {
-        grid_state::publish_tracks(
-            &mut self.values, slot_index(X, Kind::EvenShare), slot_index(Y, Kind::Flow), (lines.x, lines.y),
-        );
-    }
-
-    pub(crate) fn grid_lines(&self) -> Xy<f32> {
-        let (x, y) = grid_state::published_tracks(
-            &self.values, slot_index(X, Kind::EvenShare), slot_index(Y, Kind::Flow),
-        );
-        Xy::new(x, y)
-    }
-
-    #[cfg(feature = "incremental")]
-    pub(crate) fn grid_line_bits(&self) -> (u32, u32) {
-        let lines = self.grid_lines();
-        (lines.x.to_bits(), lines.y.to_bits())
-    }
-
-    pub(crate) fn block_margin_index(&self) -> Option<usize> {
-        if self.flags.0 & NodeFlags::BLOCK_CONTAINER == 0 {
-            return None;
-        }
-        margin_storage::margin_index(self.values[slot_index(X, Kind::EvenShare)].to_bits())
-    }
-
-    #[cfg(feature = "incremental")]
-    pub(crate) fn set_block_margin_index(&mut self, index: usize) {
-        self.set_block_margin_word(margin_storage::margin_word(index));
-    }
-
-    fn set_block_margin_word(&mut self, word: u32) {
-        self.values[slot_index(X, Kind::EvenShare)] = f32::from_bits(word);
-    }
-
+    #[cfg(all(test, feature = "incremental"))]
     fn wrap_line_metric(&self, kind: wrap_metrics::Metric) -> f32 {
         f32::from_bits(wrap_metrics::read_metric(&self.parent_flow, kind))
     }
 
-    pub(crate) fn set_wrap_metric(&mut self, kind: wrap_metrics::Metric, bits: u32) {
-        wrap_metrics::store_metric(&mut self.parent_flow, kind, bits);
-    }
 }
 
 impl Default for NodeLayoutData {
@@ -580,219 +118,149 @@ impl Default for NodeLayoutData {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct RetainedSizing {
+impl<T: Solve + ?Sized> prepare_nodes::StartActions for T {
     #[cfg(feature = "incremental")]
-    slots: u32,
-    #[cfg(feature = "incremental")]
-    blocks: usize,
-    /// Ordinary leaves solve exactly their declared bounds in addition to Regular and Final.
-    #[cfg(feature = "incremental")]
-    leaf_bounds: u32,
-    #[cfg(feature = "incremental")]
-    inspect_descendants: bool,
-}
+    type LeafMemory = RustVec;
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PrepareFrame<I> {
-    node: I,
-    next: Option<I>,
-    retain: bool,
-    children_layout: ChildrenLayout,
-    block_parent: Option<bool>,
-    block_children: Option<bool>,
-    stack_axis: Option<Axis>,
-    spacing: f32,
-    pixel_fit_axis: Option<Axis>,
-    extent: f32,
-    fixed_cross: Option<(Axis, f32)>,
-    n_placed_children: u32,
-    n_nodes: u32,
-    flags: u32,
-}
-
-impl<I> PrepareFrame<I> {
-    #[inline]
-    fn include_child(&mut self, params: &LayoutParams, child_nodes: u32, needs_solve: bool) {
-        self.n_nodes = cycle_rules::add_count(self.n_nodes, child_nodes);
-        if needs_solve {
-            self.flags |= NodeFlags::DESCENDANTS_NEED_SOLVE;
-        }
-        if let Some(axis) = self.pixel_fit_axis && !params.disabled && !params.free_placement {
-            if let Size::Pixels(size) = params.size[axis]
-                && params.min_size[axis].is_none() && params.max_size[axis].is_none()
-            {
-                let [start, end] = margins(params, axis);
-                let child_extent = with_margin(size, start + end);
-                self.extent = if Some(axis) == self.stack_axis {
-                    self.extent + child_extent
-                } else {
-                    self.extent.max(child_extent)
-                };
-            } else {
-                self.pixel_fit_axis = None;
-            }
-        }
-        summarize_child(params, &mut self.n_placed_children, &mut self.flags);
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn packed_stack_leaves(&mut self) -> &mut crate::packed_stack_leaf::PackedStackLeaves<Self::Id> {
+        &mut self.layout_data().packed_stack_leaves
     }
-}
 
-pub(crate) enum Prepare<I> {
-    Done(u32, bool),
-    Children(PrepareFrame<I>),
-}
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn stack_leaf_hint(&mut self) -> Option<u32> {
+        #[cfg(feature = "batch-pilot")]
+        let first = self.first_stack_population_hint();
+        #[cfg(not(feature = "batch-pilot"))]
+        let first = 0;
+        let data = self.layout_data();
+        let hint = data.n_nodes_solved.max(first);
+        data.pixel_scale.is_none().then_some(hint)
+    }
 
-#[cfg(feature = "incremental")]
-struct BranchCacheAccess<'a, T: ?Sized> {
-    tree: &'a mut T,
-    counts: &'a mut SubtreeCounts,
-}
+    #[inline(always)]
+    fn warn_both_axes_ratio(&mut self, node: Self::Id) {
+        self.warn(LayoutWarning::AspectRatioOnBothAxes { node });
+    }
 
-#[cfg(feature = "incremental")]
-impl<T: Solve + ?Sized> retained_branch::CacheModel for BranchCacheAccess<'_, T> {
-    type Id = T::NodeId;
-}
+    #[cfg(feature = "incremental")]
+    fn known_width_grid(&mut self, node: Self::Id) -> Option<crate::prepare_frame::KnownStack> {
+        let parent = self.parent(node)?;
+        if self.parent(parent).is_some() { return None; }
+        let window = self.layout_data().window_size;
+        grid_width::preview::<RustFloat, grid_state::RustWidthRounding>(
+            self.node_layout_params(node), self.node_layout_params(parent), window,
+        )
+    }
 
-#[cfg(feature = "incremental")]
-impl<T: Solve + ?Sized> retained_branch::BranchCache for BranchCacheAccess<'_, T> {
+    #[cfg(feature = "incremental")]
     #[inline]
-    fn status(&self, node: Self::Id) -> retained_branch::CachedBranch {
-        use retained_branch::CachedBranch;
-        let data = self.tree.node_layout_data(node);
-        if !region_policy::clean_branch_root(data.structural_change, data.flags.has_cycle()) {
-            return CachedBranch::Reject;
+    fn finish_prepared_axis(&mut self, node: Self::Id, axis: Axis) {
+        let params = self.node_layout_params(node);
+        if !matches!(params.children_layout, ChildrenLayout::Free) || !matches!(params.size[axis], Size::FitContent) {
+            self.solve_slot(node, axis, Kind::Final);
+            return;
         }
-        if self.tree.node_layout_params(node).disabled {
-            return CachedBranch::Hidden;
-        }
-        if data.flags.check_state(X, Kind::Final) == SOLVED && data.flags.check_state(Y, Kind::Final) == SOLVED {
-            CachedBranch::Ready
+        let read_opposite = params.intrinsic_reads_other_axis(axis);
+        let data = self.node_layout_data(node);
+        let index = slot_index(axis, Kind::Regular);
+        let (value, rank) = if data.flags.check_state(axis, Kind::Regular) == SOLVED {
+            (data.values[index], data.levels[index])
         } else {
-            CachedBranch::Reject
-        }
+            let rank = if read_opposite { data.levels[slot_index(axis.other(), Kind::Final)].saturating_add(1) } else { 0 };
+            let slot = sizing_requests::target(node, axis == Y, Kind::Regular);
+            let value = sizing_finish::intrinsic_content(&mut SizingFinisher { tree: self, retain_grid_cells: false }, slot, 0.0, 0.0);
+            (value, rank)
+        };
+        if !value.is_finite() { self.warn(LayoutWarning::NotFinite { node, axis }); }
+        self.node_layout_data_mut(node).publish_axis(axis, value, value, rank);
     }
 
-    #[inline]
-    fn first(&self, node: Self::Id) -> Option<Self::Id> {
-        self.tree.first_child(node)
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn note_flow(&mut self, has_flow: bool) { self.layout_data().has_flow |= has_flow; }
+
+    fn assign_fixed_grid(&mut self, node: Self::Id, columns: u32, axis: Axis, backfill: bool) {
+        self.assign_grid_cells(node, columns as usize, columns as f32, axis, backfill);
     }
 
-    #[inline]
-    fn next(&self, node: Self::Id) -> Option<Self::Id> {
-        self.tree.next_sibling(node)
-    }
-
-    #[inline]
-    fn include(&mut self, node: Self::Id) {
-        self.counts.include(self.tree.node_layout_data(node).flags);
-    }
-
-    #[inline]
-    fn dirty_children(&mut self, node: Self::Id) {
-        self.tree.node_layout_data_mut(node).mark_children_changed();
+    #[inline(always)]
+    fn prepare_scratch(&mut self) -> &mut Vec<(crate::prepare_frame::PrepareFrame<Self::Id>, Self::Id)> {
+        &mut self.layout_data().prepare_stack
     }
 }
 
-/// A `Fill` child of a stack, in `solve_even_share`.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct FillChild {
-    min: f32,
-    max: f32,
-    weight: f32,
+impl<T: Solve + ?Sized> sizing_pass::Access for T {
+    type Margin = BlockMargins;
+
+    #[inline(always)]
+    fn root_id(&self) -> Self::Id { self.root() }
+
+    #[inline(always)]
+    fn sizing_window(&mut self) -> &mut Xy<f32> { &mut self.layout_data().window_size }
+
+    #[inline(always)]
+    fn margins(&mut self) -> &mut Vec<Self::Margin> { &mut self.layout_data().block_margins }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn margin_scratch(&mut self) -> &mut Vec<Self::Margin> { &mut self.layout_data().margin_scratch }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn sizing_flags(&mut self) -> (&mut bool, &mut bool, &mut Option<IncrementalRelayoutOutcome>) {
+        let data = self.layout_data();
+        (&mut data.has_cycle, &mut data.has_flow, &mut data.pending_full_solve)
+    }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn prepared_nodes(&mut self) -> &mut u32 { &mut self.layout_data().n_nodes_solved }
+
+    #[inline(always)]
+    fn slot(&mut self, node: Self::Id, axis: Axis, kind: Kind) { self.solve_slot(node, axis, kind); }
+
+    #[inline(always)]
+    fn fill_children(&mut self, node: Self::Id) -> bool { self.solve_fill_items(node) }
+
+    #[inline(always)]
+    fn parent_id(&self, node: Self::Id) -> Option<Self::Id> { self.parent(node) }
+
+    #[inline(always)]
+    fn same_id(&self, left: Self::Id, right: Self::Id) -> bool { left == right }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn ones(word: u32) -> u32 { word.count_ones() }
 }
 
-impl FillChild {
-    fn new(content: Option<f32>, min: Option<f32>, max: Option<f32>, capped_by_content: bool, weight: f32) -> Self {
-        // f32::min/max ignore a NaN bound. Fold the intrinsic constraint into the
-        // interval once, preserving the declared minimum's precedence over the maximum.
-        // If a target is NaN, its violation (size minus target) is NaN for any size
-        // and the distribution loop can never freeze that child.
-        let mut min = min.unwrap_or(f32::NAN);
-        let mut max = max.unwrap_or(f32::NAN);
-        if let Some(content) = content.filter(|value| !value.is_nan()) {
-            if capped_by_content {
-                max = max.min(content);
-            } else {
-                min = min.max(content.min(max));
-            }
-        }
-        Self { min, max, weight }
+impl<T: Solve + ?Sized> sizing_fill::Access for T {
+    #[inline(always)]
+    fn declaration(&self, node: Self::Id, axis: Axis, kind: Kind) -> Option<Size> {
+        self.read_size(node, axis, kind)
     }
 
-    fn size(&self, target: f32) -> f32 {
-        // An absent bound is NaN, so its comparison is false. A NaN target
-        // produces a NaN violation and never freezes.
-        let capped = if self.max < target { self.max } else { target };
-        if self.min > capped { self.min } else { capped }
-    }
-
-    #[inline]
-    fn resolve(self, share: f32) -> (f32, f32) {
-        let target = share * self.weight;
-        let size = self.size(target);
-        (size, size - target)
+    #[inline(always)]
+    fn bounded_share(&mut self, axis: Axis, budget: f32, first: Option<Self::Id>) -> f32 {
+        self.distribute_fill(axis, budget, first, None)
     }
 }
 
-const MAX_FIT_STACK_FRAC: f32 = 0.999;
-const MAX_FIT_STACK_STEPS: usize = 64;
-const FIT_STACK_EPSILON: f32 = 1e-6;
-const EVEN_SHARE_EPSILON: f32 = 1e-3;
+pub(crate) use fill_compaction::FillChild;
+#[cfg(test)]
+use fill_compaction::resolve_fill_share;
 
+#[cfg(test)]
 #[inline(always)]
 fn clamp(size: f32, min: Option<f32>, max: Option<f32>) -> f32 {
-    let size = max.map_or(size, |max| size.min(max));
-    min.map_or(size, |min| size.max(min))
+    sizing_finish::clamp::<crate::placement_geometry::RustFloat>(size, min, max)
 }
 
 #[inline(always)]
 fn inner(size: f32, padding: f32) -> f32 {
-    (size - padding).max(0.0)
-}
-
-#[derive(Clone, Copy)]
-struct GridTrack {
-    count: f32,
-    cell: f32,
-    spacing: f32,
-}
-
-impl GridTrack {
-    #[inline]
-    fn new(inner: f32, n: f32, spacing: f32) -> Self {
-        let count = n.max(1.0);
-        let cell = ((inner - spacing * (n - 1.0)) / count).max(0.0);
-        Self { count, cell, spacing }
-    }
-
-    #[inline]
-    fn extent(self, span: u16) -> f32 {
-        let span = f32::from(span.max(1)).min(self.count);
-        span * self.cell + (span - 1.0) * self.spacing
-    }
-}
-
-#[inline]
-fn fill_inside_margins(size: f32, params: &LayoutParams, axis: Axis) -> f32 {
-    let [start, end] = margins(params, axis);
-    let margin = start + end;
-    if margin == 0.0 { size } else { (size - margin).max(0.0) }
-}
-
-#[inline(always)]
-fn summarize_child(params: &LayoutParams, n_placed: &mut u32, flags: &mut u32) {
-    if !params.disabled && !params.free_placement {
-        *n_placed = cycle_rules::add_count(*n_placed, 1);
-        if params.size.x.is_flex() {
-            *flags |= NodeFlags::FLEX_CHILD_X;
-        }
-        if params.size.y.is_flex() {
-            *flags |= NodeFlags::FLEX_CHILD_Y;
-        }
-        if params.grid_span.x > 1 || params.grid_span.y > 1 {
-            *flags |= NodeFlags::GRID_SPANS;
-        }
-    }
+    sizing_finish::inner::<RustFloat>(size, padding)
 }
 
 pub(crate) trait Solve: TreeAdapter {
@@ -802,45 +270,21 @@ pub(crate) trait Solve: TreeAdapter {
         self.traversal_next(self.root(), i, !self.node_layout_params(i).disabled)
     }
 
+    #[cfg(feature = "incremental")]
     #[inline(always)]
     fn traversal_next(&self, root: Self::NodeId, i: Self::NodeId, descend: bool) -> Option<Self::NodeId> {
-        crate::tree_walk::next(
-            i, descend, |node| self.first_child(node), |node| self.next_sibling(node),
-            |node| self.parent(node), |node| node == root,
-        )
+        let child = if descend { self.first_child(i) } else { None };
+        crate::tree_walk::next_forward(self, root, i, child)
     }
 
     #[inline(always)]
     fn read_size(&self, i: Self::NodeId, axis: Axis, kind: Kind) -> Option<Size> {
-        let node = self.node_layout_params(i);
-        let size = match kind {
-            Kind::Min => node.min_size[axis],
-            Kind::Max => node.max_size[axis],
-            Kind::Regular => Some(node.size[axis]),
-            Kind::Final | Kind::EvenShare | Kind::Flow => unreachable!(),
-        };
-        match size {
-            Some(Size::Auto) => {
-                let inline = axis == X && kind == Kind::Regular;
-                let block_item = inline && self.node_layout_data(i).flags.is_block_item();
-                Some(if block_schedule::inline_auto(axis == X, kind == Kind::Regular, block_item) {
-                    Size::Fill
-                } else {
-                    Size::FitContent
-                })
-            }
-            Some(size) if axis == Y && size.is_flex()
-                && block_schedule::flex_uses_content_height(
-                    true, true, self.node_layout_data(i).flags.0 & NodeFlags::BLOCK_PARENT_AUTO_HEIGHT != 0,
-                ) => (kind == Kind::Regular).then_some(Size::FitContent),
-            size => size,
-        }
+        sizing_requests::read_declaration(self, sizing_requests::target(i, axis == Y, kind))
     }
 
     #[inline(always)]
     fn any_size_is_fill(&self, i: Self::NodeId, axis: Axis) -> bool {
-        let is_fill = |size: Option<Size>| size.is_some_and(|size| size.is_fill());
-        is_fill(self.read_size(i, axis, Kind::Regular)) || is_fill(self.read_size(i, axis, Kind::Min)) || is_fill(self.read_size(i, axis, Kind::Max))
+        sizing_child::any_fill(self, i, axis == Y)
     }
 
     #[inline(always)]
@@ -864,353 +308,15 @@ pub(crate) trait Solve: TreeAdapter {
     }
 
     #[cfg(feature = "incremental")]
-    #[inline(always)]
-    fn is_in_stack(&self, i: Self::NodeId, axis: Axis) -> bool {
-        self.stack_parent(i, axis).is_some()
-    }
-
-    #[cfg(feature = "incremental")]
     fn size_depends_on_children(&self, i: Self::NodeId) -> bool {
         [X, Y].into_iter().any(|axis| DECLARED_SIZES.into_iter().any(|kind| {
             self.read_size(i, axis, kind).is_some_and(|size| size.dependency_form().reads_children())
         }))
     }
 
-    /// Updates child counts and flags in one sibling scan when their sizes are independent.
-    #[cfg(feature = "incremental")]
-    fn try_refresh_independent_parent(&mut self, i: Self::NodeId) -> bool {
-        let data = self.node_layout_data(i);
-        // An enclosing block's margin collapse can depend on this item's child count.
-        let block_item = data.flags.is_block_item();
-        let finals_solved = [X, Y].into_iter().all(|axis| data.flags.check_state(axis, Kind::Final) == SOLVED);
-        let reads_children = !block_item && finals_solved && self.size_depends_on_children(i);
-        if !region_policy::can_refresh(block_item, finals_solved, reads_children) {
-            return false;
-        }
-        let stack = match self.node_layout_params(i).children_layout {
-            ChildrenLayout::Free => None,
-            ChildrenLayout::Stack { axis, .. } if data.flags.check_state(axis, Kind::EvenShare) == UNSOLVED => Some(axis),
-            _ => return false,
-        };
-        let mut n_placed = 0;
-        let mut next = self.first_child(i);
-        let mut flags = if next.is_some() { NodeFlags::DESCENDANTS_NEED_SOLVE } else { 0 };
-        while let Some(child) = next {
-            next = self.next_sibling(child);
-            let params = self.node_layout_params(child);
-            // Stack shares and the space available to percentages depend on siblings.
-            if let Some(axis) = stack && region_policy::stack_reads_child_list(
-                !params.disabled, !params.free_placement,
-                params.size[axis].is_flex() || params.min_size[axis].is_some_and(|size| size.is_flex())
-                    || params.max_size[axis].is_some_and(|size| size.is_flex()),
-            )
-            {
-                return false;
-            }
-            summarize_child(params, &mut n_placed, &mut flags);
-        }
-        let data = self.node_layout_data_mut(i);
-        data.flags.0 &= !(NodeFlags::FLEX_CHILD_X | NodeFlags::FLEX_CHILD_Y | NodeFlags::GRID_SPANS
-            | NodeFlags::DESCENDANTS_NEED_SOLVE | NodeFlags::FIXED_LEAF);
-        data.flags.0 |= flags;
-        data.n_placed_children = n_placed;
-        true
-    }
-
-    #[inline]
-    fn prepare_leaf<const RETAIN: bool, const REGISTERED_PIXELS: bool>(&mut self, child: Self::NodeId, fixed_cross: Option<(Axis, f32)>, _retained: &mut RetainedSizing) -> bool {
-        #[cfg(feature = "incremental")]
-        if REGISTERED_PIXELS && self.node_layout_data_mut(child).reuse_registered_pixels() {
-            if self.node_layout_data(child).fixed_leaf_summary.is_empty() {
-                let summary = fixed_leaf_summary(self.node_layout_params(child));
-                self.node_layout_data_mut(child).fixed_leaf_summary = summary;
-            }
-            return true;
-        }
-        #[cfg(feature = "incremental")]
-        if RETAIN {
-            let params = self.node_layout_params(child);
-            let intrinsic = match params.size {
-                Xy { x: Size::FitContent, y: Size::Fill } => Some(X),
-                Xy { x: Size::Fill, y: Size::FitContent } => Some(Y),
-                _ => None,
-            };
-            if let Some(axis) = intrinsic && !params.intrinsic_reads_other_axis(axis)
-                && params.min_size == Xy::new_symm(None) && params.max_size == Xy::new_symm(None)
-                && self.node_layout_data_mut(child).reset_intrinsic_fill_leaf(axis)
-            {
-                _retained.slots = cycle_rules::add_count(_retained.slots, 2);
-                return false;
-            }
-            if !_retained.inspect_descendants {
-                let p = self.node_layout_params(child);
-                for axis in [X, Y] {
-                    let bounds = u32::from(p.min_size[axis].is_some()) + u32::from(p.max_size[axis].is_some());
-                    _retained.leaf_bounds = cycle_rules::add_count(_retained.leaf_bounds, bounds);
-                }
-            }
-        }
-        let params = self.node_layout_params(child);
-        let mut data = NodeLayoutData::new();
-        if data.seed_pixels(params, false, None) {
-            #[cfg(feature = "incremental")]
-            if REGISTERED_PIXELS {
-                data.fixed_leaf_summary = fixed_leaf_summary(params);
-            }
-            self.node_layout_data_mut(child).reset_fixed_leaf(data);
-            return true;
-        }
-        #[cfg(feature = "incremental")]
-        if RETAIN {
-            let slots = data.retain_leaf_slots(self.node_layout_data(child), params);
-            _retained.slots = cycle_rules::add_count(_retained.slots, slots);
-        }
-        let ready = fixed_cross.is_some_and(|(axis, inner)| data.seed_stack_leaf(params, axis, inner));
-        *self.node_layout_data_mut(child) = data;
-        ready
-    }
-
+    #[cfg(test)]
     fn prepare<const RETAIN: bool, const REGISTERED_PIXELS: bool>(&mut self, i: Self::NodeId, block_parent: Option<bool>, retained: &mut RetainedSizing) -> (u32, bool) {
-        let mut work = self.begin_prepare::<RETAIN>(i, block_parent, retained);
-        let mut parents = work_stack::work_stack::<_, 8>(std::mem::take(&mut self.layout_data().prepare_stack));
-        loop {
-            let mut frame = match work {
-                Prepare::Done(nodes, needs_solve) => {
-                    let Some((mut frame, child)) = parents.pop() else {
-                        self.layout_data().prepare_stack = parents.into_spill();
-                        return (nodes, needs_solve);
-                    };
-                    frame.include_child(self.node_layout_params(child), nodes, needs_solve);
-                    frame
-                }
-                Prepare::Children(frame) => frame,
-            };
-            while let Some(child) = frame.next {
-                frame.next = self.next_sibling(child);
-                let prepared = if RETAIN && frame.retain {
-                    self.prepare_direct_child::<true, REGISTERED_PIXELS>(&mut frame, child, retained)
-                } else {
-                    self.prepare_direct_child::<false, REGISTERED_PIXELS>(&mut frame, child, retained)
-                };
-                if prepared {
-                    continue;
-                }
-                #[cfg(feature = "incremental")]
-                if frame.retain {
-                    retained.inspect_descendants = true;
-                }
-                let subtree = if RETAIN && frame.retain {
-                    self.begin_prepare::<true>(child, frame.block_children, retained)
-                } else {
-                    self.begin_prepare::<false>(child, frame.block_children, retained)
-                };
-                match subtree {
-                    Prepare::Done(nodes, needs_solve) => {
-                        frame.include_child(self.node_layout_params(child), nodes, needs_solve);
-                    }
-                    Prepare::Children(child_frame) => {
-                        parents.push((frame, child));
-                        frame = child_frame;
-                    }
-                }
-            }
-            let (nodes, needs_solve) = self.finish_prepare(frame, retained);
-            work = Prepare::Done(nodes, needs_solve);
-        }
-    }
-
-    fn begin_prepare<const RETAIN: bool>(&mut self, i: Self::NodeId, block_parent: Option<bool>, _retained: &mut RetainedSizing) -> Prepare<Self::NodeId> {
-        let params = self.node_layout_params(i);
-        if params.disabled {
-            *self.node_layout_data_mut(i) = NodeLayoutData::new();
-            return Prepare::Done(0, false);
-        }
-        #[cfg(feature = "incremental")]
-        let retain = if RETAIN && self.node_layout_data(i).flags.check_state(X, Kind::Final) != SOLVED {
-            // A newly enabled/new region can contain old, unreachable solver data.
-            _retained.inspect_descendants = true;
-            false
-        } else {
-            RETAIN
-        };
-        #[cfg(not(feature = "incremental"))]
-        let retain = false;
-
-        let children_layout = params.children_layout;
-        let block_parent = block_schedule::in_flow_parent(block_parent,params.free_placement);
-        #[cfg(feature = "incremental")]
-        if retain && self.node_layout_data(i).structural_change == StructuralChange::Moved {
-            // The planner has included both parents. This node can now retain its
-            // local slots or, at a fixed-size boundary, its complete clean subtree.
-            self.node_layout_data_mut(i).structural_change = StructuralChange::Clean;
-        }
-        #[cfg(feature = "incremental")]
-        let params = self.node_layout_params(i);
-        #[cfg(feature = "incremental")]
-        if retain && block_parent.is_none() && !self.node_layout_data(i).flags.is_block_item()
-            && self.node_layout_data(i).structural_change == StructuralChange::Clean
-            && [X, Y].into_iter().all(|axis| matches!(params.size[axis], Size::Pixels(value) if value.is_finite())
-                && params.min_size[axis].is_none() && params.max_size[axis].is_none())
-            && self.first_child(i).is_some()
-        {
-            let mut counts = SubtreeCounts::default();
-            // Deep branches take the iterative preparation path.
-            if retained_branch::check_branch(&mut BranchCacheAccess { tree: self, counts: &mut counts }, i, 24) {
-                let data = self.node_layout_data_mut(i);
-                data.structural_change = StructuralChange::Retained;
-                // Parent grid and wrap metadata will be assigned for the new list.
-                wrap_metrics::clear_parent_line(&mut data.flags.0, NodeFlags::WRAP_LINE_START, &mut data.parent_flow);
-                _retained.slots = _retained.slots.saturating_add(counts.nodes.saturating_mul(4));
-                _retained.blocks = _retained.blocks.saturating_add(counts.blocks);
-                self.layout_data().has_flow |= counts.has_flow;
-                // Keep a traversal path to this boundary so the statistics pass releases it.
-                return Prepare::Done(counts.nodes, true);
-            }
-        }
-        let params = self.node_layout_params(i);
-        let block_children = (children_layout == ChildrenLayout::Block).then(|| {
-            block_schedule::auto_content_height(
-                matches!(params.size.y, Size::Auto | Size::FitContent),
-                params.size.y.is_flex(),
-                block_parent == Some(true),
-            )
-        });
-        // A stack can fit an axis here when every in-flow child contributes an
-        // unbounded pixel size. Those Regular slots have no dependencies.
-        let (stack_axis, spacing) = match children_layout {
-            ChildrenLayout::Stack { axis, spacing, .. } => (Some(axis), spacing),
-            _ => (None, 0.0),
-        };
-        let pixel_fit_axis = stack_axis.and_then(|main| {
-            if params.text != TextContent::None || params.content_measure != ContentMeasure::None {
-                None
-            } else if params.size[main.other()] == Size::FitContent {
-                Some(main.other())
-            } else {
-                (params.size[main] == Size::FitContent).then_some(main)
-            }
-        });
-        let fixed_cross = match children_layout {
-            ChildrenLayout::Stack { axis, .. } if !retain && block_parent.is_none() => {
-                let cross = axis.other();
-                match params.size[cross] {
-                    Size::Pixels(size) if size.is_finite() && params.min_size[cross].is_none() && params.max_size[cross].is_none() => {
-                        Some((cross, inner(size, self.total_padding(i, cross))))
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        let aspect_on_both_axes = matches!(params.size, Xy { x: Size::AspectRatio(_), y: Size::AspectRatio(_) });
-        if aspect_on_both_axes {
-            self.warn(LayoutWarning::AspectRatioOnBothAxes { node: i });
-        }
-        #[cfg(feature = "incremental")]
-        if matches!(children_layout, ChildrenLayout::Block | ChildrenLayout::Wrap { .. }) {
-            self.layout_data().has_flow = true;
-        }
-
-        Prepare::Children(PrepareFrame {
-            node: i, next: self.first_child(i), retain, children_layout, block_parent, block_children,
-            stack_axis, spacing, pixel_fit_axis, extent: 0.0, fixed_cross,
-            n_placed_children: 0, n_nodes: 1, flags: 0,
-        })
-    }
-
-    #[inline]
-    fn prepare_direct_child<const RETAIN: bool, const REGISTERED_PIXELS: bool>(
-        &mut self, frame: &mut PrepareFrame<Self::NodeId>, child: Self::NodeId, retained: &mut RetainedSizing,
-    ) -> bool {
-        let no_parent_specialty = frame.pixel_fit_axis.is_none() && frame.block_children.is_none();
-        #[cfg(feature = "incremental")]
-        if REGISTERED_PIXELS && !RETAIN && no_parent_specialty && self.first_child(child).is_none() {
-            let data = self.node_layout_data_mut(child);
-            let summary = data.fixed_leaf_summary;
-            if summary.is_ready() && data.reuse_registered_pixels() {
-                frame.n_nodes = cycle_rules::add_count(frame.n_nodes, 1);
-                frame.n_placed_children = cycle_rules::add_count(frame.n_placed_children, u32::from(summary.in_flow()));
-                if summary.spans() { frame.flags |= NodeFlags::GRID_SPANS; }
-                return true;
-            }
-        }
-        let params = self.node_layout_params(child);
-        // Fixed leaves in a full solve need no child frame or flex flags.
-        if !RETAIN && !REGISTERED_PIXELS && no_parent_specialty
-            && matches!(params.size, Xy { x: Size::Pixels(_), y: Size::Pixels(_) })
-            && !params.disabled && matches!(params.children_layout, ChildrenLayout::Free | ChildrenLayout::Stack { .. })
-            && self.first_child(child).is_none()
-        {
-            let mut leaf = NodeLayoutData::new();
-            if leaf.seed_pixels(params, false, None) {
-                if !params.free_placement {
-                    frame.n_placed_children = cycle_rules::add_count(frame.n_placed_children, 1);
-                    if params.grid_span.x > 1 || params.grid_span.y > 1 { frame.flags |= NodeFlags::GRID_SPANS; }
-                }
-                frame.n_nodes = cycle_rules::add_count(frame.n_nodes, 1);
-                self.node_layout_data_mut(child).reset_fixed_leaf(leaf);
-                return true;
-            }
-        }
-        if frame.block_children.is_none() && !params.disabled
-            && matches!(params.children_layout, ChildrenLayout::Free | ChildrenLayout::Stack { .. })
-            && self.first_child(child).is_none()
-            && !matches!(params.size, Xy { x: Size::AspectRatio(_), y: Size::AspectRatio(_) })
-        {
-            let ready = self.prepare_leaf::<RETAIN, REGISTERED_PIXELS>(child, frame.fixed_cross, retained);
-            frame.include_child(self.node_layout_params(child), 1, !ready);
-            return true;
-        }
-        false
-    }
-
-    fn finish_prepare(&mut self, frame: PrepareFrame<Self::NodeId>, _retained: &mut RetainedSizing) -> (u32, bool) {
-        let PrepareFrame { node: i, children_layout, block_parent, block_children, stack_axis, spacing,
-            pixel_fit_axis, extent, n_placed_children, n_nodes, flags, .. } = frame;
-        let params = self.node_layout_params(i);
-        let mut data = NodeLayoutData::new();
-        data.n_placed_children = n_placed_children;
-        data.flags.0 = flags;
-        if let Some(auto_height) = block_parent {
-            data.flags.0 |= NodeFlags::BLOCK_ITEM;
-            if auto_height {
-                data.flags.0 |= NodeFlags::BLOCK_PARENT_AUTO_HEIGHT;
-            }
-        }
-        if block_children.is_some() {
-            data.flags.0 |= NodeFlags::BLOCK_CONTAINER;
-        }
-        if matches!(children_layout, ChildrenLayout::Wrap { .. }) {
-            data.flags.0 |= NodeFlags::WRAP_CONTAINER;
-        }
-        let width_grid_axis = match children_layout {
-            ChildrenLayout::Grid { columns: MainAxisCellSize::Width(_), main_axis, .. } => Some(main_axis),
-            _ => None,
-        };
-        let both_axes_fixed = data.seed_pixels(params, block_parent.is_some(), width_grid_axis);
-        if let Some(axis) = pixel_fit_axis {
-            let own = params.image.map_or(0.0, |extent| 0.0f32.max(extent[axis]));
-            let index = slot_index(axis, Kind::Regular);
-            let gaps = if Some(axis) == stack_axis { spacing * (n_placed_children as f32 - 1.0).max(0.0) } else { 0.0 };
-            data.publish_slot(index, extent.max(own) + gaps + self.total_padding(i, axis));
-            #[cfg(feature = "incremental")]
-            { data.levels[index] = u16::from(n_placed_children != 0); }
-        }
-        #[cfg(feature = "incremental")]
-        if frame.retain && !both_axes_fixed && self.first_child(i).is_none()
-            && matches!(children_layout, ChildrenLayout::Free | ChildrenLayout::Stack { .. })
-        {
-            let slots = data.retain_leaf_slots(self.node_layout_data(i), params);
-            _retained.slots = cycle_rules::add_count(_retained.slots, slots);
-        }
-        *self.node_layout_data_mut(i) = data;
-
-        if let ChildrenLayout::Grid { columns: MainAxisCellSize::Count(n), main_axis, backfill, .. } = children_layout {
-            self.assign_grid_cells(i, n.max(1) as usize, n.max(1) as f32, main_axis, backfill);
-        }
-        let needs_solve = !both_axes_fixed
-            || data.flags.0 & (NodeFlags::DESCENDANTS_NEED_SOLVE | NodeFlags::BLOCK_CONTAINER | NodeFlags::WRAP_CONTAINER) != 0;
-        (n_nodes, needs_solve)
+        prepare_nodes::prepare::<_, RustVec, RETAIN, REGISTERED_PIXELS>(self, i, block_parent, retained)
     }
 
     #[inline(always)]
@@ -1228,1184 +334,707 @@ pub(crate) trait Solve: TreeAdapter {
         });
     }
 
+    #[cfg(test)]
     fn request_dependencies(
         &mut self, slot: Slot<Self::NodeId>, request: &mut impl FnMut(&mut Self, Slot<Self::NodeId>),
     ) {
-        let Slot { node: i, axis, kind } = slot;
-        match kind {
-            Kind::Final => {
-                for kind in DECLARED_SIZES {
-                    if self.read_size(i, axis, kind).is_some() {
-                        request(self, Slot { node: i, axis, kind });
-                    }
-                }
-            }
-            Kind::EvenShare => wrap_schedule::request_flow_inputs(
-                &mut FlowDependencies { tree: self, parent: i, main: axis, request },
-                wrap_schedule::Producer::Share,
-            ),
-            Kind::Flow => self.request_flow_dependencies(i, request),
-            declared => {
-                let form = self.read_size(i, axis, declared).unwrap().dependency_form();
-                let stack = if matches!(form, Form::Fill) { self.stack_parent(i, axis) } else { None };
-                match form.input(stack.is_some()) {
-                    Input::None => {}
-                    Input::OppositeFinal => request(self, Slot { node: i, axis: axis.other(), kind: Kind::Final }),
-                    Input::ParentFinal => self.request_available_from_parent(slot, request),
-                    Input::ParentShare => request(self, Slot { node: stack.unwrap(), axis, kind: Kind::EvenShare }),
-                    Input::IntrinsicChildren => self.request_intrinsic_dependencies(i, axis, request),
-                }
-            }
-        }
-    }
-
-    fn request_intrinsic_dependencies(
-        &mut self, i: Self::NodeId, axis: Axis, request: &mut impl FnMut(&mut Self, Slot<Self::NodeId>),
-    ) {
-        match self.node_layout_params(i).children_layout {
-            ChildrenLayout::Block if axis == Y => request(self, Slot { node: i, axis: Y, kind: Kind::Flow }),
-            ChildrenLayout::Wrap { axis: main, .. } if main != axis => {
-                request(self, Slot { node: i, axis, kind: Kind::Flow });
-            }
-            _ => for_each_layout_child!(self, i, child, {
-                if !self.node_layout_params(child).free_placement {
-                    for kind in DECLARED_SIZES {
-                        if let Some(size) = self.read_size(child, axis, kind) && size.dependency_form().contributes_to_intrinsic() {
-                            request(self, Slot { node: child, axis, kind });
-                        }
-                    }
-                }
-            }),
-        }
-        let other = axis.other();
-        if dependency_rules::reads_intrinsic_constraint(
-            self.node_layout_params(i).intrinsic_reads_other_axis(axis), self.width_grid_main_axis(i) == Some(other),
-        ) {
-            request(self, Slot { node: i, axis: other, kind: Kind::Final });
-        }
-    }
-
-    fn request_flow_dependencies(
-        &mut self, i: Self::NodeId, request: &mut impl FnMut(&mut Self, Slot<Self::NodeId>),
-    ) {
-        match self.node_layout_params(i).children_layout {
-            ChildrenLayout::Wrap { axis, .. } => {
-                wrap_schedule::request_flow_inputs(
-                    &mut FlowDependencies { tree: self, parent: i, main: axis, request },
-                    wrap_schedule::Producer::Cross,
-                );
-            }
-            ChildrenLayout::Block => block_schedule::request_block_inputs(&mut BlockDependencies { tree: self, parent: i, request }),
-            _ => unreachable!(),
-        }
-    }
-
-    /// Solves what `available_from_parent` reads. The root reads the window size, which is an input.
-    #[inline(always)]
-    fn request_available_from_parent(
-        &mut self, slot: Slot<Self::NodeId>, request: &mut impl FnMut(&mut Self, Slot<Self::NodeId>),
-    ) {
-        use dependency_rules::request_parent_inputs;
-        let i = slot.node;
-        let Some(parent) = self.parent(i) else {
-            return;
-        };
-        request_parent_inputs!(
-            !self.node_layout_params(i).free_placement
-                && matches!(self.node_layout_params(parent).children_layout, ChildrenLayout::Wrap { axis, .. } if axis != slot.axis);
-            dependency_rules::reads_parent_axis(false, !self.node_layout_params(i).free_placement,
-                self.width_grid_main_axis(parent) == Some(slot.axis.other()));
-            other => {
-                let axis = if other { slot.axis.other() } else { slot.axis };
-                request(self, Slot { node: parent, axis, kind: Kind::Final });
-            };
-            { request(self, Slot { node: parent, axis: slot.axis, kind: Kind::Flow }); }
+        let _ = sizing_requests::request_inputs(
+            SizingDependencies { tree: self, request },
+            sizing_request(slot),
         );
     }
 
-    fn measure_sizes<const REGISTERED_PIXELS: bool>(&mut self, window_size: Xy<f32>) {
-        self.layout_data().window_size = window_size;
-        self.layout_data().block_margins.clear();
-        #[cfg(feature = "incremental")]
-        {
-            let data = self.layout_data();
-            data.has_cycle = false;
-            data.has_flow = false;
-            data.pending_full_solve = None;
-        }
-        let _summary = self.prepare::<false, REGISTERED_PIXELS>(self.root(), None, &mut RetainedSizing::default());
-        #[cfg(feature = "incremental")]
-        {
-            self.layout_data().n_nodes_solved = _summary.0;
-        }
-        self.solve_subtree::<false>(self.root());
-    }
-
-    /// Rebuilds an isolated sizing region using its parent's already-solved inputs.
-    /// The caller includes the parent in the region if the edit changes those inputs.
+    /// Rebuild an isolated sizing region using its already-solved parent.
     #[cfg(feature = "incremental")]
-    fn measure_subtree(&mut self, root: Self::NodeId) -> (u32, u32, usize) {
-        let parent_layout = self.parent(root).map(|parent| self.node_layout_params(parent).children_layout);
-        let params = self.node_layout_params(root);
-        let in_flow = !params.disabled && !params.free_placement;
-        debug_assert!(!region_policy::attached_flow_child(
-            in_flow, matches!(parent_layout, Some(ChildrenLayout::Wrap { .. } | ChildrenLayout::Block)),
-        ));
-        // The enclosing grid has already assigned the region's unchanged cell.
-        let grid_cell = grid_state::preserve_parent_cell(
-            in_flow, matches!(parent_layout, Some(ChildrenLayout::Grid { .. })),
-            self.node_layout_data(root).parent_flow,
-        );
-        let mut retained = RetainedSizing::default();
-        let (nodes, needs_solve) = self.prepare::<true, false>(root, None, &mut retained);
-        if let Some(cell) = grid_cell {
-            self.node_layout_data_mut(root).parent_flow = cell;
-        }
-        // Every enabled node publishes Regular and Final on both axes, including
-        // the pixel slots seeded by prepare. Other slots are evaluated on demand.
-        let mut slots = nodes.saturating_mul(4);
-        let mut blocks = retained.blocks;
-        if needs_solve {
-            self.solve_subtree::<true>(root);
-            if !retained.inspect_descendants {
-                slots = slots.saturating_add(retained.leaf_bounds);
-            }
-            let mut next = Some(root);
-            while let Some(node) = next {
-                if self.node_layout_data(node).structural_change == StructuralChange::Retained {
-                    self.node_layout_data_mut(node).structural_change = StructuralChange::Clean;
-                    next = self.traversal_next(root, node, false);
-                    continue;
-                }
-                let flags = self.node_layout_data(node).flags;
-                const SOLVED_BITS: u32 = 0xaaaa_aaaa & ((1 << (2 * N_SLOTS)) - 1);
-                slots = slots.saturating_add((flags.0 & SOLVED_BITS).count_ones().saturating_sub(4));
-                blocks += usize::from(flags.0 & NodeFlags::BLOCK_CONTAINER != 0);
-                next = self.traversal_next(root, node, retained.inspect_descendants
-                    && flags.0 & NodeFlags::DESCENDANTS_NEED_SOLVE != 0);
-            }
-        }
-        (nodes, slots.saturating_sub(retained.slots), blocks)
-    }
-
-    fn solve_subtree<const RETAIN: bool>(&mut self, root: Self::NodeId) {
-        let mut next = Some(root);
-        while let Some(node) = next {
-            #[cfg(feature = "incremental")]
-            if RETAIN && self.node_layout_data(node).structural_change == StructuralChange::Retained {
-                next = self.traversal_next(root, node, false);
-                continue;
-            }
-            let flags = self.node_layout_data(node).flags;
-            if flags == NodeFlags::EMPTY && self.node_layout_params(node).disabled {
-                next = self.traversal_next(root, node, false);
-                continue;
-            }
-            let [first_axis, second_axis] = cycle_rules::canonical_axes(X, Y);
-            visit_sizing_roots!(
-                first_axis, second_axis;
-                axis => {
-                    if flags.check_state(axis, Kind::Final) != SOLVED && !self.finish_wrapped_fill(node, axis) {
-                        self.solve_slot(node, axis, Kind::Final);
-                    }
-                };
-                flags.0 & NodeFlags::BLOCK_CONTAINER != 0 => {
-                    self.solve_slot(node, Y, Kind::Flow);
-                };
-                flags.0 & NodeFlags::WRAP_CONTAINER != 0 => {
-                    let axis = self.stack_axis(node).unwrap();
-                    self.solve_slot(node, axis, Kind::EvenShare);
-                }
-            );
-            let descend = flags.0 & NodeFlags::DESCENDANTS_NEED_SOLVE != 0 && !self.solve_fill_items(node);
-            next = self.traversal_next(root, node, descend);
-        }
-    }
-
-    /// A wrapped leaf can read its line extent directly once flow has solved.
-    fn finish_wrapped_fill(&mut self, child: Self::NodeId, cross: Axis) -> bool {
-        let params = self.node_layout_params(child);
-        if params.size[cross] != Size::Fill || params.free_placement
-            || params.min_size[cross].is_some() || params.max_size[cross].is_some()
-            || !matches!(params.children_layout, ChildrenLayout::Free | ChildrenLayout::Stack { .. })
-            || self.first_child(child).is_some()
-        {
-            return false;
-        }
-        let data = self.node_layout_data(child);
-        if data.flags.check_state(cross, Kind::Regular) != UNSOLVED || data.flags.check_state(cross, Kind::Final) != UNSOLVED { return false; }
-        let Some(parent) = self.parent(child) else { return false; };
-        let parent_data = self.node_layout_data(parent);
-        if parent_data.flags.check_state(cross, Kind::Flow) != SOLVED
-            || !matches!(self.node_layout_params(parent).children_layout, ChildrenLayout::Wrap { axis, .. } if axis != cross)
-        {
-            return false;
-        }
-        let size = fill_inside_margins(data.wrap_line_metric(wrap_metrics::Metric::Cross), params, cross);
-        // Resolve non-finite sizes through the usual slots so their warnings are emitted.
-        if !size.is_finite() { return false; }
-        #[cfg(feature = "incremental")]
-        let level = dependency_rules::next_level(parent_data.levels[slot_index(cross, Kind::Flow)]);
-        #[cfg(not(feature = "incremental"))]
-        let level = 0;
-        self.node_layout_data_mut(child).seed_unbounded_axis(cross, size, level);
-        true
+    fn measure_subtree(&mut self, root: Self::NodeId) -> Option<(u32, u32, usize)> {
+        sizing_pass::measure_region::<_, RustVec, false>(self, root)
+            .map(|measured| (measured.nodes, measured.slots, measured.blocks))
     }
 
     /// Resolves fill items together once their parent's geometry is known.
     fn solve_fill_items(&mut self, node: Self::NodeId) -> bool {
-        let axis = match self.node_layout_params(node).children_layout {
-            ChildrenLayout::Stack { axis, .. } => axis,
-            ChildrenLayout::Grid { columns: MainAxisCellSize::Count(_), spacing_x, spacing_y, .. } => {
-                return self.solve_grid_fill_leaves(node, Xy::new(spacing_x, spacing_y));
-            }
-            _ => return false,
-        };
-        let flags = self.node_layout_data(node).flags;
-        if flags.0 & NodeFlags::flex_child(axis) == 0 || flags.check_state(axis, Kind::EvenShare) != UNSOLVED {
-            return false;
-        }
-        self.solve_simple_fill_items::<false>(node, axis)
-    }
-
-    fn solve_grid_fill_leaves(&mut self, node: Self::NodeId, spacing: Xy<f32>) -> bool {
-        let parent = self.node_layout_data(node);
-        let flex = NodeFlags::FLEX_CHILD_X | NodeFlags::FLEX_CHILD_Y;
-        if parent.flags.0 & flex != flex { return false; }
-        let lines = parent.grid_lines();
-        let track = |axis| {
-            let size = self.get_solved_value(node, axis, Kind::Final);
-            GridTrack::new(inner(size, self.total_padding(node, axis)), lines[axis], spacing[axis])
-        };
-        let tracks = Xy::new(track(X), track(Y));
-        #[cfg(feature = "incremental")]
-        let levels = Xy::new(dependency_rules::next_level(parent.levels[slot_index(X, Kind::Final)]), dependency_rules::next_level(parent.levels[slot_index(Y, Kind::Final)]));
-        #[cfg(not(feature = "incremental"))]
-        let levels = Xy::new_symm(0);
-
-        for_each_layout_child!(self, node, child, {
-            let params = self.node_layout_params(child);
-            if params.free_placement || params.size != Xy::new_symm(Size::Fill)
-                || params.min_size != Xy::new_symm(None) || params.max_size != Xy::new_symm(None)
-                || !matches!(params.children_layout, ChildrenLayout::Stack { .. } | ChildrenLayout::Free)
-                || self.first_child(child).is_some() || self.node_layout_data(child).flags != NodeFlags::EMPTY
-            {
-                return false;
-            }
-            // Each Regular reads only the parent Final on its own axis for a count grid.
-            // The ordinary traversal can resume after a resolved prefix in a mixed grid.
-            let width = fill_inside_margins(tracks.x.extent(params.grid_span.x), params, X);
-            let height = fill_inside_margins(tracks.y.extent(params.grid_span.y), params, Y);
-            if !width.is_finite() || !height.is_finite() { return false; }
-            let data = self.node_layout_data_mut(child);
-            data.seed_unbounded_axis(X, width, levels.x);
-            data.seed_unbounded_axis(Y, height, levels.y);
-        });
-        true
-    }
-
-    fn solve_simple_fill_items<const PIXEL_BOUNDS: bool>(&mut self, node: Self::NodeId, axis: Axis) -> bool {
-        let first = self.first_child(node);
-        let own = inner(self.get_solved_value(node, axis, Kind::Final), self.total_padding(node, axis));
-        let mut budget = fill_budget::after_gaps(own, self.stack_gaps(node, axis));
-        let mut total_weight = 0.0;
-        let mut needs_cross = false;
-        for_each_layout_child!(@from self, first, child, {
-            let params = self.node_layout_params(child);
-            let flags = self.node_layout_data(child).flags;
-            if params.free_placement || params.size[axis] != Size::Fill
-                || flags.0 & (NodeFlags::DESCENDANTS_NEED_SOLVE | NodeFlags::BLOCK_CONTAINER | NodeFlags::WRAP_CONTAINER) != 0
-                || self.width_grid_main_axis(child) == Some(axis)
-            {
-                return false;
-            }
-            if !PIXEL_BOUNDS && (params.min_size[axis].is_some() || params.max_size[axis].is_some()) {
-                // Keep the common unbounded loop free of per-item clamp and bound-slot work.
-                return self.solve_simple_fill_items::<true>(node, axis);
-            }
-            needs_cross |= flags.check_state(axis.other(), Kind::Final) != SOLVED;
-            if PIXEL_BOUNDS {
-                for (kind, bound) in [(Kind::Min, params.min_size[axis]), (Kind::Max, params.max_size[axis])] {
-                    if let Some(bound) = bound {
-                        let Size::Pixels(pixels) = bound else { return false };
-                        // Pixel declarations have no dependencies or measurement callbacks.
-                        let data = self.node_layout_data_mut(child);
-                        let index = slot_index(axis, kind);
-                        data.publish_slot(index, pixels);
-                        #[cfg(feature = "incremental")]
-                        { data.levels[index] = 0; }
-                    }
-                }
-            } else {
-                let [start, end] = margins(params, axis);
-                budget = fill_budget::charge(budget, start + end);
-                total_weight += params.fill_weight;
-            }
-        });
-        let share = if PIXEL_BOUNDS {
-            self.distribute_fill(axis, budget, first, None)
-        } else {
-            fill_budget::share(fill_budget::nonnegative(budget), 0.0, total_weight)
-        };
-        let data = self.node_layout_data_mut(node);
-        data.publish_slot(slot_index(axis, Kind::EvenShare), share);
-        #[cfg(feature = "incremental")]
-        let share_level = {
-            let level = dependency_rules::next_level(data.levels[slot_index(axis, Kind::Final)]);
-            data.levels[slot_index(axis, Kind::EvenShare)] = level;
-            level
-        };
-        for_each_layout_child!(@from self, first, child, {
-            let value = share * self.node_layout_params(child).fill_weight;
-            let (min, max) = if PIXEL_BOUNDS { self.solved_bounds(child, axis, |_| false) } else { (None, None) };
-            let final_size = clamp(value, min, max);
-            if !final_size.is_finite() || matches!((min, max), (Some(a), Some(b)) if a > b) {
-                // Keep the ordinary diagnostic and callback order for exceptional inputs.
-                self.solve_slot(child, X, Kind::Final);
-                self.solve_slot(child, Y, Kind::Final);
-                continue;
-            }
-            #[cfg(feature = "incremental")]
-            let level = dependency_rules::next_level(share_level);
-            #[cfg(not(feature = "incremental"))]
-            let level = 0;
-            let data = self.node_layout_data_mut(child);
-            data.publish_axis(axis, value, final_size, level);
-            if needs_cross && data.flags.check_state(axis.other(), Kind::Final) != SOLVED {
-                self.solve_slot(child, axis.other(), Kind::Final);
-            }
-        });
-        true
+        sizing_fill::children(self, node)
     }
 
     fn solve_slot(&mut self, node: Self::NodeId, axis: Axis, kind: Kind) {
-        self.solve_slot_with_budget(Slot { node, axis, kind }, sizing_stack::NATIVE_DEPTH);
-    }
-
-    fn solve_slot_with_budget(&mut self, slot: Slot<Self::NodeId>, budget: u8) {
-        match self.enter_slot(slot) {
-            Entry::CheckIntrinsic => self.solve_unsolved_slot::<{ cfg!(feature = "incremental") }>(slot, budget),
-            Entry::Compute => self.solve_unsolved_slot::<false>(slot, budget),
-            Entry::Reuse | Entry::BackEdge => {}
-        }
-    }
-
-    #[inline(always)]
-    fn enter_slot(&mut self, slot: Slot<Self::NodeId>) -> Entry {
-        let Slot { node, axis, kind } = slot;
-        let entry = cycle_rules::enter(self.node_layout_data(node).flags.check_state(axis, kind));
-        match entry {
-            Entry::Reuse => {
-                #[cfg(feature = "incremental")]
-                {
-                    let level = self.node_layout_data(node).levels[slot_index(axis, kind)];
-                    let data = self.layout_data();
-                    data.current_level = data.current_level.max(dependency_rules::next_level(level));
-                }
-            }
-            Entry::BackEdge => {
-                #[cfg(feature = "incremental")]
-                {
-                    self.layout_data().has_cycle = true;
-                }
-                self.record_cycle(node, axis);
-            }
-            Entry::CheckIntrinsic | Entry::Compute => {}
-        }
-        entry
-    }
-
-    #[inline]
-    fn solve_unsolved_slot<const CHECK: bool>(&mut self, slot: Slot<Self::NodeId>, budget: u8) {
-        let opened = self.open_slot::<CHECK>(slot);
-        if let Some(budget) = sizing_stack::descend(budget) {
-            self.request_dependencies(slot, &mut |tree: &mut Self, dependency| {
-                tree.solve_slot_with_budget(dependency, budget);
-            });
-            self.finish_open_slot::<CHECK>(opened);
-        } else {
-            self.finish_slots_on_worklist(opened, CHECK);
-        }
-    }
-
-    #[inline]
-    fn open_slot<const CHECK: bool>(&mut self, slot: Slot<Self::NodeId>) -> OpenSlot<Self::NodeId> {
-        let Slot { node, axis, kind } = slot;
-        let data = self.node_layout_data_mut(node);
-        data.flags.set_state(axis, kind, IN_PROGRESS);
-        let index = slot_index(axis, kind);
-        // A dependency cycle can read an in-progress slot. It must see its normal
-        // initial value while we check whether the previous constraint still holds.
-        let previous = if CHECK {
-            cycle_rules::erase_cached_slot(&mut data.values[index], EMPTY_VALUES[index])
-        } else { 0.0 };
-        #[cfg(feature = "incremental")]
-        let outer_level = std::mem::replace(&mut self.layout_data().current_level, 0);
-        OpenSlot { slot, previous, #[cfg(feature = "incremental")] outer_level }
-    }
-
-    #[inline]
-    fn finish_open_slot<const CHECK: bool>(&mut self, opened: OpenSlot<Self::NodeId>) {
-        let Slot { node, axis, kind } = opened.slot;
-        let data = self.node_layout_data(node);
-        if CHECK && cycle_rules::same_intrinsic_constraint(
-            data.flags.check_state(axis.other(), Kind::Final),
-            data.values[slot_index(axis.other(), Kind::Final)].to_bits(),
-            data.values[slot_index(Y, Kind::Flow)].to_bits(),
-        ) {
-            let data = self.node_layout_data_mut(node);
-            data.publish_slot(slot_index(axis, kind), opened.previous);
-        } else {
-            self.finish_slot(opened.slot);
-        }
-        #[cfg(feature = "incremental")]
-        {
-            let level = self.layout_data().current_level;
-            self.layout_data().current_level = opened.outer_level.max(dependency_rules::next_level(level));
-            self.node_layout_data_mut(node).levels[slot_index(axis, kind)] = level;
-        }
+        let slot = sizing_requests::target(node, axis == Y, kind);
+        let _ = sizing_stack::drive(NativeSizing { tree: self }, slot);
     }
 
     #[cold]
     #[inline(never)]
     fn finish_slots_on_worklist(&mut self, opened: OpenSlot<Self::NodeId>, check: bool) {
-        let mut tasks = Vec::new();
-        self.push_sizing_tasks(&mut tasks, opened, check);
-        while let Some(task) = tasks.pop() {
-            match task {
-                SizingTask::Enter(slot) => match self.enter_slot(slot) {
-                    Entry::Reuse | Entry::BackEdge => {}
-                    Entry::CheckIntrinsic if cfg!(feature = "incremental") => {
-                        let opened = self.open_slot::<true>(slot);
-                        self.push_sizing_tasks(&mut tasks, opened, true);
-                    }
-                    Entry::Compute | Entry::CheckIntrinsic => {
-                        let opened = self.open_slot::<false>(slot);
-                        self.push_sizing_tasks(&mut tasks, opened, false);
-                    }
-                },
-                SizingTask::Finish(opened, false) => self.finish_open_slot::<false>(opened),
-                SizingTask::Finish(opened, true) => self.finish_open_slot::<true>(opened),
-            }
-        }
-    }
-
-    fn push_sizing_tasks(
-        &mut self, tasks: &mut Vec<SizingTask<Self::NodeId>>, opened: OpenSlot<Self::NodeId>, check: bool,
-    ) {
-        tasks.push(SizingTask::Finish(opened, check));
-        let start = tasks.len();
-        // The scheduler reads stable declarations, links and prepared flow
-        // context. Enter the requests separately to preserve DFS cycle and rank
-        // updates and the order in which warnings and measurements are emitted.
-        self.request_dependencies(opened.slot, &mut |_, slot| tasks.push(SizingTask::Enter(slot)));
-        sizing_stack::reverse_requests(tasks, start);
+        let scratch = RustVec::take(&mut self.layout_data().sizing_stack);
+        let mut tasks = sizing_stack::task_buffer(scratch);
+        sizing_stack::finish_worklist(self, opened, check, &mut tasks);
+        self.layout_data().sizing_stack = tasks.recycle();
     }
 
     /// Computes the value of a slot whose dependencies are solved, and marks it as solved.
-    fn finish_slot(&mut self, slot: Slot<Self::NodeId>) {
-        let Slot { node, axis, kind } = slot;
-        let size = self.solve_slot_inner(slot);
-        if kind == Kind::Final && ! size.is_finite() {
-            self.warn(LayoutWarning::NotFinite { node, axis });
-        }
-        let data = self.node_layout_data_mut(node);
-        data.publish_slot(slot_index(axis, kind), size);
-        if kind == Kind::Final && grid_state::writes_width_grid(true, self.width_grid_main_axis(node) == Some(axis)) {
-            self.assign_width_grid_cells(node);
-        }
+    fn finish_slot(&mut self, slot: Slot<Self::NodeId>) -> sizing_finish::StoredSize<Self::NodeId> {
+        sizing_finish::finish_size(&mut SizingFinisher { tree: self, retain_grid_cells: false }, sizing_request(slot))
+    }
+
+    /// Numeric work reuses the stable in-flow order of the settled grid.
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn finish_numeric_slot(&mut self, slot: sizing_requests::Request<Self::NodeId>) -> sizing_finish::StoredSize<Self::NodeId> {
+        sizing_finish::finish_size(&mut SizingFinisher { tree: self, retain_grid_cells: true }, slot)
     }
 
     /// Keeps the user's callback out of the hot code.
     #[cold]
     #[inline(never)]
     fn warn(&mut self, warning: LayoutWarning<Self::NodeId>) {
+        #[cfg(feature = "incremental")]
+        { self.layout_data().sizing_warned = true; }
         self.layout_warning(warning);
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn record_cycle(&mut self, node: Self::NodeId, axis: Axis) {
-        let flags = &mut self.node_layout_data_mut(node).flags;
-        if flags.0 & NodeFlags::in_cycle(axis) == 0 {
-            flags.0 |= NodeFlags::in_cycle(axis);
-            self.layout_warning(LayoutWarning::Cycle { node, axis });
-        }
     }
 
     #[inline(always)]
     fn get_solved_value(&self, i: Self::NodeId, axis: Axis, kind: Kind) -> f32 {
         let data = self.node_layout_data(i);
-        debug_assert!(data.flags.check_state(axis, kind) != UNSOLVED, "Slot {axis:?} {kind:?} of node {i:?} read before it is solved.");
-        data.values[slot_index(axis, kind)]
-    }
-
-    fn solve_slot_inner(&mut self, slot: Slot<Self::NodeId>) -> f32 {
-        let i = slot.node;
-        let axis = slot.axis;
-        match slot.kind {
-            Kind::Final => {
-                let (min, max) = self.solved_bounds(i, axis, |_| false);
-                if let (Some(min), Some(max)) = (min, max) && min > max {
-                    self.warn(LayoutWarning::MinAboveMax { node: i, axis });
-                }
-                let mut size = clamp(self.get_solved_value(i, axis, Kind::Regular), min, max);
-                let flags = self.node_layout_data(i).flags;
-                if flags.is_block_item() {
-                    size = size.max(self.total_padding(i, axis));
-                }
-                let has_flex_child = flags.0 & NodeFlags::flex_child(axis) != 0;
-                if has_flex_child && size <= self.total_padding(i, axis)
-                    && self.node_layout_params(i).size[axis] == Size::FitContent
-                    && !matches!(self.node_layout_params(i).children_layout, ChildrenLayout::Block | ChildrenLayout::Wrap { .. })
-                {
-                    self.warn(LayoutWarning::FitContentCollapsed { node: i, axis });
-                }
-                size
-            }
-            Kind::EvenShare => self.solve_even_share(i, axis),
-            Kind::Flow => self.solve_flow(i),
-            declared => match self.read_size(i, axis, declared).unwrap() {
-                Size::Pixels(pixels) => pixels,
-                Size::AspectRatio(aspect) => {
-                    let other = self.get_solved_value(i, axis.other(), Kind::Final);
-                    match axis {
-                        X => other * aspect,
-                        Y => other / aspect,
-                    }
-                }
-                Size::FitContent => self.solve_fitcontent(i, axis),
-                Size::Frac(frac) => self.available_from_parent(i, axis, false) * frac,
-
-                Size::Fill => {
-                    if let Some(parent) = self.stack_parent(i, axis) {
-                        let flags = self.node_layout_data(parent).flags;
-                        let share = if flags.0 & NodeFlags::WRAP_CONTAINER == 0 {
-                            self.get_solved_value(parent, axis, Kind::EvenShare)
-                        } else {
-                            wrap_metrics::ready_metric(flags.check_state(axis, Kind::EvenShare) == SOLVED, wrap_metrics::Metric::Share)
-                                .map_or(0.0, |metric| self.node_layout_data(i).wrap_line_metric(metric))
-                        };
-                        share * self.node_layout_params(i).fill_weight
-                    } else {
-                        self.available_from_parent(i, axis, true)
-                    }
-                },
-                Size::Auto => unreachable!("read_size resolves Auto"),
-            },
-        }
-    }
-
-    #[inline(always)]
-    fn solved_bounds(&self, i: Self::NodeId, axis: Axis, ignore_bounds_rule: impl Fn(Size) -> bool) -> (Option<f32>, Option<f32>) {
-        let min = if let Some(bound) = self.read_size(i, axis, Kind::Min) && ! ignore_bounds_rule(bound) {
-            Some(self.get_solved_value(i, axis, Kind::Min))
-        } else { None };
-        let max = if let Some(bound) = self.read_size(i, axis, Kind::Max) && ! ignore_bounds_rule(bound) {
-            Some(self.get_solved_value(i, axis, Kind::Max))
-        } else { None };
-        (min, max)
-    }
-
-    fn available_from_parent(&mut self, i: Self::NodeId, axis: Axis, fill: bool) -> f32 {
-        let Some(parent) = self.parent(i) else {
-            return self.layout_data().window_size[axis];
-        };
-        let params = self.node_layout_params(i);
-        let children_layout = self.node_layout_params(parent).children_layout;
-        let subtract_margin = |size: f32| {
-            if !fill || params.free_placement || children_layout == ChildrenLayout::Free {
-                return size;
-            }
-            fill_inside_margins(size, params, axis)
-        };
-        if !params.free_placement
-            && let ChildrenLayout::Wrap { axis: main, .. } = children_layout
-            && main != axis
-        {
-            let solved = self.node_layout_data(parent).flags.check_state(axis, Kind::Flow) == SOLVED;
-            let extent = wrap_metrics::ready_metric(solved, wrap_metrics::Metric::Cross)
-                .map_or(0.0, |metric| self.node_layout_data(i).wrap_line_metric(metric));
-            return subtract_margin(extent);
-        }
-        let inner = inner(self.get_solved_value(parent, axis, Kind::Final), self.total_padding(parent, axis));
-        if params.free_placement {
-            return inner;
-        }
-        let available = match children_layout {
-            ChildrenLayout::Grid { spacing_x, spacing_y, .. } => {
-                let spacing = Xy::new(spacing_x, spacing_y)[axis];
-                GridTrack::new(inner, self.node_layout_data(parent).grid_lines()[axis], spacing).extent(params.grid_span[axis])
-            }
-            ChildrenLayout::Stack { axis: stack_axis, .. } if stack_axis == axis => {
-                (inner - self.stack_gaps(parent, axis)).max(0.0)
-            }
-            _ => inner,
-        };
-        subtract_margin(available)
-    }
-
-    fn solve_flow(&mut self, i: Self::NodeId) -> f32 {
-        match self.node_layout_params(i).children_layout {
-            ChildrenLayout::Wrap { axis, spacing, line_spacing, .. } => {
-                // A back edge to EvenShare has not published line starts.
-                let marks_ready = self.node_layout_data(i).flags.check_state(axis, Kind::EvenShare) == SOLVED;
-                let mut next = self.first_child(i);
-                let mut extent = 0.0;
-                while next.is_some() {
-                    let line = if marks_ready {
-                        self.wrap_line::<true>(next, axis, None, spacing)
-                    } else {
-                        self.wrap_line::<false>(next, axis, None, spacing)
-                    };
-                    wrap_metrics::publish_metrics(
-                        self, next, line.next, wrap_metrics::Metric::Cross, line.cross.to_bits(),
-                    );
-                    next = line.next;
-                    extent += line.cross;
-                    if next.is_some() {
-                        extent += line_spacing;
-                    }
-                }
-                extent
-            }
-            ChildrenLayout::Block => {
-                let mut flow = self.block_flow(i);
-                for_each_layout_child!(self, i, child, {
-                    if !self.node_layout_params(child).free_placement {
-                        flow.push(self.block_item(child));
-                    }
-                });
-                let (height, margins) = flow.finish();
-                let layout = self.node_layout_data(i);
-                if layout.flags.is_block_item() && !margins.is_implicit(layout.n_placed_children == 0) {
-                    let word = margin_storage::publish_margin(&mut self.layout_data().block_margins,margins);
-                    self.node_layout_data_mut(i).set_block_margin_word(word);
-                }
-                height
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    fn solve_fitcontent(&mut self, i: Self::NodeId, axis: Axis) -> f32 {
-        let (children, gaps) = match self.node_layout_params(i).children_layout {
-            ChildrenLayout::Grid { columns, spacing_x, spacing_y, main_axis, .. } => {
-                let spacing = Xy::new(spacing_x, spacing_y)[axis];
-                let (n, cell) = match columns {
-                    MainAxisCellSize::Width(w) if axis == main_axis => (1.0, w),
-                    _ => {
-                        let n = self.node_layout_data(i).grid_lines()[axis];
-                        let mut cell = 0.0f32;
-                        for_each_layout_child!(self, i, child, {
-                            if ! self.node_layout_params(child).free_placement {
-                                let span = (self.node_layout_params(child).grid_span[axis].max(1) as f32).min(n.max(1.0));
-                                let [start, end] = margins(self.node_layout_params(child), axis);
-                                let extent = with_margin(self.pre_grow_size(child, axis), start + end);
-                                cell = cell.max((extent - (span - 1.0) * spacing) / span);
-                            }
-                        });
-                        (n, cell)
-                    }
-                };
-                ((n * cell + spacing * (n - 1.0)).max(0.0), 0.0)
-            }
-            ChildrenLayout::Stack { axis: stack_axis, .. } | ChildrenLayout::Wrap { axis: stack_axis, .. } if stack_axis == axis => {
-                (self.fit_stack_main(i, axis), self.stack_gaps(i, axis))
-            }
-            ChildrenLayout::Block if axis == Y => (self.get_solved_value(i, axis, Kind::Flow), 0.0),
-            ChildrenLayout::Wrap { .. } => (self.get_solved_value(i, axis, Kind::Flow), 0.0),
-            layout => {
-                let mut biggest = 0.0f32;
-                for_each_layout_child!(self, i, child, {
-                    if ! self.node_layout_params(child).free_placement {
-                        let size = self.pre_grow_size(child, axis);
-                        let extent = if layout == ChildrenLayout::Free {
-                            size
-                        } else {
-                            let [start, end] = margins(self.node_layout_params(child), axis);
-                            with_margin(size, start + end)
-                        };
-                        biggest = biggest.max(extent);
-                    }
-                });
-                (biggest, 0.0)
-            }
-        };
-
-        let mut own_content = match self.node_layout_params(i).text {
-            TextContent::None => 0.0,
-            _ => {
-                #[cfg(feature = "incremental")]
-                { self.layout_data().track_topology = true; }
-                if self.text_wraps(i, axis) {
-                    let width = inner(self.get_solved_value(i, X, Kind::Final), self.total_padding(i, X));
-                    self.measure_text_height(i, Some(width))
-                } else {
-                    match axis {
-                        X => self.measure_text_width(i),
-                        Y => self.measure_text_height(i, None),
-                    }
-                }
-            }
-        };
-        if let Some(image) = self.node_layout_params(i).image {
-            own_content = own_content.max(image[axis]);
-        }
-        if self.node_layout_params(i).content_measure != ContentMeasure::None {
-            let measured = self.custom_intrinsic_size(i, axis);
-            own_content = own_content.max(measured);
-        }
-
-        children.max(own_content) + gaps + self.total_padding(i, axis)
-    }
-
-    fn custom_intrinsic_size(&mut self, i: Self::NodeId, axis: Axis) -> f32 {
-        #[cfg(feature = "incremental")]
-        { self.layout_data().track_topology = true; }
-        let params = self.node_layout_params(i);
-        let mut known_dimensions = Xy::new_symm(None);
-        if params.content_measure.reads_other_axis(axis) {
-            let other = axis.other();
-            known_dimensions[other] = Some(inner(self.get_solved_value(i, other, Kind::Final), self.total_padding(i, other)));
-        }
-        let pixel_max = |axis| match params.max_size[axis] {
-            Some(Size::Pixels(pixels)) => Some(inner(pixels, self.total_padding(i, axis))),
-            _ => None,
-        };
-        let max_size = Xy::new(pixel_max(X), pixel_max(Y));
-        self.measure_content(i, ContentMeasureInput { axis, known_dimensions, max_size })[axis]
-    }
-
-    fn fit_stack_main(&mut self, i: Self::NodeId, axis: Axis) -> f32 {
-        let mut estimate = 0.0f32;
-        let mut overflow = false;
-        for _ in 0..MAX_FIT_STACK_STEPS {
-            let mut fixed = 0.0f32;
-            let mut free_frac = 0.0f32;
-            let mut has_frac = false;
-            for_each_layout_child!(self, i, child, {
-                if self.node_layout_params(child).free_placement {
-                    // Nothing
-                } else if let Some(Size::Frac(frac)) = self.read_size(child, axis, Kind::Regular) {
-                    let [start, end] = margins(self.node_layout_params(child), axis);
-                    fixed += start + end;
-                    has_frac = true;
-                    let wanted = estimate * frac;
-                    let (min, max) = self.solved_bounds(child, axis, |bound| bound.is_flex());
-                    let allowed = clamp(wanted, min, max);
-                    match allowed == wanted {
-                        true => free_frac += frac,
-                        false => fixed += allowed,
-                    }
-                } else {
-                    let [start, end] = margins(self.node_layout_params(child), axis);
-                    fixed += with_margin(self.pre_grow_size(child, axis), start + end);
-                }
-            });
-
-            if ! has_frac {
-                return fixed;
-            }
-
-            let next = match free_frac <= MAX_FIT_STACK_FRAC {
-                true => fixed / (1.0 - free_frac),
-                false => {
-                    overflow = true;
-                    fixed
-                }
-            };
-            let settled = (next - estimate).abs() <= FIT_STACK_EPSILON * next.abs().max(1.0);
-            estimate = next;
-            if settled {
-                break;
-            }
-        }
-        if overflow {
-            self.warn(LayoutWarning::ImpossibleFracChildren { node: i, axis });
-        }
-        estimate
+        // In-progress cycle reads see the initialized provisional value.
+        cycle_rules::read_slot(&data.values, axis.index(), kind)
     }
 
     #[inline(always)]
     fn pre_grow_size(&self, child: Self::NodeId, axis: Axis) -> f32 {
-        let size = match self.read_size(child, axis, Kind::Regular).unwrap() {
-            Size::Fill | Size::Frac(_) => 0.0,
-            _ => self.get_solved_value(child, axis, Kind::Regular),
-        };
-        let (min, max) = self.solved_bounds(child, axis, |bound| bound.is_flex());
-        clamp(size, min, max)
+        sizing_child::pre_growth::<_, fill_compaction::RustFloat>(self, child, axis == Y, true)
     }
 
-    fn solve_even_share(&mut self, i: Self::NodeId, axis: Axis) -> f32 {
-        let own = inner(self.get_solved_value(i, axis, Kind::Final), self.total_padding(i, axis));
-        let first = self.first_child(i);
-        if let ChildrenLayout::Wrap { spacing, .. } = self.node_layout_params(i).children_layout {
-            let mut first = first;
-            while first.is_some() {
-                let line = self.wrap_line::<false>(first, axis, Some(own), spacing);
-                if let Some(next) = line.next {
-                    let flags = &mut self.node_layout_data_mut(next).flags.0;
-                    *flags = wrap_metrics::mark_start(*flags, NodeFlags::WRAP_LINE_START);
-                }
-                if line.has_fill {
-                    let gaps = spacing * line.count.saturating_sub(1) as f32;
-                    let share = self.distribute_fill(axis, (own - gaps).max(0.0), first, line.next);
-                    wrap_metrics::publish_metrics(
-                        self, first, line.next, wrap_metrics::Metric::Share, share.to_bits(),
-                    );
-                }
-                first = line.next;
-            }
-            return 0.0;
-        }
-        let budget = fill_budget::after_gaps(own, self.stack_gaps(i, axis));
-        self.distribute_fill(axis, budget, first, None)
+    #[cfg(feature = "incremental")]
+    fn solve_even_share(&mut self, node: Self::NodeId, axis: Axis) -> f32 {
+        sizing_finish::measure_share(
+            &mut SizingFinisher { tree: self, retain_grid_cells: false },
+            sizing_requests::target(node, axis == Y, Kind::EvenShare),
+        )
     }
 
     fn wrap_fill_base(&self, child: Self::NodeId, axis: Axis) -> f32 {
-        let content = if self.read_size(child, axis, Kind::Regular) == Some(Size::Fill) {
-            0.0
-        } else {
-            self.get_solved_value(child, axis, Kind::Regular)
-        };
-        let (min, max) = self.solved_bounds(child, axis, |bound| bound.is_fill());
-        clamp(content, min, max)
+        sizing_child::pre_growth::<_, fill_compaction::RustFloat>(self, child, axis == Y, false)
     }
 
     fn distribute_fill(
         &mut self,
         axis: Axis,
         budget: f32,
-        mut next: Option<Self::NodeId>,
+        next: Option<Self::NodeId>,
         end: Option<Self::NodeId>,
     ) -> f32 {
-
-        let mut fills = Vec::new();
-        let mut inline = [FillChild::default(); 8];
-        let mut fill_count = 0;
-        let mut collection = fill_collection::FillCollection::new(budget);
-        while let Some(child) = next {
-            if Some(child) == end { break; }
-            next = self.next_sibling(child);
-            let node = self.node_layout_params(child);
-            if node.free_placement || node.disabled {
-                // Nothing
-            } else {
-                let [start, end] = margins(node, axis);
-                collection.margin(start,end);
-                if self.any_size_is_fill(child, axis) {
-                    let content = if self.read_size(child, axis, Kind::Regular) != Some(Size::Fill) {
-                        Some(self.get_solved_value(child, axis, Kind::Regular))
-                    } else { None };
-                    let weight = node.fill_weight;
-                    collection.weight(weight);
-                    let (min, max) = self.solved_bounds(child, axis, |bound| bound.is_fill());
-                    if fill_collection::has_constraint(content,min,max) {
-                        let capped_by_content = content.is_some() && self.read_size(child, axis, Kind::Max) == Some(Size::Fill);
-                        let fill = FillChild::new(content, min, max, capped_by_content, weight);
-                        if fill_count < inline.len() {
-                            inline[fill_count] = fill;
-                        } else {
-                            if fill_count == inline.len() {
-                                fills = std::mem::take(&mut self.layout_data().fills_scratch);
-                                fills.reserve(2 * inline.len());
-                                fills.extend_from_slice(&inline);
-                            }
-                            fills.push(fill);
-                        }
-                        fill_count += 1;
-                    } else {
-                        collection.mark_unconstrained(weight);
-                    }
-                } else {
-                    collection.fixed(self.get_solved_value(child, axis, Kind::Final));
-                }
-            }
-        }
-
-        let (budget, unfrozen_weight, max_unconstrained_weight) = collection.finish();
-        if fill_count <= inline.len() {
-            return resolve_fill_share(&mut inline[..fill_count], budget, unfrozen_weight, max_unconstrained_weight);
-        }
-        let share = resolve_fill_share(&mut fills, budget, unfrozen_weight, max_unconstrained_weight);
-        fills.clear();
-        self.layout_data().fills_scratch = fills;
-        share
+        fill_compaction::distribute(&mut FillInputs { tree: self, axis }, next, end, budget)
     }
 
     /// Assigns the cells of a grid with `MainAxisCellSize::Width` columns, from its `Final` size on the main axis.
-    fn assign_width_grid_cells(&mut self, i: Self::NodeId) {
-        let ChildrenLayout::Grid { columns: MainAxisCellSize::Width(w), spacing_x, spacing_y, main_axis: main, backfill } = self.node_layout_params(i).children_layout else {
-            unreachable!();
-        };
-        let spacing = Xy::new(spacing_x, spacing_y)[main];
+    fn assign_width_grid_cells(
+        &mut self, i: Self::NodeId, main: Axis, width: f32, spacing: f32, backfill: bool, retain: bool,
+    ) {
         let inner_main = inner(self.get_solved_value(i, main, Kind::Final), self.total_padding(i, main));
-        let count = grid_state::width_key(inner_main, w, spacing);
-        self.assign_grid_cells(i, count as usize, count, main, backfill);
+        let key = grid_state::width_key::<grid_state::RustWidthRounding>(inner_main, width, spacing);
+        let retained = if retain {
+            Some(self.node_layout_data(i).grid_lines()[main].to_bits())
+        } else {
+            None
+        };
+        if !grid_state::reuse_width_cells(retained, key.tracks.to_bits()) {
+            self.assign_grid_cells(i, key.columns, key.tracks, main, backfill);
+        }
     }
 
     fn assign_grid_cells(&mut self, i: Self::NodeId, n_main: usize, main_tracks: f32, main_axis: Axis, backfill: bool) {
-        use grid_state::AssignmentPath;
         let data = self.node_layout_data(i);
         let has_spans = data.flags.0 & NodeFlags::GRID_SPANS != 0;
-        let n_lines = match grid_state::assignment_path(n_main, data.n_placed_children as usize, has_spans) {
-            AssignmentPath::Sequential => self.assign_grid_cells_in_order(i, n_main, main_axis) as u64,
-            AssignmentPath::OneRow => {
-                // Even the widest possible spans fit side-by-side. The unused
-                // tracks still affect geometry without needing occupancy storage.
-                let mut pos = 0;
-                let mut height = 0;
-                for_each_layout_child!(self, i, child, {
-                    if !self.node_layout_params(child).free_placement {
-                        let span = self.node_layout_params(child).grid_span;
-                        self.node_layout_data_mut(child).set_grid_cell(main_axis, pos, 0);
-                        (pos, height) = grid_state::extend_one_row(pos, height,
-                            usize::from(span[main_axis].max(1)), usize::from(span[main_axis.other()].max(1)));
-                    }
-                });
-                height as u64
-            }
-            AssignmentPath::Search => self.assign_grid_cells_with_spans(i, n_main, main_axis, backfill),
-        };
-
-        let [x, y] = grid_state::physical_pair(main_tracks, n_lines as f32, main_axis == Y);
+        let count = data.n_placed_children;
+        let n_lines = grid_search::assign_grid(
+            &mut GridInput { tree: self, parent: i, main: main_axis }, n_main, count, has_spans, backfill,
+        ).as_float();
+        let [x, y] = grid_state::physical_pair(main_tracks, n_lines, main_axis == Y);
         self.node_layout_data_mut(i).set_grid_lines(Xy::new(x, y));
-    }
-
-    /// Without spans, the children go into predictable positions and `backfill` has no effect, because there are no holes.
-    fn assign_grid_cells_in_order(&mut self, i: Self::NodeId, n_main: usize, main_axis: Axis) -> usize {
-        let mut line = 0;
-        let mut pos = 0;
-        for_each_layout_child!(self, i, child, {
-            if ! self.node_layout_params(child).free_placement {
-                self.node_layout_data_mut(child).set_grid_cell(main_axis, pos, line as u64);
-                (line, pos) = grid_search::next_cell(line, pos, n_main);
-            }
-        });
-        line + usize::from(pos != 0)
-    }
-
-    fn assign_grid_cells_with_spans(&mut self, i: Self::NodeId, n_main: usize, main_axis: Axis, backfill: bool) -> u64 {
-        let words_per_line = n_main.div_ceil(GRID_WORD_BITS);
-        let count = self.node_layout_data(i).n_placed_children;
-        let row_budget = grid_state::packed_row_budget(words_per_line);
-        if row_budget < u64::from(count) * u64::from(u16::MAX) {
-            // Each item can start at or before the current last row. Their
-            // total cross span bounds every intermediate occupancy length.
-            let mut height = 0;
-            for_each_layout_child!(self, i, child, {
-                let item = self.node_layout_params(child);
-                if !item.free_placement {
-                    height += u64::from(item.grid_span[main_axis.other()].max(1));
-                    if height > row_budget {
-                        return self.assign_grid_cells_sparse(i, n_main, main_axis, backfill);
-                    }
-                }
-            });
-        }
-        let mut occupied = std::mem::take(&mut self.layout_data().occupied_scratch);
-        // Start each row on a word boundary so the same masks apply to every row of a span.
-        if backfill {
-            // Each in-flow child occupies at least one cell, including children with spans.
-            let min_rows = (count as usize).div_ceil(n_main);
-            occupied.reserve(min_rows * words_per_line);
-        }
-        let mut cursor = grid_search::new_span_cursor();
-        for_each_layout_child!(self, i, child, {
-            if !self.node_layout_params(child).free_placement {
-                let span = self.node_layout_params(child).grid_span;
-                let span_pos = usize::from(span[main_axis].max(1)).min(n_main);
-                let span_line = usize::from(span[main_axis.other()].max(1));
-                let (line, pos) = cursor.place(&mut occupied, n_main, words_per_line, span_line, span_pos, backfill);
-
-                self.node_layout_data_mut(child).set_grid_cell(main_axis, pos, line as u64);
-            }
-        });
-        occupied.clear();
-        self.layout_data().occupied_scratch = occupied;
-        cursor.rows as u64
-    }
-
-    #[cold]
-    fn assign_grid_cells_sparse(&mut self, i: Self::NodeId, n_main: usize, main_axis: Axis, backfill: bool) -> u64 {
-        let mut occupied = Vec::new();
-        let mut rows = 0;
-        let mut start = (0, 0);
-        for_each_layout_child!(self, i, child, {
-            let item = self.node_layout_params(child);
-            if !item.free_placement {
-                let h = u64::from(item.grid_span[main_axis.other()].max(1));
-                let w = usize::from(item.grid_span[main_axis].max(1)).min(n_main);
-                let (line, pos) = grid_sparse::find_cell(&occupied, n_main, start, rows, h, w);
-                rows = rows.max(line + h);
-                let end = pos + w;
-                occupied.push(grid_sparse::Occupied { rows: (line, line + h), cols: (pos, end) });
-                if !backfill {
-                    start = (line, end);
-                }
-                self.node_layout_data_mut(child).set_grid_cell(main_axis, pos, line);
-            }
-        });
-        rows
     }
 
     #[inline(always)]
     fn total_padding(&self, i: Self::NodeId, axis: Axis) -> f32 {
-        let [start, end] = self.node_layout_params(i).padding[axis];
-        start + end
+        sizing_finish::padding(self.node_layout_params(i), axis)
+    }
+}
+
+struct NativeSizing<'a, T: Solve + ?Sized> {
+    tree: &'a mut T,
+}
+
+impl<T: Solve + ?Sized> sizing_stack::NativeModel for NativeSizing<'_, T> {
+    type Id = T::NodeId;
+    type Opened = OpenSlot<T::NodeId>;
+    type View = T;
+}
+
+impl<T: Solve + ?Sized> sizing_stack::NativeAccess for NativeSizing<'_, T> {
+    #[inline(always)]
+    fn view(&self) -> &T { self.tree }
+
+    #[inline(always)]
+    fn start(&mut self, slot: sizing_requests::Request<Self::Id>) -> Option<(Self::Opened, bool)> {
+        phase::start_slot(self.tree, slot)
     }
 
     #[inline(always)]
-    fn stack_gaps(&self, i: Self::NodeId, axis: Axis) -> f32 {
-        let (ChildrenLayout::Stack { axis: stack_axis, spacing, .. } | ChildrenLayout::Wrap { axis: stack_axis, spacing, .. }) = self.node_layout_params(i).children_layout else {
-            return 0.0;
-        };
-        if stack_axis != axis {
-            return 0.0;
-        }
-        let n = self.node_layout_data(i).n_placed_children as f32;
-        spacing * (n - 1.0).max(0.0)
+    fn finish(&mut self, opened: Self::Opened, check: bool) -> sizing_finish::StoredSize<Self::Id> {
+        phase::resume_slot(self.tree, opened, check)
+    }
+
+    #[inline(always)]
+    fn spill(&mut self, opened: Self::Opened, check: bool) {
+        self.tree.finish_slots_on_worklist(opened, check);
     }
 }
 
-struct BlockDependencies<'a, T: Solve + ?Sized, F> {
-    tree: &'a mut T,
-    parent: T::NodeId,
-    request: &'a mut F,
+impl<T: Solve + ?Sized> sizing_stack::WorkModel for T {
+    type Slot = sizing_requests::Request<T::NodeId>;
+    type Opened = OpenSlot<T::NodeId>;
+    type Storage = sizing_stack::TaskBuffer<Self::Slot, Self::Opened, RustVec>;
 }
 
-impl<T: Solve + ?Sized, F> ScheduleModel for BlockDependencies<'_, T, F> {
+impl<T: Solve + ?Sized> sizing_stack::SizingWork for T {
+    #[inline]
+    fn enter(&mut self, slot: Self::Slot) -> Option<bool> {
+        phase::enter_slot(self, slot)
+    }
+
+    #[inline]
+    fn open(&mut self, slot: Self::Slot, check: bool) -> Self::Opened {
+        if check { phase::open_slot::<_, true>(self, slot) } else { phase::open_slot::<_, false>(self, slot) }
+    }
+
+    #[inline]
+    fn finish(&mut self, opened: Self::Opened, check: bool) {
+        phase::resume_slot(self, opened, check);
+    }
+
+    #[inline]
+    fn slot(&self, opened: Self::Opened) -> Self::Slot { opened.slot }
+
+    #[inline]
+    fn append_requests(&self, slot: Self::Slot, tasks: &mut Self::Storage) {
+        let pending = core::mem::replace(tasks, sizing_stack::task_buffer(Vec::new()));
+        *tasks = sizing_stack::append_inputs(self, slot, pending);
+    }
+}
+
+#[inline(always)]
+fn sizing_request<I>(slot: Slot<I>) -> sizing_requests::Request<I> {
+    sizing_requests::Request { node: slot.node, vertical: slot.axis == Y, kind: slot.kind }
+}
+
+#[inline(always)]
+fn solve_slot<I: Copy>(request: sizing_requests::Request<I>) -> Slot<I> {
+    Slot { node: request.node, axis: request.axis(), kind: request.kind }
+}
+
+impl<T: Solve + ?Sized> phase::PhaseAccess for T {
+    type Id = T::NodeId;
+    type Float = RustFloat;
+
+    #[inline(always)]
+    fn node_record(&self, node: Self::Id) -> &NodeLayoutData {
+        self.node_layout_data(node)
+    }
+
+    #[inline(always)]
+    fn edit_record(&mut self, node: Self::Id) -> &mut NodeLayoutData {
+        self.node_layout_data_mut(node)
+    }
+
+    #[inline(always)]
+    fn initial_values() -> &'static [f32; N_SLOTS] { &EMPTY_VALUES }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn current_level(&mut self) -> &mut u16 { &mut self.layout_data().current_level }
+
+    #[cfg(feature = "incremental")]
+    #[inline(always)]
+    fn saw_cycle(&mut self) { self.layout_data().has_cycle = true; }
+
+    #[inline(always)]
+    fn warn_cycle(&mut self, node: Self::Id, axis: Axis) {
+        self.layout_warning(LayoutWarning::Cycle { node, axis });
+    }
+
+    #[inline(always)]
+    fn recompute(&mut self, slot: sizing_requests::Request<Self::Id>) -> sizing_finish::StoredSize<Self::Id> {
+        self.finish_slot(solve_slot(slot))
+    }
+}
+
+impl<T: Solve + ?Sized> sizing_requests::DeclarationModel for T {
     type Id = T::NodeId;
 }
 
-impl<T: Solve + ?Sized, F: FnMut(&mut T, Slot<T::NodeId>)> BlockSchedule for BlockDependencies<'_, T, F> {
+impl<T: Solve + ?Sized> sizing_requests::Declarations for T {
+    #[inline(always)]
+    fn params(&self, node: Self::Id) -> &LayoutParams {
+        self.node_layout_params(node)
+    }
+
+    #[inline(always)]
+    fn is_block_item(&self, node: Self::Id) -> bool {
+        self.node_layout_data(node).flags.is_block_item()
+    }
+
+    #[inline(always)]
+    fn block_parent_auto_height(&self, node: Self::Id) -> bool {
+        self.node_layout_data(node).flags.0 & NodeFlags::BLOCK_PARENT_AUTO_HEIGHT != 0
+    }
+}
+
+impl<T: Solve + ?Sized> sizing_child::ValueModel for T {}
+
+impl<T: Solve + ?Sized> sizing_child::Values for T {
+    #[inline(always)]
+    fn words(&self, node: Self::Id) -> &[f32; N_SLOTS] {
+        &self.node_layout_data(node).values
+    }
+}
+
+struct SizingFinisher<'a, T: Solve + ?Sized> {
+    tree: &'a mut T,
+    retain_grid_cells: bool,
+}
+
+impl<T: Solve + ?Sized> sizing_finish::FinishModel for SizingFinisher<'_, T> {
+    type Id = T::NodeId;
+    type Float = crate::placement_geometry::RustFloat;
+}
+
+impl<T: Solve + ?Sized> sizing_finish::FinishAccess for SizingFinisher<'_, T> {
+    #[inline(always)]
+    fn declaration(&self, slot: sizing_requests::Request<Self::Id>) -> Option<Size> {
+        self.tree.read_size(slot.node, slot.axis(), slot.kind)
+    }
+
+    #[inline(always)]
+    fn words(&self, slot: sizing_requests::Request<Self::Id>) -> &[f32; N_SLOTS] {
+        &self.tree.node_layout_data(slot.node).values
+    }
+
+    #[inline(always)]
+    fn stack_parent(&self, slot: sizing_requests::Request<Self::Id>) -> Option<Self::Id> {
+        self.tree.stack_parent(slot.node, slot.axis())
+    }
+
+    #[inline(always)]
+    fn params(&self, node: Self::Id) -> &LayoutParams {
+        self.tree.node_layout_params(node)
+    }
+
+    #[inline(always)]
+    fn flags(&self, node: Self::Id) -> NodeFlags {
+        self.tree.node_layout_data(node).flags
+    }
+
+    #[inline(always)]
+    fn line_words(&self, node: Self::Id) -> &[u32; 2] {
+        &self.tree.node_layout_data(node).parent_flow
+    }
+
+    #[inline(always)]
+    fn parent(&self, node: Self::Id) -> Option<Self::Id> {
+        self.tree.parent(node)
+    }
+
+    #[inline(always)]
+    fn parent_context(
+        &self, slot: sizing_requests::Request<Self::Id>, parent: Self::Id,
+    ) -> sizing_finish::ParentContext<'_> {
+        let child = self.tree.node_layout_params(slot.node);
+        let layout = self.tree.node_layout_params(parent).children_layout;
+        sizing_finish::ParentContext { child, layout }
+    }
+
+    #[inline(always)]
+    fn window_extent(&mut self, axis: Axis) -> f32 {
+        self.tree.layout_data().window_size[axis]
+    }
+
+    #[inline(always)]
+    fn placed_child_count(&self, node: Self::Id) -> u32 {
+        self.tree.node_layout_data(node).n_placed_children
+    }
+
+    #[inline(always)]
+    fn margins(params: &LayoutParams, axis: Axis) -> [f32; 2] {
+        margins(params, axis)
+    }
+
+    #[inline(always)]
+    fn warn(&mut self, slot: sizing_requests::Request<Self::Id>, warning: sizing_finish::Warning) {
+        let node = slot.node;
+        let axis = slot.axis();
+        self.tree.warn(match warning {
+            sizing_finish::Warning::MinAboveMax => LayoutWarning::MinAboveMax { node, axis },
+            sizing_finish::Warning::FitContentCollapsed => LayoutWarning::FitContentCollapsed { node, axis },
+            sizing_finish::Warning::NotFinite => LayoutWarning::NotFinite { node, axis },
+            sizing_finish::Warning::ImpossibleFracChildren => LayoutWarning::ImpossibleFracChildren { node, axis },
+        });
+    }
+}
+
+impl<T: Solve + ?Sized> sizing_finish::IntrinsicContent for SizingFinisher<'_, T> {
+    #[inline(always)]
+    fn wrapping_text(&self, slot: sizing_requests::Request<Self::Id>) -> bool {
+        self.tree.text_wraps(slot.node, slot.axis())
+    }
+
+    #[inline(always)]
+    fn content_needs_constraint(&self, slot: sizing_requests::Request<Self::Id>, params: &LayoutParams) -> bool {
+        params.content_measure.reads_other_axis(slot.axis())
+    }
+
+    #[inline(always)]
+    fn track_content(&mut self) {
+        #[cfg(feature = "incremental")]
+        { self.tree.layout_data().track_topology = true; }
+    }
+
+    #[inline(always)]
+    fn text_width(&mut self, node: Self::Id) -> f32 {
+        self.tree.measure_text_width(node)
+    }
+
+    #[inline(always)]
+    fn text_height(&mut self, node: Self::Id, width: Option<f32>) -> f32 {
+        self.tree.measure_text_height(node, width)
+    }
+
+    #[inline(always)]
+    fn content_size(&mut self, node: Self::Id, axis: Axis, known_dimensions: Xy<Option<f32>>, max_size: Xy<Option<f32>>) -> f32 {
+        self.tree.measure_content(node, ContentMeasureInput { axis, known_dimensions, max_size })[axis]
+    }
+}
+
+impl<T: Solve + ?Sized> sizing_finish::IntrinsicRows for SizingFinisher<'_, T> {
+    #[inline(always)]
+    fn intrinsic_layout(&self, slot: sizing_requests::Request<Self::Id>) -> ChildrenLayout {
+        self.tree.node_layout_params(slot.node).children_layout
+    }
+
+    #[inline(always)]
+    fn first_child(&self, parent: Self::Id) -> Option<Self::Id> {
+        self.tree.first_child(parent)
+    }
+
+    #[inline(always)]
+    fn child(&self, _parent: Self::Id, child: Self::Id) -> (Option<Self::Id>, bool) {
+        let following = self.tree.next_sibling(child);
+        let params = self.tree.node_layout_params(child);
+        (following, !params.disabled && !params.free_placement)
+    }
+}
+
+impl<T: Solve + ?Sized> sizing_finish::block::Model<T::NodeId> for SizingFinisher<'_, T> {
+    type Block = f32;
+    type BlockMemory = RustVec;
+}
+
+impl<T: Solve + ?Sized> sizing_finish::FlowShareModel for SizingFinisher<'_, T> {
+    type ShareFloat = fill_compaction::RustFloat;
+    type MetricFloat = RustFloat;
+    type ShareMemory = RustVec;
+    type ShareSpill = fill_compaction::VecSpill;
+}
+
+impl<T: Solve + ?Sized> sizing_finish::FlowAccess for SizingFinisher<'_, T> {
+
+    #[inline(always)]
+    fn flow_layout(&self, parent: Self::Id) -> ChildrenLayout {
+        self.tree.node_layout_params(parent).children_layout
+    }
+
+    type MarkedScan<'a> = crate::flow::SolverLine<'a, T, true> where Self: 'a;
+    type FreshScan<'a> = crate::flow::SolverLine<'a, T, false> where Self: 'a;
+
+    #[inline(always)]
+    fn marked_scan<'a>(
+        &'a self, _slot: sizing_requests::Request<Self::Id>, axis: Axis, _first: Option<Self::Id>, _available: Option<f32>, spacing: f32,
+    ) -> Self::MarkedScan<'a> {
+        crate::flow::SolverLine::new(self.tree, axis, spacing)
+    }
+
+    #[inline(always)]
+    fn fresh_scan<'a>(
+        &'a self, _slot: sizing_requests::Request<Self::Id>, axis: Axis, _first: Option<Self::Id>, _available: Option<f32>, spacing: f32,
+    ) -> Self::FreshScan<'a> {
+        crate::flow::SolverLine::new(self.tree, axis, spacing)
+    }
+
+    #[inline(always)]
+    fn mark_line(&mut self, next: Self::Id) {
+        self.tree.node_layout_data_mut(next).mark_wrap_start();
+    }
+
+    type LineRecords<'a> = crate::flow::WrapRecords<'a, T> where Self: 'a;
+
+    #[inline(always)]
+    fn stamp_source<'a>(&'a mut self, _slot: sizing_requests::Request<Self::Id>, _first: Option<Self::Id>, _stop: Option<Self::Id>,
+        _metric: wrap_metrics::Metric, _value: f32,
+    ) -> Self::LineRecords<'a> {
+        crate::flow::WrapRecords { tree: self.tree }
+    }
+
+    #[inline(always)]
+    fn first_fill(&self, parent: Self::Id, _axis: Axis) -> Option<Self::Id> {
+        self.tree.first_child(parent)
+    }
+
+    #[inline(always)]
+    fn fill_row(&self, child: Self::Id, axis: Axis, stop: Option<Self::Id>)
+        -> Option<(Option<Self::Id>, Option<fill_compaction::ChildTerms<fill_compaction::FillNumber<Self::ShareFloat>>>)> {
+        read_fill_row(self.tree, axis, child, stop)
+    }
+
+    #[inline(always)]
+    fn take_fill_spill(&mut self) -> Vec<FillChild> {
+        RustVec::take(&mut self.tree.layout_data().fills_scratch)
+    }
+
+    #[inline(always)]
+    fn return_fill_spill(&mut self, spill: Vec<FillChild>) {
+        self.tree.layout_data().fills_scratch = spill;
+    }
+
+    #[inline(always)]
+    fn block_record(&self, node: Self::Id) -> &NodeLayoutData { self.tree.node_layout_data(node) }
+
+    #[inline(always)]
+    fn edit_block_record(&mut self, node: Self::Id) -> &mut NodeLayoutData { self.tree.node_layout_data_mut(node) }
+
+    #[inline(always)]
+    fn block_margins(&mut self) -> &mut Vec<BlockMargins> { &mut self.tree.layout_data().block_margins }
+
+    #[inline(always)]
+    fn lift_block(value: f32) -> f32 { value }
+
+    #[inline(always)]
+    fn lower_block(value: f32) -> f32 { value }
+}
+
+impl<T: Solve + ?Sized> sizing_finish::FinishPublication for SizingFinisher<'_, T> {
+    #[inline(always)]
+    fn finite(value: f32) -> bool { value.is_finite() }
+
+    #[inline(always)]
+    fn publish(&mut self, slot: sizing_requests::Request<Self::Id>, value: f32) -> sizing_finish::StoredSize<Self::Id> {
+        sizing_finish::store_size(self.tree.node_layout_data_mut(slot.node), slot, value)
+    }
+
+    #[inline(always)]
+    fn assign_width_grid(
+        &mut self, slot: sizing_requests::Request<Self::Id>, width: f32, spacing: f32, backfill: bool,
+    ) {
+        self.tree.assign_width_grid_cells(slot.node, slot.axis(), width, spacing, backfill, self.retain_grid_cells);
+    }
+}
+
+#[cfg(test)]
+struct SizingDependencies<'a, T: Solve + ?Sized, F> {
+    tree: &'a mut T,
+    request: &'a mut F,
+}
+
+#[cfg(test)]
+impl<T: Solve + ?Sized, F> sizing_requests::RequestModel for SizingDependencies<'_, T, F> {
+    type Id = T::NodeId;
+    type Source = T;
+}
+
+#[cfg(test)]
+impl<T: Solve + ?Sized, F: FnMut(&mut T, Slot<T::NodeId>)> sizing_requests::RequestAccess for SizingDependencies<'_, T, F> {
+    #[inline(always)]
+    fn source(&self) -> &T { self.tree }
+
+    #[inline(always)]
+    fn emit(&mut self, slot: sizing_requests::Request<Self::Id>) {
+        (self.request)(self.tree, Slot { node: slot.node, axis: slot.axis(), kind: slot.kind });
+    }
+}
+
+impl<T: Solve + ?Sized> sizing_requests::RequestView for T {
+    type Id = T::NodeId;
+}
+
+impl<T: Solve + ?Sized> sizing_requests::RequestSource for T {
+    #[inline(always)]
+    fn form(&self, slot: sizing_requests::Request<Self::Id>) -> Option<Form> {
+        self.read_size(slot.node, slot.axis(), slot.kind).map(Size::dependency_form)
+    }
+
+    #[inline(always)]
+    fn final_declarations(&self, slot: sizing_requests::Request<Self::Id>) -> (bool, bool, bool) {
+        sizing_requests::final_presence(self, slot)
+    }
+
+    #[inline(always)]
+    fn stack_parent(&self, slot: sizing_requests::Request<Self::Id>) -> Option<Self::Id> {
+        Solve::stack_parent(self, slot.node, slot.axis())
+    }
+
+    #[inline(always)]
+    fn parent(&self, node: Self::Id) -> Option<Self::Id> {
+        TreeAdapter::parent(self, node)
+    }
+
+    #[inline(always)]
+    fn parent_uses_flow(&self, slot: sizing_requests::Request<Self::Id>, parent: Self::Id) -> bool {
+        !self.node_layout_params(slot.node).free_placement
+            && matches!(self.node_layout_params(parent).children_layout,
+                ChildrenLayout::Wrap { axis, .. } if axis != slot.axis())
+    }
+
+    #[inline(always)]
+    fn parent_uses_other_axis(&self, slot: sizing_requests::Request<Self::Id>, parent: Self::Id) -> bool {
+        dependency_rules::reads_parent_axis(false, !self.node_layout_params(slot.node).free_placement,
+            self.width_grid_main_axis(parent) == Some(slot.axis().other()))
+    }
+
+    #[inline(always)]
+    fn intrinsic_uses_flow(&self, slot: sizing_requests::Request<Self::Id>) -> bool {
+        match self.node_layout_params(slot.node).children_layout {
+            ChildrenLayout::Block => slot.vertical,
+            ChildrenLayout::Wrap { axis, .. } => axis != slot.axis(),
+            _ => false,
+        }
+    }
+
+    #[inline(always)]
+    fn intrinsic_uses_other_axis(&self, slot: sizing_requests::Request<Self::Id>) -> bool {
+        dependency_rules::reads_intrinsic_constraint(
+            self.node_layout_params(slot.node).intrinsic_reads_other_axis(slot.axis()),
+            self.width_grid_main_axis(slot.node) == Some(slot.axis().other()),
+        )
+    }
+
+    #[inline(always)]
+    fn first_child(&self, parent: Self::Id) -> Option<Self::Id> {
+        TreeAdapter::first_child(self, parent)
+    }
+
+    #[inline(always)]
+    fn child(&self, _: Self::Id, child: Self::Id) -> (Option<Self::Id>, bool) {
+        let next = self.next_sibling(child);
+        let params = self.node_layout_params(child);
+        (next, !params.disabled && !params.free_placement)
+    }
+
+    #[inline(always)]
+    fn flow_mode(&self, parent: Self::Id) -> sizing_requests::FlowMode {
+        match self.node_layout_params(parent).children_layout {
+            ChildrenLayout::Wrap { axis, .. } => sizing_requests::FlowMode::Wrap(axis == Y),
+            ChildrenLayout::Block => sizing_requests::FlowMode::Block,
+            _ => sizing_requests::FlowMode::Other,
+        }
+    }
+
+    #[inline(always)]
+    fn block_child(&self, _: Self::Id, child: Self::Id) -> (Option<Self::Id>, bool, bool) {
+        let params = self.node_layout_params(child);
+        let in_flow = !params.disabled && !params.free_placement;
+        (self.next_sibling(child), in_flow, in_flow
+            && self.node_layout_data(child).flags.0 & NodeFlags::BLOCK_CONTAINER != 0)
+    }
+
+    #[inline(always)]
+    fn wrap_child(&self, _: Self::Id, _: bool, child: Self::Id) -> (Option<Self::Id>, bool) {
+        let params = self.node_layout_params(child);
+        (self.next_sibling(child), !params.disabled && !params.free_placement)
+    }
+}
+
+impl<T: TreeAdapter + ?Sized> Solve for T {}
+
+#[inline]
+fn read_fill_row<T: Solve + ?Sized>(tree: &T, axis: Axis, child: T::NodeId, end: Option<T::NodeId>)
+    -> Option<(Option<T::NodeId>, Option<fill_compaction::ChildTerms<fill_compaction::FillNumber<fill_compaction::RustFloat>>>)> {
+    use fill_compaction::{ChildTerms, FillNumber};
+    if Some(child) == end {
+        return None;
+    }
+    let next = tree.next_sibling(child);
+    let node = tree.node_layout_params(child);
+    if node.free_placement || node.disabled {
+        return Some((next, None));
+    }
+    let margins = margins(node, axis).map(FillNumber::new);
+    let terms = sizing_child::fill_terms::<_, fill_compaction::RustFloat>(tree, child, axis == Y, node.fill_weight);
+    Some((next, Some(ChildTerms { margins, terms })))
+}
+
+struct FillInputs<'a, T: Solve + ?Sized> {
+    tree: &'a mut T,
+    axis: Axis,
+}
+
+impl<T: Solve + ?Sized> fill_compaction::ChildrenModel for FillInputs<'_, T> {
+    type Child = T::NodeId;
+    type Number = fill_compaction::FillNumber<fill_compaction::RustFloat>;
+}
+
+impl<T: Solve + ?Sized> fill_compaction::Children for FillInputs<'_, T> {
+    #[inline]
+    fn read(&self, child: Self::Child, end: Option<Self::Child>) -> Option<(Option<Self::Child>, Option<fill_compaction::ChildTerms<Self::Number>>)> {
+        read_fill_row(self.tree, self.axis, child, end)
+    }
+
+    #[inline]
+    fn take_spill(&mut self) -> Vec<FillChild> {
+        RustVec::take(&mut self.tree.layout_data().fills_scratch)
+    }
+
+    #[inline]
+    fn return_spill(&mut self, spill: Vec<FillChild>) {
+        self.tree.layout_data().fills_scratch = spill;
+    }
+}
+
+struct GridInput<'a, T: Solve + ?Sized> {
+    tree: &'a mut T,
+    parent: T::NodeId,
+    main: Axis,
+}
+
+impl<T: Solve + ?Sized> grid_sparse::InputModel for GridInput<'_, T> {
+    type Id = T::NodeId;
+}
+
+impl<T: Solve + ?Sized> grid_sparse::Inputs for GridInput<'_, T> {
+    #[inline]
+    fn inspect(&self, child: Self::Id) -> (Option<Self::Id>, Option<(u16, u16)>) {
+        let next = self.tree.next_sibling(child);
+        let item = self.tree.node_layout_params(child);
+        (next, grid_state::assignment_item(item.disabled, item.free_placement, item.grid_span.x, item.grid_span.y, self.main == Y))
+    }
+
+    #[inline]
+    fn publish(&mut self, child: Self::Id, (line, position): (u128, usize)) {
+        self.tree.node_layout_data_mut(child).set_grid_cell::<RustFloat>(self.main, position as f32, line as f32);
+    }
+}
+
+impl<T: Solve + ?Sized> grid_search::GridBuffers for GridInput<'_, T> {
     #[inline]
     fn first_child(&self) -> Option<Self::Id> {
         self.tree.first_child(self.parent)
     }
 
     #[inline]
-    fn read_child(&self, id: Self::Id) -> (Option<Self::Id>, bool, bool) {
-        let params = self.tree.node_layout_params(id);
-        let in_flow = !params.disabled && !params.free_placement;
-        (self.tree.next_sibling(id), in_flow, in_flow
-            && self.tree.node_layout_data(id).flags.0 & NodeFlags::BLOCK_CONTAINER != 0)
+    fn take_bitmap(&mut self) -> Vec<u64> {
+        RustVec::take(&mut self.tree.layout_data().occupied_scratch)
     }
 
     #[inline]
-    fn request(&mut self, request: BlockRequest<Self::Id>) {
-        let (node, kind) = match request {
-            BlockRequest::Height(child) => (child, Kind::Final),
-            BlockRequest::Margins(child) => (child, Kind::Flow),
-        };
-        (self.request)(self.tree, Slot { node, axis: Y, kind });
+    fn return_bitmap(&mut self, words: Vec<u64>) {
+        self.tree.layout_data().occupied_scratch = words;
     }
 }
-
-struct FlowDependencies<'a, T: Solve + ?Sized, F> {
-    tree: &'a mut T,
-    parent: T::NodeId,
-    main: Axis,
-    request: &'a mut F,
-}
-
-impl<T: Solve + ?Sized, F> wrap_schedule::Model for FlowDependencies<'_, T, F> {
-    type Id = T::NodeId;
-}
-
-impl<T: Solve + ?Sized, F: FnMut(&mut T, Slot<T::NodeId>)> wrap_schedule::FlowRequestSchedule for FlowDependencies<'_, T, F> {
-    #[inline(always)]
-    fn first(&self) -> Option<Self::Id> {
-        self.tree.first_child(self.parent)
-    }
-
-    #[inline(always)]
-    fn row(&self, child: Self::Id) -> (Option<Self::Id>, bool) {
-        let params = self.tree.node_layout_params(child);
-        (self.tree.next_sibling(child), !params.disabled && !params.free_placement)
-    }
-
-    #[inline(always)]
-    fn fills(&self, child: Self::Id) -> bool {
-        self.tree.any_size_is_fill(child, self.main)
-    }
-
-    #[inline(always)]
-    fn declaration(&self, child: Self::Id, producer: wrap_schedule::Producer, index: usize) -> bool {
-        use wrap_schedule::Producer;
-        let axis = match producer { Producer::Share => self.main, Producer::Cross => self.main.other() };
-        self.tree.read_size(child, axis, DECLARED_SIZES[index]).is_some_and(|size| {
-            let form = size.dependency_form();
-            match producer {
-                Producer::Share => form.contributes_to_share(),
-                Producer::Cross => form.contributes_to_intrinsic(),
-            }
-        })
-    }
-
-    #[inline(always)]
-    fn request(&mut self, request: wrap_schedule::Request<Self::Id>) {
-        use wrap_schedule::Request;
-        let (node, axis, kind) = match request {
-            Request::ParentMainFinal => (self.parent, self.main, Kind::Final),
-            Request::ParentShare => (self.parent, self.main, Kind::EvenShare),
-            Request::MainFinal(child) => (child, self.main, Kind::Final),
-            Request::MainDeclaration(child, index) => (child, self.main, DECLARED_SIZES[index]),
-            Request::CrossDeclaration(child, index) => (child, self.main.other(), DECLARED_SIZES[index]),
-        };
-        (self.request)(self.tree, Slot { node, axis, kind });
-    }
-}
-
-impl<T: TreeAdapter + ?Sized> Solve for T {}
-
-fn resolve_fill_share(fills: &mut [FillChild], budget: f32, mut unfrozen_weight: f32, max_unconstrained_weight: Option<f32>) -> f32 {
-    let mut active = fills;
-    let mut frozen_total = 0.0;
-    let mut share = 0.0;
-
-    while !active.is_empty() || max_unconstrained_weight.is_some() {
-        share = fill_budget::share(budget, frozen_total, unfrozen_weight);
-        if active.is_empty() {
-            break;
-        }
-        // Unconstrained children never freeze. Their target minus itself is zero
-        // for finite targets and NaN otherwise.
-        let initial_violation = if max_unconstrained_weight.is_some_and(|weight| !(share * weight).is_finite()) {
-            f32::NAN
-        } else {
-            0.0
-        };
-        let total_violation = fill_compaction::fold(active, initial_violation,
-            |child| child.resolve(share).1, |total, violation| total + violation);
-        if total_violation.abs() < EVEN_SHARE_EPSILON {
-            break;
-        }
-
-        // Retain constraints in sibling order so later shares use identical rounding.
-        let should_freeze = |violation: f32| if total_violation > 0.0 {
-            violation > EVEN_SHARE_EPSILON
-        } else {
-            violation < -EVEN_SHARE_EPSILON
-        };
-        let (remaining, totals) = fill_compaction::compact(active, (frozen_total, unfrozen_weight),
-            |child| {
-                let (size, violation) = child.resolve(share);
-                (should_freeze(violation), (size, child.weight))
-            },
-            |(total, weight), (size, frozen_weight)| (total + size, weight - frozen_weight),
-        );
-        (frozen_total, unfrozen_weight) = totals;
-        if !fill_compaction::continue_freezing(active.len(), remaining) {
-            break;
-        }
-        active = &mut active[..remaining];
-    }
-    share
-}
-
-const GRID_WORD_BITS: usize = u64::BITS as usize;
 
 #[cfg(test)]
 mod tests {
@@ -2469,8 +1098,16 @@ mod tests {
             for node in 0..tree.nodes.len() {
                 for axis in [X, Y] {
                     let slot = Slot { node, axis, kind: Kind::Final };
-                    tree.solve_slot_with_budget(slot, sizing_stack::NATIVE_DEPTH);
-                    spill.solve_slot_with_budget(slot, 0);
+                    let entry = cycle_rules::enter(tree.nodes[node].flags.check_state(axis, Kind::Final));
+                    tree.solve_slot(node, axis, Kind::Final);
+                    let _ = sizing_stack::drive_spill(NativeSizing { tree: &mut spill }, sizing_request(slot));
+                    if matches!(entry, Entry::Compute | Entry::CheckIntrinsic) {
+                        for tree in [&mut tree, &mut spill] {
+                            tree.request_dependencies(slot, &mut |tree, dependency| {
+                                assert_eq!(tree.nodes[dependency.node].flags.check_state(dependency.axis, dependency.kind), SOLVED);
+                            });
+                        }
+                    }
                 }
             }
             for (recursive, explicit) in tree.nodes.iter().zip(&spill.nodes) {
@@ -2523,7 +1160,7 @@ mod tests {
             leaf.reset_fixed_leaf(prepared);
             assert_eq!(leaf.values[slot].to_bits(), (-0.0f32).to_bits());
         }
-        leaf.set_grid_cell(X, 3, 1);
+        leaf.set_grid_cell::<RustFloat>(X, 3.0, 1.0);
         leaf.reset_fixed_leaf(prepared);
         assert_eq!(leaf.parent_flow, [0; 2]);
         leaf.flags.0 |= NodeFlags::WRAP_LINE_START;
@@ -2603,6 +1240,36 @@ mod tests {
             FillChild::new(None, Some(1.25), None, false, 1.0),
         ];
         assert_eq!(resolve_fill_share(&mut fills, 2e8, 2e8, Some(1.0)), 0.0);
+    }
+
+    #[cfg(feature = "incremental")]
+    #[test]
+    fn spilled_fill_constraints_preserve_child_order_and_share() {
+        let mut tree: LayoutTree = LayoutTree::new();
+        let root = tree.root();
+        tree.update_node_params(&root, LayoutParams {
+            children_layout: ChildrenLayout::Stack { arrange: Arrange::Start, axis: X, spacing: 0.0 },
+            ..LayoutParams::DEFAULT
+        }).unwrap();
+        let mut children = Vec::new();
+        for i in 0..12 {
+            let minimum = if i == 0 { 16.0 } else { 1.0 };
+            children.push(tree.add_node(&root, LayoutParams {
+                min_size: Xy::new(Some(Size::Pixels(minimum)), None),
+                ..LayoutParams::DEFAULT
+            }).unwrap());
+        }
+        children.push(tree.add_node(&root, LayoutParams::DEFAULT).unwrap());
+
+        tree.solve_layout(Xy::new(112.0, 40.0));
+        let mut left = 0.0;
+        for (i, child) in children.iter().enumerate() {
+            let right = left + if i == 0 { 16.0 } else { 8.0 };
+            assert_eq!(tree.layout(child).unwrap().x, [left, right]);
+            left = right;
+        }
+        assert!(tree.layout_data.fills_scratch.is_empty());
+        assert!(tree.layout_data.fills_scratch.capacity() >= 12);
     }
 
     #[cfg(feature = "incremental")]
@@ -3101,10 +1768,11 @@ mod tests {
     fn packed_grid_matches_cell_by_cell_search() {
         let mut rng = StdRng::seed_from_u64(314);
         for columns in [1_usize, 12, 63, 64, 65, 97, 129, 257] {
-            let words_per_line = columns.div_ceil(GRID_WORD_BITS);
+            let words_per_line = grid_state::row_stride(columns);
             for backfill in [false, true] {
                 let mut packed = Vec::new();
                 let mut sparse = Vec::new();
+                let mut sparse_cursor = grid_sparse::new_cursor();
                 let mut cells = Vec::<Vec<bool>>::new();
                 let mut cursor = (0, 0);
                 #[cfg(feature = "incremental")]
@@ -3135,14 +1803,10 @@ mod tests {
                         "columns={columns} backfill={backfill} cursor={cursor:?} span={width}x{height}",
                     );
                     assert_eq!(
-                        grid_sparse::find_cell(&sparse, columns, (cursor.0 as u64, cursor.1),
-                            cells.len() as u64, height as u64, width),
-                        (line as u64, pos),
+                        sparse_cursor.place(&mut sparse, columns, height as u16, width, backfill),
+                        (line as u128, pos),
                         "columns={columns} backfill={backfill} cursor={cursor:?} span={width}x{height}",
                     );
-                    sparse.push(grid_sparse::Occupied {
-                        rows: (line as u64, (line + height) as u64), cols: (pos, pos + width),
-                    });
                     #[cfg(feature = "incremental")]
                     placements.push((line, pos, height, width));
                     let end = line + height;

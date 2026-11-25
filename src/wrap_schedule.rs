@@ -23,7 +23,12 @@ verus! {
 pub trait Model {
     type Id: Copy + Eq;
     spec fn children(&self) -> Seq<Child<Self::Id>>;
-    spec fn requests(&self) -> Seq<Request<Self::Id>>;
+    type Event;
+    type Scope;
+    #[verifier::prophetic]
+    spec fn scope(&self) -> Self::Scope;
+    spec fn project(&self) -> spec_fn(Request<Self::Id>) -> Self::Event;
+    spec fn requests(&self) -> Seq<Self::Event>;
 }
 }
 
@@ -34,31 +39,37 @@ pub trait Model {
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub trait FlowRequestSchedule: Model {
-    #[cfg_attr(verus_keep_ghost, verus_spec(first => ensures first == child_at(self.children(),0)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(first => ensures first == child_at(self.children(),0), no_unwind))]
     fn first(&self) -> Option<Self::Id>;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(row =>
         requires member(self.children(),child),
         ensures row==(child_at(self.children(),index(self.children(),child)+1),
             current(self.children(),child).in_flow),
+        no_unwind
     ))]
     fn row(&self, child: Self::Id) -> (Option<Self::Id>, bool);
 
     #[cfg_attr(verus_keep_ghost, verus_spec(fill =>
         requires member(self.children(),child),
         ensures fill==current(self.children(),child).has_fill,
+        no_unwind
     ))]
     fn fills(&self, child: Self::Id) -> bool;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(needed =>
         requires member(self.children(),child), i<3,
         ensures needed==selected(current(self.children(),child),producer)[i as int],
+        no_unwind
     ))]
     fn declaration(&self, child: Self::Id, producer: Producer, i:usize) -> bool;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(
+        requires valid_request(request),
         ensures final(self).children()==old(self).children(),
-            final(self).requests()==old(self).requests().push(request),
+            final(self).scope()==old(self).scope(), final(self).project()==old(self).project(),
+            final(self).requests()==old(self).requests().push((old(self).project())(request)),
+        no_unwind
     ))]
     fn request(&mut self, request: Request<Self::Id>);
 }
@@ -68,15 +79,18 @@ pub trait FlowRequestSchedule: Model {
 #[cfg_attr(verus_keep_ghost, verus_spec(
     requires member(old(walk).children(),child),
     ensures final(walk).children()==old(walk).children(),
+        final(walk).scope()==old(walk).scope(), final(walk).project()==old(walk).project(),
         final(walk).requests()==old(walk).requests()+declarations(child,producer,
-            &selected(current(old(walk).children(),child),producer),3),
+            &selected(current(old(walk).children(),child),producer),3).map_values(old(walk).project()),
+    no_unwind
 ))]
 fn request_declarations<S: FlowRequestSchedule>(walk:&mut S, child:S::Id, producer:Producer) {
     let mut i = 0;
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant i<=3, walk.children()==old(walk).children(), member(walk.children(),child),
+            walk.scope()==old(walk).scope(), walk.project()==old(walk).project(),
             walk.requests()==old(walk).requests()+declarations(child,producer,
-                &selected(current(walk.children(),child),producer),i as nat),
+                &selected(current(walk.children(),child),producer),i as nat).map_values(walk.project()),
         decreases 3-i,
     ))]
     while i<3 {
@@ -87,8 +101,12 @@ fn request_declarations<S: FlowRequestSchedule>(walk:&mut S, child:S::Id, produc
             });
         }
         #[cfg(verus_keep_ghost)]
-        proof! { extend_declarations(old(walk).requests(),child,producer,
-            &selected(current(walk.children(),child),producer),i as nat); }
+        proof! {
+            let flags = &selected(current(walk.children(),child),producer);
+            extend_declarations(Seq::empty(),child,producer,flags,i as nat);
+            assert(walk.requests() =~= old(walk).requests()
+                + declarations(child,producer,flags,i as nat + 1).map_values(walk.project()));
+        }
         i += 1;
     }
 }
@@ -98,8 +116,10 @@ fn request_declarations<S: FlowRequestSchedule>(walk:&mut S, child:S::Id, produc
 #[cfg_attr(verus_keep_ghost, verus_spec(
     requires distinct(old(walk).children()),
     ensures final(walk).children()==old(walk).children(),
-        final(walk).requests()==old(walk).requests() + seq![own(producer)]
-            + child_requests(old(walk).children(),producer,old(walk).children().len()),
+        final(walk).scope()==old(walk).scope(), final(walk).project()==old(walk).project(),
+        final(walk).requests()==old(walk).requests() + seq![(old(walk).project())(own(producer))]
+            + child_requests(old(walk).children(),producer,old(walk).children().len()).map_values(old(walk).project()),
+    no_unwind
 ))]
 pub fn request_flow_inputs<S: FlowRequestSchedule>(walk: &mut S, producer:Producer) {
     #[cfg(verus_keep_ghost)]
@@ -108,8 +128,10 @@ pub fn request_flow_inputs<S: FlowRequestSchedule>(walk: &mut S, producer:Produc
     let mut next=walk.first();
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant walk.children()==old(walk).children(), distinct(walk.children()),
+            walk.scope()==old(walk).scope(), walk.project()==old(walk).project(),
             consumed@<=walk.children().len(), next==child_at(walk.children(),consumed@),
-            walk.requests()==old(walk).requests()+seq![own(producer)]+child_requests(walk.children(),producer,consumed@),
+            walk.requests()==old(walk).requests()+seq![(walk.project())(own(producer))]
+                +child_requests(walk.children(),producer,consumed@).map_values(walk.project()),
         ensures consumed@==walk.children().len(),
         decreases walk.children().len()-consumed@,
     ))]
@@ -129,7 +151,11 @@ pub fn request_flow_inputs<S: FlowRequestSchedule>(walk: &mut S, producer:Produc
             }
         }
         #[cfg(verus_keep_ghost)]
-        proof! { extend_children(old(walk).requests()+seq![own(producer)],walk.children(),producer,consumed@); }
+        proof! {
+            extend_children(Seq::empty(),walk.children(),producer,consumed@);
+            assert(walk.requests() =~= old(walk).requests() + seq![(walk.project())(own(producer))]
+                + child_requests(walk.children(),producer,consumed@ + 1).map_values(walk.project()));
+        }
         #[cfg(verus_keep_ghost)]
         { consumed=wrap_lines::advance(consumed); }
     }

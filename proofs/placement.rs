@@ -1,4 +1,12 @@
 use vstd::prelude::*;
+#[path = "../src/placement_geometry.rs"]
+pub(crate) mod geometry;
+#[path = "../src/placement_node.rs"]
+pub(crate) mod node;
+#[path = "../src/placement_modes.rs"]
+pub(crate) mod modes;
+#[path = "../src/placement_entry.rs"]
+pub(crate) mod entry;
 
 #[path = "../src/placement_work.rs"]
 pub(crate) mod kernel;

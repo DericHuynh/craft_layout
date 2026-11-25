@@ -2,17 +2,34 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "incremental")]
 #[macro_use]
 mod child_walk;
 #[macro_use]
 mod solve;
+mod declarations;
+#[cfg(feature = "batch-pilot")]
+#[allow(dead_code)] // The standalone experiment also uses the slice-based kernel API.
+mod batch_order;
 mod fill_budget;
 mod flow;
+mod full_layout;
 mod input_words;
 mod margin_storage;
+mod node_data;
+mod node_flags;
 pub mod measurement;
 mod place;
+mod placement_adapter;
+mod placement_geometry;
+mod packed_stack_leaf;
+mod placement_work;
+mod prepare_frame;
+mod prepare_leaf;
+mod prepare_nodes;
+mod sizing_pass;
 mod tree_walk;
+mod vec_memory;
 mod work_stack;
 #[cfg(feature = "incremental")]
 mod fixed_leaf_cache;
@@ -31,8 +48,10 @@ mod layout_tree;
 
 
 use std::fmt::Debug;
-use std::ops::{Index, IndexMut};
 
+pub use declarations::{Axis, ChildrenLayout, ContentMeasure, LayoutParams, MainAxisCellSize, Margin, Size, TextContent, Xy, XyRect};
+pub(crate) use declarations::{X, Y};
+pub use placement_geometry::{Anchor, Arrange, Pos, WindowOverflow};
 pub use solve::NodeLayoutData;
 pub(crate) use solve::*;
 pub(crate) use flow::*;
@@ -41,10 +60,15 @@ pub(crate) use incremental::*;
 #[cfg(feature = "incremental")]
 pub(crate) use topology::{Topology, TopologySnapshot};
 pub(crate) use place::Place;
+pub use place::FreePlacementError;
 #[cfg(feature = "incremental")]
 pub use incremental::IncrementalRelayoutOutcome;
 #[cfg(feature = "incremental")]
 pub use layout_tree::{ChildId, Destination, LayoutTree, NodeId, TreeError, measure_monospace_text};
+#[cfg(feature = "batch-pilot")]
+pub use layout_tree::{BatchLayoutError, BatchLayoutStats};
+#[cfg(feature = "incremental")]
+pub use tree_walk::AttachmentError;
 
 /// The adapter trait that allows the layout algorithm to read your UI tree and compute the layout for it.
 /// 
@@ -56,8 +80,13 @@ pub use layout_tree::{ChildId, Destination, LayoutTree, NodeId, TreeError, measu
 /// constraints, and its current content. Incremental solves may skip callbacks
 /// and reuse their previous results. Report changes to that content before the
 /// next incremental solve, and keep output and warning callbacks from changing
-/// the inputs to the solve in progress. Adapters can forward measurement
-/// callbacks to a [`measurement::Measurer`] whose implementation is checked by Verus.
+/// the inputs or the solver's records during a solve. Initialize new node
+/// records with [`NodeLayoutData::new`] and keep a distinct record for each live ID.
+/// The read and mutable accessors for an ID address that node's record.
+/// Preserve the solver state in those records and in [`LayoutData`] between
+/// incremental calls. The registration methods update that state for edits.
+/// Adapters can forward measurement callbacks to a [`measurement::Measurer`]
+/// whose implementation is checked by Verus.
 pub trait TreeAdapter {
     /// An id type that can be used to refer to nodes in your UI tree.
     type NodeId: Copy + Eq + Debug;
@@ -92,6 +121,7 @@ pub trait TreeAdapter {
     fn measure_content(&mut self, _i: Self::NodeId, _input: ContentMeasureInput) -> Xy<f32> { Xy::new_symm(0.0) }
     /// Called when the layout solver computes the end result for a node's rectangle.
     /// The output is provided in both absolute coordinates and relative to the parent, in logical pixels.
+    /// NaN edges use the quiet NaN encoding `0x7fc00000`.
     fn write_output_rect(&mut self, i: Self::NodeId, rect: XyRect, local_rect: XyRect);
 
     /// Whether the adapter keeps the last written bits of both rectangles for
@@ -100,12 +130,25 @@ pub trait TreeAdapter {
     #[cfg(feature = "incremental")]
     fn retains_output_rects(&self) -> bool { false }
 
+    /// Capacity hint for the checked Stack leaf preparation paths.
+    #[doc(hidden)]
+    #[cfg(feature = "batch-pilot")]
+    fn stack_leaf_count_hint(&self, node: Self::NodeId) -> u32 {
+        self.node_layout_data(node).n_placed_children
+    }
+
+    /// Estimated population available for reserving prepared leaf rows.
+    #[doc(hidden)]
+    #[cfg(feature = "batch-pilot")]
+    fn first_stack_population_hint(&self) -> u32 { 0 }
+
     /// Called when the layout solver finds a problem in a node's layout.
     /// 
     /// Depending on the use case, this can be reported to the user.
     fn layout_warning(&mut self, _warning: LayoutWarning<Self::NodeId>) {}
 
     /// Solves the layout on all nodes. `window_size` is the size of the window, in logical pixels.
+    /// The default unchecked incremental solve calls this method when it falls back.
     fn solve_layout(&mut self, window_size: Xy<f32>) {
         self.solve_full::<false>(window_size);
     }
@@ -126,8 +169,9 @@ pub trait TreeAdapter {
 
     /// After successful incremental measurement, compares its sizing slots and
     /// complete view against the engine's canonical full solve. Checks node order
-    /// and the exact bits of both rectangles. Publishes the full result and reports
-    /// `IncrementalRelayoutOutcome::CheckedIncrementalRelayoutMismatch` if they differ.
+    /// and the exact bits of both rectangles. Publishes the engine's full result,
+    /// including when incremental measurement falls back. Reports
+    /// `IncrementalRelayoutOutcome::CheckedIncrementalRelayoutMismatch` if the compared views differ.
     #[cfg(feature = "incremental")]
     fn solve_layout_incremental_checked(&mut self, window_size: Xy<f32>) -> IncrementalRelayoutOutcome {
         self.solve_incremental(window_size, true)
@@ -164,15 +208,7 @@ pub trait TreeAdapter {
     /// accepted by the adapter's accessors.
     #[cfg(feature = "incremental")]
     fn register_child_attached(&mut self, child: Self::NodeId) -> Result<(), AttachmentError> {
-        let root = self.root();
-        if child == root {
-            return Err(AttachmentError::Root);
-        }
-        let parent = self.parent(child).ok_or(AttachmentError::Detached)?;
-        let mut ancestor = parent;
-        while ancestor != root {
-            ancestor = self.parent(ancestor).ok_or(AttachmentError::Detached)?;
-        }
+        let parent = tree_walk::registered_parent(self, self.root(), child)?;
         self.incr_register_children_change(parent, Some(child));
         Ok(())
     }
@@ -198,22 +234,13 @@ pub trait TreeAdapter {
     ///
     /// Returns [`FreePlacementError`] before writing output if the target is
     /// the root, is detached, participates in its parent's flow, belongs to
-    /// a disabled subtree, or has visible nodes without solved sizes. Supply
-    /// a live ID accepted by the adapter's accessors.
+    /// a disabled subtree, or has visible nodes without the sizing values used
+    /// by placement. A wrapping container also needs each in-flow child's
+    /// cross-axis base size and applicable bounds. Supply a live ID accepted
+    /// by the adapter's accessors.
     fn place_free_placed_subtree(&mut self, node: Self::NodeId, parent_rect: XyRect) -> Result<(), FreePlacementError> {
         self.place_free_node(node, parent_rect)
     }
-}
-
-/// Reason why a node cannot be registered as a newly attached child.
-#[cfg(feature = "incremental")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum AttachmentError {
-    /// The layout root has no parent to notify.
-    Root,
-    /// The node's parent chain ends outside the active tree.
-    Detached,
 }
 
 #[cfg(feature = "incremental")]
@@ -229,22 +256,6 @@ impl std::fmt::Display for AttachmentError {
 #[cfg(feature = "incremental")]
 impl std::error::Error for AttachmentError {}
 
-/// Reason why a subtree cannot be repositioned independently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum FreePlacementError {
-    /// The root takes its rectangle from the layout window.
-    Root,
-    /// The node's parent chain ends outside the active tree.
-    Detached,
-    /// The node or one of its ancestors is disabled.
-    Disabled,
-    /// The parent positions this node as an in-flow child.
-    InFlow,
-    /// The target or a visible descendant lacks a solved width or height.
-    Unsolved,
-}
-
 impl std::fmt::Display for FreePlacementError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -258,138 +269,6 @@ impl std::fmt::Display for FreePlacementError {
 }
 
 impl std::error::Error for FreePlacementError {}
-
-/// The X or Y axes.
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-pub enum Axis {
-    /// The X axis.
-    X,
-    /// The Y axis.
-    Y,
-}
-
-impl Axis {
-    /// The axis orthogonal to `self`: Y if `self` is X and X if `self` is Y.
-    pub fn other(&self) -> Self {
-        match self {
-            Axis::X => Axis::Y,
-            Axis::Y => Axis::X,
-        }
-    }
-}
-
-pub(crate) use Axis::{X, Y};
-
-/// A generic container for two-dimensional data.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-pub struct Xy<T> {
-    /// The X component.
-    pub x: T,
-    /// The Y component.
-    pub y: T,
-}
-
-impl<T> Xy<T> {
-    /// Create a new `Xy<T>`.
-    pub const fn new(x: T, y: T) -> Self {
-        Self { x, y }
-    }
-}
-
-impl<T: Copy> Xy<T> {
-    /// Create a new `Xy<T>` with the same value on both axes.
-    pub const fn new_symm(v: T) -> Self {
-        Self { x: v, y: v }
-    }
-}
-
-impl<T> Index<Axis> for Xy<T> {
-    type Output = T;
-    #[inline(always)]
-    fn index(&self, axis: Axis) -> &T {
-        match axis {
-            Axis::X => &self.x,
-            Axis::Y => &self.y,
-        }
-    }
-}
-
-impl<T> IndexMut<Axis> for Xy<T> {
-    #[inline(always)]
-    fn index_mut(&mut self, axis: Axis) -> &mut T {
-        match axis {
-            Axis::X => &mut self.x,
-            Axis::Y => &mut self.y,
-        }
-    }
-}
-
-/// A 2D rectangle, expressed as a start and end coordinates on each axis.
-/// 
-/// Alias of `Xy<[f32; 2]>`.
-pub type XyRect = Xy<[f32; 2]>;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-/// The size of a layout node.
-pub enum Size {
-    /// A fixed size in logical pixels.
-    Pixels(f32),
-    /// A fraction of the parent element.
-    /// 
-    /// Collapses to zero if the parent has a size of zero, or if it's `FitContent` and has no other children that can give it a size. 
-    Frac(f32),
-    /// Fill all the available space in the parent element.
-    /// 
-    /// Multiple `Fill` children in a stack or wrap line divide its main-axis space according
-    /// to their `fill_weight`.
-    /// 
-    /// Collapses to zero if the parent has a size of zero, or if it's `FitContent` and has no other children that can give it a size. 
-    Fill,
-    /// As big as the element's children or the intrinsic content such as text, plus the `padding`.
-    FitContent,
-    /// In-flow block width fills the containing block, while height fits the content.
-    /// In other layouts both axes fit the content.
-    Auto,
-    /// A size that depends on the size of this same element in the other axis, according to an aspect ratio.
-    AspectRatio(f32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-/// The "origin" of a layout node inside its own rectangle.
-/// 
-/// For example, an element with `Size::Pixels(10.0)` and `Pos::Pixels(0.0)` on an axis will be placed at `[0.0, 10.0]`, `[-5.0, 5.0]` or `[-10.0, 0.0]` if its `Anchor` is `Start`, `Center` or `End` respectively.
-/// 
-/// Has no effect in a stack's main axis, or for `Pos` values other than `Pixels` and `Frac`.
-pub enum Anchor {
-    /// The left or top edge of the element's rectangle.
-    Start,
-    /// The center of the element's rectangle.
-    Center,
-    /// The right or bottom edge of the element's rectangle.
-    End,
-    /// Any fraction, with `0.0` corresponding to the left or top edge and `1.0` corresponding to the right or bottom edge.
-    Frac(f32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-/// The position of a layout node in the space of its parent.
-/// 
-/// If the node is a child of a stack, its `Pos` value on the stack's main axis is ignored, as the stack positions the child according to its own logic.
-/// 
-/// In a grid, the `Pos` value controls how the node is placed within the space of a grid cell.
-/// In normal block flow, margins and the containing block determine in-flow positions.
-pub enum Pos {
-    /// The left or top side of the parent.
-    Start,
-    /// The center of the parent.
-    Center,
-    /// The right or bottom side of the parent.
-    End,
-    /// A fixed number of pixels starting from the left or top side of the parent.
-    Pixels(f32),
-    /// A fraction of the parent's size starting from its left or top side.
-    Frac(f32),
-}
 
 /// A warning about a potential problem in the user's layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -478,176 +357,6 @@ impl<Id: Debug> std::fmt::Display for LayoutWarning<Id> {
     }
 }
 
-/// What to do if a freely placed node would extend past the edges of the window. It has no effect on the children of a `Stack` or a `Grid`, unless they are `free_placement`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum WindowOverflow {
-    /// Leave the node where it is, even if it extends past the window edge.
-    #[default]
-    Ignore,
-    /// Push the node back inside the window.
-    Clamp,
-    /// Mirror the node to the other side of its anchor point, as a right-click context menu does. If the mirrored node also doesn't fit, push it back inside the window.
-    Flip,
-}
-
-/// The way that a stack's children are arranged along its main axis.
-#[derive(Debug, Clone, Copy, Hash, PartialEq)]
-pub enum Arrange {
-    /// The children are arranged close together at the start of the stack.
-    Start,
-    /// The children are arranged close together at the end of the stack.
-    End,
-    /// The children are arranged close together in the center of the stack.
-    Center,
-    /// The free space is divided equally between the children, with no space at the edges.
-    SpaceBetween,
-    /// Each child gets an equal amount of free space on both sides, so the space at the edges is half the space between the children.
-    SpaceAround,
-    /// The free space is divided equally between the children and the edges.
-    SpaceEvenly,
-}
-
-/// What determines the size and number of cells on the main axis of a grid.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MainAxisCellSize {
-    /// Fix the number of cells and derive the cell size from the grid size.  
-    Count(u32),
-    /// Fix the size of the cells and derive the cell count from the grid size.
-    /// 
-    /// A grid with `FitContent` on its main axis uses one track. A cell width and
-    /// spacing that add to zero also produce one track.
-    Width(f32),
-}
-
-/// Whether the node is a stack or a grid that arranges its children according to a specific rule.
-/// 
-/// Individual children can override this by setting `free_placement = true`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ChildrenLayout {
-    /// Every child can position itself freely according to its `Pos`.
-    Free,
-    /// Children are arranged on a stack.
-    /// 
-    /// This means that the children's `Pos` value on the stack's axis is ignored, but it can still be used to control alignment on the cross axis. 
-    Stack {
-        /// The way that the stack's children are arranged along its main axis.
-        arrange: Arrange,
-        /// The "main" axis along which the children are stacked.
-        axis: Axis,
-        /// The spacing between the stacked children.
-        spacing: f32,
-    },
-    /// Place children in successive rows or columns. A child that would overflow starts a new line.
-    Wrap {
-        /// Primary direction of each line.
-        axis: Axis,
-        /// How children are distributed along each line.
-        arrange: Arrange,
-        /// Space between items on the same line.
-        spacing: f32,
-        /// Space between lines.
-        line_spacing: f32,
-    },
-    /// Normal block flow. Children stack vertically with adjoining block margins collapsed.
-    /// Block positions come from flow and inline margins. Flip the X origin for right-to-left placement.
-    Block,
-    /// Children are arranged in a grid.
-    ///
-    /// The `Pos` value of the children on both axes can still be used to place them within the space of the grid cell.
-    Grid {
-        /// What determines the size and number of cells on the main axis of the grid.
-        columns: MainAxisCellSize,
-        /// The spacing between grid elements along the `X` axis.
-        spacing_x: f32,
-        /// The spacing between grid elements along the `Y` axis.
-        spacing_y: f32,
-        /// The axis along which the children are arranged.
-        main_axis: Axis,
-        /// Whether later children can fill a gap left by previous children.
-        /// 
-        /// Gaps can only be left when elements have span greater than the default of one.
-        backfill: bool,
-    },
-}
-
-/// The text content of a node, if any. The solver will measure it with `TreeAdapter::measure_text_width()` and `TreeAdapter::measure_text_height()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TextContent {
-    /// The node has no text.
-    None,
-    /// Text that wraps. Its height depends on the node's width.
-    Wrapping,
-    /// Text that doesn't wrap. Its width and height don't depend on the node's size.
-    Fixed,
-}
-
-/// An in-flow margin on one edge of a node's box.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Margin(u32);
-
-impl Margin {
-    /// A margin of zero logical pixels.
-    pub const ZERO: Self = Self(0);
-
-    /// Share the unused inline space in block flow. On other edges it is zero.
-    pub const AUTO: Self = Self(f32::NAN.to_bits());
-
-    /// A finite margin in logical pixels. Negative values are allowed.
-    ///
-    /// Returns `None` for infinite or NaN values.
-    pub const fn px(pixels: f32) -> Option<Self> {
-        match input_words::finite_margin(pixels.to_bits()) {
-            Some(word) => Some(Self(word)),
-            None => None,
-        }
-    }
-
-    /// The margin in logical pixels, or `None` for an automatic margin.
-    pub const fn as_px(self) -> Option<f32> {
-        if self.0 == Self::AUTO.0 { None } else { Some(f32::from_bits(self.0)) }
-    }
-
-    #[inline(always)]
-    pub(crate) fn pixels(self) -> f32 {
-        self.as_px().unwrap_or(0.0)
-    }
-}
-
-impl Debug for Margin {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.as_px() {
-            Some(pixels) => f.debug_tuple("Pixels").field(&pixels).finish(),
-            None => f.write_str("Auto"),
-        }
-    }
-}
-
-impl Default for Margin {
-    fn default() -> Self {
-        Self::ZERO
-    }
-}
-
-/// Which resolved dimension an intrinsic content measurement needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ContentMeasure {
-    /// No custom intrinsic content.
-    #[default]
-    None,
-    /// Each dimension can be measured independently.
-    Independent,
-    /// The intrinsic height depends on the resolved content width.
-    HeightForWidth,
-    /// The intrinsic width depends on the resolved content height.
-    WidthForHeight,
-}
-
-impl ContentMeasure {
-    pub(crate) fn reads_other_axis(self, axis: Axis) -> bool {
-        matches!((self, axis), (Self::HeightForWidth, Y) | (Self::WidthForHeight, X))
-    }
-}
-
 /// Inputs to a custom intrinsic content measurement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContentMeasureInput {
@@ -687,76 +396,6 @@ impl measurement::SizeBits {
     #[inline]
     pub fn to_size(self) -> Xy<f32> {
         Xy::new(f32::from_bits(self.x), f32::from_bits(self.y))
-    }
-}
-
-/// The parameters that define a node's layout, from its own sizing to how it places its children.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LayoutParams {
-    /// The position of a layout node in the space of its parent.
-    pub position: Xy<Pos>,
-    /// The size of a layout node on its two axes.
-    pub size: Xy<Size>,
-    /// The minimum size of a layout node on its two axes.
-    pub min_size: Xy<Option<Size>>,
-    /// The maximum size of a layout node on its two axes.
-    pub max_size: Xy<Option<Size>>,
-    /// The space that this node keeps for itself as padding before giving space to its children.
-    pub padding: Xy<[f32; 2]>,
-    /// Space outside the node's box in a stack, wrap, grid, or block. Each pair uses physical
-    /// start/end order (left/right or top/bottom). Free placement ignores margins.
-    pub margin: Xy<[Margin; 2]>,
-    /// How this node positions its children.
-    pub children_layout: ChildrenLayout,
-    /// Place this node freely within the parent, outside the parent's in-flow layout.
-    pub free_placement: bool,
-    /// Whether this node should occupy more than one cell if this node is a child of a grid.
-    pub grid_span: Xy<u16>,
-    /// The text content of this node, if any.
-    pub text: TextContent,
-    /// Optional content measured by `TreeAdapter::measure_content()`.
-    pub content_measure: ContentMeasure,
-    /// The image or fixed-size content of a node, if any. 
-    pub image: Option<Xy<f32>>,
-    /// The "origin" of a layout node inside its own rectangle.
-    pub anchor: Xy<Anchor>,
-    /// If true for one axis, children elements are placed starting from the right or bottom edge. If the node is a stack or a grid, the order in which children are arranged is reversed. 
-    pub children_origin_flipped: Xy<bool>,
-    /// The node's behavior if it extends past the edges of the window.
-    pub window_overflow: Xy<WindowOverflow>,
-    /// In a stack, the `Fill` children share the free space in proportion to their weight. It has no effect on the other axis.
-    pub fill_weight: f32,
-    /// True if a node should be ignored by the layout solver. When a node is disabled, all its descendants must be disabled too.
-    pub disabled: bool,
-
-}
-
-impl LayoutParams {
-    /// Default values for the `LayoutParams`.
-    pub const DEFAULT: LayoutParams = LayoutParams {
-        size: Xy { x: Size::Fill, y: Size::Fill },
-        min_size: Xy { x: None, y: None },
-        max_size: Xy { x: None, y: None },
-        fill_weight: 1.0,
-        padding: Xy { x: [0.0, 0.0], y: [0.0, 0.0] },
-        margin: Xy::new_symm([Margin::ZERO; 2]),
-        children_layout: ChildrenLayout::Free,
-        free_placement: false,
-        grid_span: Xy { x: 1, y: 1 },
-        text: TextContent::None,
-        content_measure: ContentMeasure::None,
-        image: None,
-        disabled: false,
-        position: Xy { x: Pos::Center, y: Pos::Center },
-        anchor: Xy { x: Anchor::Center, y: Anchor::Center },
-        children_origin_flipped: Xy { x: false, y: false },
-        window_overflow: Xy { x: WindowOverflow::Ignore, y: WindowOverflow::Ignore },
-    };
-}
-
-impl Default for LayoutParams {
-    fn default() -> Self {
-        Self::DEFAULT
     }
 }
 
@@ -810,12 +449,16 @@ pub struct LayoutData<I> {
     #[cfg(feature = "incremental")]
     pub(crate) placement_scale_changed: bool,
     pub(crate) block_margins: Vec<BlockMargins>,
-    pub(crate) prepare_stack: Vec<(PrepareFrame<I>, I)>,
+    pub(crate) prepare_stack: Vec<(prepare_frame::PrepareFrame<I>, I)>,
+    pub(crate) sizing_stack: Vec<SizingTask<I>>,
 
     #[cfg(feature = "incremental")]
     pub(crate) node_changes: Vec<(I, NodeChange)>,
     #[cfg(feature = "incremental")]
     pub(crate) content_changes: Vec<I>,
+    #[cfg(feature = "incremental")]
+    // The pending fallback was raised by edit intake, before any sizing ran.
+    pub(crate) replay_pending: bool,
     #[cfg(feature = "incremental")]
     pub(crate) children_changed: bool,
     #[cfg(feature = "incremental")]
@@ -829,9 +472,13 @@ pub struct LayoutData<I> {
     #[cfg(feature = "incremental")]
     pub(crate) regions: Vec<I>,
     #[cfg(feature = "incremental")]
+    pub(crate) plan_spill: Vec<incremental::Suspended<I>>,
+    #[cfg(feature = "incremental")]
     pub(crate) margin_scratch: Vec<BlockMargins>,
     #[cfg(feature = "incremental")]
     pub(crate) checked_values: Vec<(I, [u32; N_SLOTS])>,
+    #[cfg(feature = "incremental")]
+    pub(crate) packed_stack_leaves: crate::packed_stack_leaf::PackedStackLeaves<I>,
     #[cfg(feature = "incremental")]
     pub(crate) checked_view: Vec<incremental::OutputRecord<I>>,
     #[cfg(feature = "incremental")]
@@ -846,7 +493,15 @@ pub struct LayoutData<I> {
     #[cfg(feature = "incremental")]
     pub(crate) current_level: u16,
     #[cfg(feature = "incremental")]
+    pub(crate) numeric_touched: Vec<I>,
+    #[cfg(feature = "incremental")]
     pub(crate) queue: WorkQueue<Slot<I>>,
+    #[cfg(feature = "incremental")]
+    pub(crate) numeric_tape: incremental::tape::Tape<I, NodeChange, incremental::tape_plan::Ranked<I>>,
+    #[cfg(feature = "incremental")]
+    pub(crate) numeric_wrap: Option<bool>,
+    #[cfg(feature = "incremental")]
+    pub(crate) sizing_warned: bool,
 
     #[cfg(not(feature = "incremental"))]
     _marker: std::marker::PhantomData<I>,
@@ -861,6 +516,8 @@ impl<I> LayoutData<I> {
             #[cfg(feature = "incremental")]
             content_changes: Vec::new(),
             #[cfg(feature = "incremental")]
+            replay_pending: false,
+            #[cfg(feature = "incremental")]
             children_changed: false,
             #[cfg(feature = "incremental")]
             unknown_structure: false,
@@ -871,9 +528,13 @@ impl<I> LayoutData<I> {
             #[cfg(feature = "incremental")]
             regions: Vec::new(),
             #[cfg(feature = "incremental")]
+            plan_spill: Vec::new(),
+            #[cfg(feature = "incremental")]
             margin_scratch: Vec::new(),
             #[cfg(feature = "incremental")]
             checked_values: Vec::new(),
+            #[cfg(feature = "incremental")]
+            packed_stack_leaves: crate::packed_stack_leaf::PackedStackLeaves::new(),
             #[cfg(feature = "incremental")]
             checked_view: Vec::new(),
             #[cfg(feature = "incremental")]
@@ -887,7 +548,15 @@ impl<I> LayoutData<I> {
             #[cfg(feature = "incremental")]
             current_level: 0,
             #[cfg(feature = "incremental")]
+            numeric_touched: Vec::new(),
+            #[cfg(feature = "incremental")]
             queue: WorkQueue::new(),
+            #[cfg(feature = "incremental")]
+            numeric_tape: incremental::tape::Tape::new(),
+            #[cfg(feature = "incremental")]
+            numeric_wrap: None,
+            #[cfg(feature = "incremental")]
+            sizing_warned: false,
             fills_scratch: Vec::new(),
             occupied_scratch: Vec::new(),
             window_size: Xy::new(0.0, 0.0),
@@ -896,6 +565,7 @@ impl<I> LayoutData<I> {
             placement_scale_changed: false,
             block_margins: Vec::new(),
             prepare_stack: Vec::new(),
+            sizing_stack: Vec::new(),
             #[cfg(not(feature = "incremental"))]
             _marker: std::marker::PhantomData,
         }
@@ -908,12 +578,11 @@ impl<I> LayoutData<I> {
     pub fn set_pixel_scale(&mut self, scale: Option<PixelScale>) {
         let scale = scale.map(PixelScale::get);
         #[cfg(feature = "incremental")]
-        {
-            self.placement_scale_changed = update_scale_dirty(
-                self.placement_scale_changed, self.pixel_scale != scale,
-            );
-        }
-        self.pixel_scale = scale;
+        placement_adapter::set_scale::<placement_geometry::RustFloat>(
+            &mut self.pixel_scale, &mut self.placement_scale_changed, scale,
+        );
+        #[cfg(not(feature = "incremental"))]
+        { self.pixel_scale = scale; }
     }
 }
 

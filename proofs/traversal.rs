@@ -1,5 +1,6 @@
 //! Placement order through first-child/next-sibling links.
 use vstd::prelude::*;
+#[macro_use]
 #[path = "../src/child_walk.rs"]
 mod kernel;
 
@@ -50,6 +51,76 @@ pub open spec fn advanced<I>(links: Seq<(I, bool)>, stop: Option<I>, result: Opt
 use super::{Key, Phase, Rule, Step, Work, writes};
 use super::placement::{PathEdge, PlacementWork, Route, placement_route};
 use super::retained_view::visible_keys;
+
+use crate::placement_walk::place_siblings;
+
+verus! {
+
+// Represent one sibling list using the ranges given by a consistent preorder
+// encoding. `descend` is the publication decision, which may prune a subtree.
+pub struct PlacementRow {
+    pub node: usize,
+    pub end: usize,
+    pub disabled: bool,
+    pub descend: bool,
+}
+
+pub open spec fn finite_sibling_ranges(rows: Seq<PlacementRow>, end: usize) -> bool {
+    forall |i: int| 0 <= i < rows.len() ==> {
+        let r = #[trigger] rows[i];
+        r.node < r.end <= end
+            && r.end == if i + 1 < rows.len() { rows[i + 1].node } else { end }
+    }
+}
+
+pub open spec fn sibling_remaining(rows: Seq<PlacementRow>, cursor: Option<usize>, end: usize) -> int {
+    match cursor {
+        Some(i) => end - rows[i as int].node,
+        None => 0,
+    }
+}
+
+/// Check the loop shared by Free, Stack, Wrap, Block, and Grid placement.
+/// Siblings already skipped cannot reenter the cursor. On a branch, the child
+/// range and the later siblings together contain strictly fewer pending nodes.
+pub fn placement_prefix(rows: &[PlacementRow], cursor: &mut Option<usize>, end: usize)
+    -> (branch: Option<(usize, usize)>)
+    requires
+        finite_sibling_ranges(rows@, end),
+        old(cursor).is_some() ==> old(cursor).unwrap() < rows.len(),
+    ensures match branch {
+        Some((first, limit)) => {
+            &&& first < limit
+            &&& limit - first + sibling_remaining(rows@, *final(cursor), end)
+                < sibling_remaining(rows@, *old(cursor), end)
+            &&& final(cursor).is_some() ==> sibling_remaining(rows@, *final(cursor), end) > 0
+        },
+        None => final(cursor).is_none(),
+    },
+    no_unwind
+{
+    place_siblings!(
+        #[verus_spec(
+            invariant
+                finite_sibling_ranges(rows@, end),
+                cursor.is_some() ==> cursor.unwrap() < rows.len(),
+                sibling_remaining(rows@, *cursor, end) <= sibling_remaining(rows@, *old(cursor), end),
+            ensures cursor.is_none(),
+            decreases sibling_remaining(rows@, *cursor, end),
+        )]; (*cursor, i); {
+            let r = &rows[i];
+        }; if i + 1 < rows.len() { Some(i + 1) } else { None }; r.disabled; {
+            if r.descend && r.node + 1 < r.end {
+                Some((r.node + 1, r.end))
+            } else {
+                None
+            }
+        }
+    );
+    None
+}
+
+}
 
 verus! {
 

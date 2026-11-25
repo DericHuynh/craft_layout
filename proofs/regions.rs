@@ -2,6 +2,13 @@
 use vstd::prelude::*;
 #[path = "../src/region_list.rs"]
 mod kernel;
+#[path = "../src/incremental/regional.rs"]
+pub(crate) mod regional;
+#[path = "../src/incremental/plan.rs"]
+mod plan;
+pub(crate) use plan::SubtreeCounts;
+#[path = "../src/incremental/register.rs"]
+mod register;
 
 verus! {
 

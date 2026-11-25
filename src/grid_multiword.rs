@@ -2,6 +2,7 @@
 #![allow(unexpected_cfgs)]
 
 use super::grid_words;
+use grid_words::ZeroCounts;
 #[cfg(verus_keep_ghost)]
 use super::*;
 #[cfg(verus_keep_ghost)]
@@ -19,6 +20,7 @@ use vstd::prelude::*;
         row_open(packed(mem@, stride as int), line as int, stop-line, word as int, !pair[0]),
         PAIR ==> row_open(packed(mem@, stride as int), line as int, stop-line, word+1, !pair[1]),
         !PAIR ==> pair[1] == u64::MAX,
+    no_unwind
 ))]
 fn blocked_words<const PAIR: bool>(
     mem: &[u64],
@@ -84,11 +86,15 @@ fn blocked_words<const PAIR: bool>(
         next < 64 ==> min <= next && 64 < next+span
             && open_across(!lo, !hi, next as int, span as int),
         forall |p:int| min<=p<next && 64<p+span ==> !#[trigger] open_across(!lo,!hi,p,span as int),
+    no_unwind
 ))]
-fn first_crossing(lo: u64, hi: u64, span: u32, min: u32) -> u32 {
-    let left = lo.leading_zeros();
-    let right = hi.trailing_zeros();
-    let first = (64 - left).max(65 - span).max(min);
+fn first_crossing<C: ZeroCounts>(lo: u64, hi: u64, span: u32, min: u32) -> u32 {
+    let left = C::leading(lo);
+    let right = C::trailing(hi);
+    let occupied = 64 - left;
+    let crossing = 65 - span;
+    let first = if occupied > crossing { occupied } else { crossing };
+    let first = if first > min { first } else { min };
     let next = if first == 64 || span > (64 - first) + right {
         64
     } else {
@@ -107,8 +113,9 @@ fn first_crossing(lo: u64, hi: u64, span: u32, min: u32) -> u32 {
         columns.0<=columns.1, columns.1+span<=stride*64,
     ensures
         row_first(packed(mem@,stride as int), line as int,h as int,span as int,columns.0 as int,columns.1 as int,result),
+    no_unwind
 ))]
-fn scan_row(
+fn scan_row<C: ZeroCounts>(
     mem: &[u64],
     stride: usize,
     rows: usize,
@@ -118,7 +125,8 @@ fn scan_row(
     columns: (usize, usize),
 ) -> Option<usize> {
     let (pos, last_start) = columns;
-    let stop = rows.min(line.saturating_add(h));
+    let spanned_end = line.saturating_add(h);
+    let stop = if spanned_end < rows { spanned_end } else { rows };
     let mut word = pos / 64;
     let mut min = (pos % 64) as u32;
     let mut previous: Option<u64> = None;
@@ -153,7 +161,7 @@ fn scan_row(
         // A start in the preceding word can spill into this pair and
         // precedes any start contained in one of its two words.
         if let Some(prior) = previous {
-            let cross = first_crossing(prior, lo, span, 0);
+            let cross = first_crossing::<C>(prior, lo, span, 0);
             #[cfg(verus_keep_ghost)]
             proof! {
                 check_crossing(packed(mem@,stride as int),stride as int,line as int,h as int,span,
@@ -168,7 +176,7 @@ fn scan_row(
             return None;
         }
         let mask = grid_words::word_range(min, 63);
-        let (left, right) = grid_words::first_pair_starts((!lo & mask, !hi), span);
+        let (left, right) = grid_words::first_pair_starts::<C>((!lo & mask, !hi), span);
         #[cfg(verus_keep_ghost)]
         proof! {
             check_internal(packed(mem@,stride as int),line as int,h as int,span,
@@ -178,7 +186,7 @@ fn scan_row(
             let col = word * 64 + left as usize;
             return if col <= last_start { Some(col) } else { None };
         }
-        let cross = first_crossing(lo, hi, span, min);
+        let cross = first_crossing::<C>(lo, hi, span, min);
         #[cfg(verus_keep_ghost)]
         proof! {
             if word+1==stride { assert(!hi==0) by(bit_vector) requires hi==u64::MAX; }
@@ -220,8 +228,9 @@ fn scan_row(
     ensures result.0 <= rows+1,
         first_fit(packed(mem@,stride as int),columns as int,h as int,w as int,
             (start.0 as int,start.1 as int),(result.0 as int,result.1 as int)),
+    no_unwind
 ))]
-pub(super) fn find_grid_cell(
+pub(super) fn find_grid_cell<C: ZeroCounts>(
     mem: &[u64],
     columns: usize,
     stride: usize,
@@ -251,7 +260,7 @@ pub(super) fn find_grid_cell(
         decreases rows+1-line,
     ))]
     while line < rows {
-        let next = scan_row(mem, stride, rows, line, h, w as u32, (pos, last_start));
+        let next = scan_row::<C>(mem, stride, rows, line, h, w as u32, (pos, last_start));
         #[cfg(verus_keep_ghost)]
         proof! {
             finish_row_scan(packed(mem@,stride as int),columns as int,h as int,w as int,
@@ -277,7 +286,7 @@ pub(super) fn find_grid_cell(
 
 #[cfg(test)]
 mod tests {
-    use super::find_grid_cell;
+    use super::{find_grid_cell, grid_words::IntrinsicZeroCounts};
 
     #[test]
     fn picks_the_first_cross_word_start_and_respects_the_legal_tail() {
@@ -287,11 +296,11 @@ mod tests {
             row[1] &= !(1 | (1 << 63));
             row[2] &= !3;
         }
-        assert_eq!(find_grid_cell(&occupied, 130, 3, 8, (0, 0), 2, 2), (0, 63));
+        assert_eq!(find_grid_cell::<IntrinsicZeroCounts>(&occupied, 130, 3, 8, (0, 0), 2, 2), (0, 63));
         assert_eq!(
-            find_grid_cell(&occupied, 130, 3, 8, (0, 64), 2, 3),
+            find_grid_cell::<IntrinsicZeroCounts>(&occupied, 130, 3, 8, (0, 64), 2, 3),
             (0, 127)
         );
-        assert_eq!(find_grid_cell(&occupied, 129, 3, 8, (0, 64), 2, 3), (8, 0));
+        assert_eq!(find_grid_cell::<IntrinsicZeroCounts>(&occupied, 129, 3, 8, (0, 64), 2, 3), (8, 0));
     }
 }

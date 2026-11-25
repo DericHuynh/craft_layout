@@ -44,6 +44,13 @@ pub proof fn locate<I>(children:Seq<Child<I>>,i:nat,id:I)
     assert(children[i as int].id==children[j as int].id);
 }
 
+pub open spec fn valid_request<I>(request:Request<I>) -> bool {
+    match request {
+        Request::MainDeclaration(_, i) | Request::CrossDeclaration(_, i) => i < 3,
+        _ => true,
+    }
+}
+
 pub open spec fn own<I>(producer:Producer) -> Request<I> {
     match producer {
         Producer::Share=>Request::ParentMainFinal,

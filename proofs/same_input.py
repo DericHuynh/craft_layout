@@ -16,6 +16,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 HARNESSES = (
     'agrees_on_every_field',
+    'owned_placement_gate_keeps_sizing_inputs',
     'reports_all_numeric_inputs',
     'structural_inputs_request_rebuild',
 )
@@ -98,7 +99,7 @@ def oracle(item, index):
     return f'impl{generic} Bits for {name}{arguments} {{fn matches_bits(&self,other:&Self)->bool{{{body}}}}}'
 
 
-def generate(index, source):
+def generate(index, crate):
     types = {}
 
     def walk(node):
@@ -129,17 +130,57 @@ def generate(index, source):
             for field in ids:
                 walk(index[str(field)]['inner']['struct_field'])
 
-    collect(next(item for item in index.values() if item['name'] == 'LayoutParams' and item['crate_id'] == 0))
-    lines = source.read_text().splitlines(keepends=True)
+    layout = next(item for item in index.values() if item['name'] == 'LayoutParams' and item['crate_id'] == 0)
+    collect(layout)
+    sources = {}
+    oracles = {}
     for item in types.values():
         span = item['span']
-        if span['filename'] != 'src/lib.rs' or span['begin'][1] != 1:
+        path = (crate / span['filename']).resolve()
+        if not path.is_relative_to(crate / 'src') or span['begin'][1] != 1:
             raise ValueError(f"unsupported source location for {item['name']}: {span}")
+        if path not in sources:
+            sources[path] = path.read_text().splitlines(keepends=True)
+            oracles[path] = []
         line = span['begin'][0] - 1
+        lines = sources[path]
         lines[line] = '#[cfg_attr(kani, derive(kani::Arbitrary))]\n' + lines[line]
-    source.write_text(''.join(lines) + '\n#[cfg(kani)] mod same_input_proof;\n')
-    source.with_name('same_input_proof.rs').write_text(
-        PRELUDE + '\n'.join(oracle(item, index) for item in types.values()) + HARNESS)
+        oracles[path].append(oracle(item, index))
+    source = crate / 'src/lib.rs'
+    if source not in sources:
+        sources[source] = source.read_text().splitlines(keepends=True)
+    sources[source].append('\n#[cfg(kani)] mod same_input_proof;\n')
+    for path, definitions in oracles.items():
+        sources[path].append(
+            '\n#[cfg(kani)] mod same_input_oracle {\n'
+            'use super::*;\nuse crate::same_input_proof::Bits;\n'
+            + '\n'.join(definitions) + '\n}\n'
+        )
+    for path, lines in sources.items():
+        path.write_text(''.join(lines))
+    source.with_name('same_input_proof.rs').write_text(PRELUDE + HARNESS)
+
+    _, fields = payload(layout['inner']['struct']['kind'], index)
+    ignored = {'position', 'anchor', 'children_origin_flipped', 'window_overflow'}
+    if not ignored.issubset(fields):
+        raise ValueError('the owned placement-field inventory has changed')
+    sizing_bits = '\n        && '.join(f'old.{field}.matches_bits(&new.{field})'
+                                        for field in fields if field not in ignored)
+    (crate/'src/layout_tree/owned_edit_proof.rs').write_text(f'''
+use super::*;
+use crate::same_input_proof::Bits;
+
+#[kani::proof]
+#[kani::unwind(16)]
+fn owned_placement_gate_keeps_sizing_inputs() {{
+    let old: LayoutParams = kani::any();
+    let new: LayoutParams = kani::any();
+    let unchanged = {sizing_bits};
+    assert_eq!(solve_frame::same_sizing_inputs(old, new), unchanged);
+}}
+''')
+    with (crate/'src/layout_tree.rs').open('a') as module:
+        module.write('\n#[cfg(kani)] mod owned_edit_proof;\n')
     return len(types)
 
 
@@ -152,11 +193,11 @@ def main():
     if kani is None:
         parser.error(f'executable not found: {args.kani}')
     with tempfile.TemporaryDirectory(prefix='keru-input-proof-') as temp:
-        crate = Path(temp)
-        for filename in ('Cargo.toml', 'Cargo.lock', 'README.md'):
+        crate = Path(temp).resolve()
+        for filename in ('Cargo.toml', 'Cargo.lock', 'README.md', 'build.rs'):
             shutil.copyfile(ROOT/filename, crate/filename)
         shutil.copytree(ROOT/'src', crate/'src')
-        for folder in ('examples', 'tests'):
+        for folder in ('examples', 'tests', 'benches'):
             (crate/folder).symlink_to(ROOT/folder, target_is_directory=True)
         env = {**os.environ, 'CARGO_TARGET_DIR': str(crate/'target')}
         if Path(kani).name == 'kani-driver':
@@ -165,7 +206,7 @@ def main():
         subprocess.run(['cargo', 'rustdoc', '--locked', '--lib', '--', '-Zunstable-options',
                         '--output-format', 'json', '--document-private-items'], cwd=crate, env=env, check=True)
         index = json.loads((crate/'target/doc/keru_layout.json').read_text())['index']
-        count = generate(index, crate/'src/lib.rs')
+        count = generate(index, crate)
         shutil.copyfile(ROOT/'proofs/node_change.rs', crate/'src/incremental/node_change_proof.rs')
         with (crate/'src/incremental.rs').open('a') as module:
             module.write('\n#[cfg(kani)] mod node_change_proof;\n')

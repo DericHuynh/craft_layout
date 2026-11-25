@@ -15,18 +15,24 @@ exclude = [
 
 [features]
 default = ["incremental"]
-incremental = ["dep:arrayvec", "dep:memchr"]
+incremental = ["dep:arrayvec"]
+batch-pilot = ["incremental"]
 
 [dependencies]
 slotmap = "1.0"
 arrayvec = { version = "0.7", default-features = false, optional = true }
-memchr = { version = "2.7", optional = true }
 
 [dev-dependencies]
 rand = "0.9"
 
 [[test]]
 name = "incremental_fuzz"
+required-features = ["incremental"]
+
+[[bench]]
+name = "real_workloads"
+path = "benches/real_workloads/main.rs"
+harness = false
 required-features = ["incremental"]
 
 [[example]]

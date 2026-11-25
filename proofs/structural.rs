@@ -219,11 +219,11 @@ pub proof fn reconcile_captured_children(
 }
 
 pub open spec fn invalidates_parent_input(mark: StructuralChange) -> bool {
-    matches!(mark, StructuralChange::Moved | StructuralChange::Subtree)
+    matches!(mark, StructuralChange::Moved | StructuralChange::Subtree | StructuralChange::DormantGrid)
 }
 
 pub open spec fn invalidates_child_input(mark: StructuralChange) -> bool {
-    matches!(mark, StructuralChange::Children | StructuralChange::Subtree)
+    matches!(mark, StructuralChange::Children | StructuralChange::Subtree | StructuralChange::DormantGrid)
 }
 
 // Retained is a transient marker during measurement. Registration folds child
@@ -613,6 +613,114 @@ pub proof fn append_resumes_from_cached_first_edge<I:Copy,V>(
         assert(cached[cut-1] == place_items(prefix,origin,share,item).1[cut-1]);
         assert(cached[cut-1] == last);
     }
+}
+
+}
+
+use super::declarations::Size;
+use super::stack_tail;
+use super::wrap_schedule::{Child, child_requests, row_requests};
+use super::wrap_schedule::kernel::Producer;
+
+verus! {
+
+pub(crate) open spec fn contributes_to_share(size: Option<Size>) -> bool {
+    match size {
+        None | Some(Size::Fill) => false,
+        Some(_) => true,
+    }
+}
+
+pub(crate) proof fn unbounded_fill_has_no_share_reads<I>(
+    id: I, regular: Size, min: Option<Size>, max: Option<Size>,
+)
+    requires stack_tail::unbounded_fill(regular, min, max),
+    ensures row_requests(Child {
+        id,
+        in_flow: true,
+        has_fill: regular is Fill,
+        share: [contributes_to_share(Some(regular)), contributes_to_share(min), contributes_to_share(max)],
+        cross: [false, false, false],
+    }, Producer::Share).len() == 0,
+{
+    reveal_with_fuel(super::wrap_schedule::declarations, 4);
+}
+
+proof fn same_share_prefix<I>(before: Seq<Child<I>>, after: Seq<Child<I>>, prefix: nat)
+    requires
+        prefix <= before.len(), prefix <= after.len(),
+        forall |i: int| 0 <= i < prefix ==> #[trigger] after[i] == before[i],
+    ensures child_requests(before, Producer::Share, prefix) == child_requests(after, Producer::Share, prefix),
+    decreases prefix,
+{
+    if prefix != 0 {
+        same_share_prefix(before, after, (prefix - 1) as nat);
+        assert(after[prefix - 1] == before[prefix - 1]);
+    }
+}
+
+proof fn share_requests_through_tail<I>(rows: Seq<Child<I>>, prefix: nat, count: nat)
+    requires prefix <= count <= rows.len(),
+        forall |i: int| prefix <= i < count ==>
+            row_requests(#[trigger] rows[i], Producer::Share).len() == 0,
+    ensures child_requests(rows, Producer::Share, prefix) == child_requests(rows, Producer::Share, count),
+    decreases count - prefix,
+{
+    if prefix < count {
+        share_requests_through_tail(rows, prefix, (count - 1) as nat);
+        assert(row_requests(rows[count - 1], Producer::Share).len() == 0);
+    }
+}
+
+proof fn share_reads_start_with_prefix<I>(rows: Seq<Child<I>>, prefix: nat, count: nat)
+    requires prefix <= count <= rows.len(),
+    ensures ({
+        let head = child_requests(rows, Producer::Share, prefix);
+        let all = child_requests(rows, Producer::Share, count);
+        head.len() <= all.len() && head == all.take(head.len() as int)
+    }),
+    decreases count - prefix,
+{
+    let head = child_requests(rows, Producer::Share, prefix);
+    if prefix < count {
+        share_reads_start_with_prefix(rows, prefix, (count - 1) as nat);
+        let prior = child_requests(rows, Producer::Share, (count - 1) as nat);
+        let all = child_requests(rows, Producer::Share, count);
+        assert(all == prior + row_requests(rows[count - 1], Producer::Share));
+        assert(head.len() <= prior.len());
+        assert forall |i: int| 0 <= i < head.len() implies #[trigger] all.take(head.len() as int)[i] == head[i] by {
+            assert(all[i] == prior[i]);
+            assert(prior.take(head.len() as int)[i] == prior[i]);
+        }
+        assert(head =~= all.take(head.len() as int));
+    }
+}
+
+/// Admitted Fill-only leaves have a main Regular Fill and no Min or Max.
+/// Their share row has no selected reads, so the new request sequence
+/// consists exactly of a prefix of the old sequence.
+pub proof fn tail_edits_keep_share_inputs<I>(before: Seq<Child<I>>, after: Seq<Child<I>>, prefix: nat)
+    requires
+        prefix <= before.len(), prefix <= after.len(),
+        forall |i: int| 0 <= i < prefix ==> #[trigger] after[i] == before[i],
+        forall |i: int| prefix <= i < after.len() ==> {
+            let row = #[trigger] after[i];
+            row.has_fill && !row.share[0] && !row.share[1] && !row.share[2]
+        },
+    ensures ({
+        let current = child_requests(after, Producer::Share, after.len());
+        current == child_requests(before, Producer::Share, before.len()).take(current.len() as int)
+    }),
+{
+    assert forall |i: int| prefix <= i < after.len() implies
+        row_requests(#[trigger] after[i], Producer::Share).len() == 0 by {
+        assert(after[i].has_fill);
+        assert(!after[i].share[0] && !after[i].share[1] && !after[i].share[2]);
+        reveal_with_fuel(super::wrap_schedule::declarations, 4);
+    }
+    same_share_prefix(before, after, prefix);
+    share_requests_through_tail(after, prefix, after.len());
+    share_reads_start_with_prefix(before, prefix, before.len());
 }
 
 }

@@ -2,26 +2,11 @@
 use vstd::prelude::*;
 #[path = "../src/fill_compaction.rs"]
 pub mod kernel;
+#[path = "../src/fill_budget.rs"]
+pub(crate) mod budget;
+use kernel::{Account, Project};
 
 verus! {
-
-pub open spec fn decision<T, D, C: Fn(T) -> (bool, D)>(classify: C, item: T) -> (bool, D) {
-    choose |r: (bool, D)| call_ensures(classify, (item,), r)
-}
-
-pub open spec fn account<S, D, U: Fn(S, D) -> S>(update: U, state: S, data: D) -> S {
-    choose |r: S| call_ensures(update, (state, data), r)
-}
-
-pub open spec fn classifier<T, D, C: Fn(T) -> (bool, D)>(classify: C) -> bool {
-    &&& forall |x: T| #[trigger] call_requires(classify, (x,))
-    &&& forall |x: T, r: (bool, D)| #[trigger] call_ensures(classify, (x,), r) ==> r == decision(classify, x)
-}
-
-pub open spec fn accumulator<S, D, U: Fn(S, D) -> S>(update: U) -> bool {
-    &&& forall |s: S, d: D| #[trigger] call_requires(update, (s, d))
-    &&& forall |s: S, d: D, r: S| #[trigger] call_ensures(update, (s, d), r) ==> r == account(update, s, d)
-}
 
 // Scalar reference for a sequence of already-resolved lanes. No algebraic
 // properties of the accounting operation are required.
@@ -35,21 +20,21 @@ pub open spec fn survivors<T, D>(items: Seq<T>, decisions: Seq<(bool, D)>, n: na
     }
 }
 
-pub open spec fn total<S, D, U: Fn(S, D) -> S>(update: U, decisions: Seq<(bool, D)>, n: nat, initial: S) -> S
+pub open spec fn total<S, D, U: Account<D, S>>(update: U, decisions: Seq<(bool, D)>, n: nat, initial: S) -> S
     decreases n,
 {
     if n == 0 { initial }
     else {
         let prior = total(update, decisions, (n - 1) as nat, initial);
-        if decisions[n - 1].0 { account(update, prior, decisions[n - 1].1) } else { prior }
+        if decisions[n - 1].0 { update.accounted(prior, decisions[n - 1].1) } else { prior }
     }
 }
 
-pub open spec fn decisions<T, D, C: Fn(T) -> (bool, D)>(items: Seq<T>, classify: C) -> Seq<(bool, D)> {
-    Seq::new(items.len(), |i: int| decision(classify, items[i]))
+pub open spec fn decisions<T, D, C: Project<T, (bool, D)>>(items: Seq<T>, classify: C) -> Seq<(bool, D)> {
+    Seq::new(items.len(), |i: int| classify.projected(items[i]))
 }
 
-pub proof fn all_kept<T, S, D, U: Fn(S, D) -> S>(items: Seq<T>, ds: Seq<(bool, D)>, n: nat, update: U, initial: S)
+pub proof fn all_kept<T, S, D, U: Account<D, S>>(items: Seq<T>, ds: Seq<(bool, D)>, n: nat, update: U, initial: S)
     requires n <= items.len(), n <= ds.len(), forall |i: int| 0 <= i < n ==> !(#[trigger] ds[i]).0,
     ensures survivors(items,ds,n) == items.take(n as int), total(update,ds,n,initial) == initial,
     decreases n,
@@ -60,7 +45,7 @@ pub proof fn all_kept<T, S, D, U: Fn(S, D) -> S>(items: Seq<T>, ds: Seq<(bool, D
     }
 }
 
-pub proof fn append_block<T, S, D, U: Fn(S, D) -> S>(
+pub proof fn append_block<T, S, D, U: Account<D, S>>(
     items: Seq<T>, ds: Seq<(bool, D)>, start: nat, block: Seq<T>, local: Seq<(bool, D)>, n: nat,
     update: U, initial: S,
 )
@@ -83,24 +68,15 @@ pub proof fn append_block<T, S, D, U: Fn(S, D) -> S>(
     }
 }
 
-pub open spec fn projected<T, D, P: Fn(T) -> D>(project: P, item: T) -> D {
-    choose |r: D| call_ensures(project, (item,), r)
-}
-
-pub open spec fn projection<T, D, P: Fn(T) -> D>(project: P) -> bool {
-    &&& forall |x: T| #[trigger] call_requires(project, (x,))
-    &&& forall |x: T, r: D| #[trigger] call_ensures(project, (x,), r) ==> r == projected(project, x)
-}
-
 // A left fold makes the order of every floating-point addition observable.
-pub open spec fn ordered_fold<T, D, S, P: Fn(T) -> D, U: Fn(S, D) -> S>(
+pub open spec fn ordered_fold<T, D, S, P: Project<T, D>, U: Account<D, S>>(
     items: Seq<T>, n: nat, initial: S, project: P, update: U,
 ) -> S
     decreases n,
 {
     if n == 0 { initial } else {
-        account(update, ordered_fold(items, (n - 1) as nat, initial, project, update),
-            projected(project, items[n - 1]))
+        update.accounted(ordered_fold(items, (n - 1) as nat, initial, project, update),
+            project.projected(items[n - 1]))
     }
 }
 

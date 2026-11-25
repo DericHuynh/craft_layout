@@ -1,0 +1,14 @@
+workload	nodes	geometry_hash	first_solve_allocations	first_solve_bytes	second_solve_allocations	second_solve_bytes	repeated_batch_allocations	repeated_batch_bytes
+expand_with_max_constraint	3001	ac5c021548247745	0	0	0	0	0	0
+expand_with_min_constraint	3001	6864b1369dc53b45	0	0	0	0	0	0
+fit_nesting	101111	c951816befdc63cd	0	0	2	2438820	0	0
+flex_expand_equal_weights	15001	3ed5d73b7cbfbb87	0	0	1	60000	0	0
+flex_expand_weights	15001	58a165fb9be426e9	0	0	0	0	0	0
+nested_vertical_stack	10001	4162651303213dc5	0	0	2	240096	0	0
+padding_and_margin	101	50a35e45228d6105	0	0	2	2496	0	0
+percentage_and_ratio	10001	abb07ee310d00d25	0	0	2	240096	0	0
+perpendicular_expand_with_wrap	12001	23e37c7fa25d9ec5	0	0	2	288048	0	0
+pixels_with_min_expand_constraint	30001	ce156989a739f345	0	0	0	0	0	0
+wide_no_wrap_simple_few	1001	6c60df1010a92245	0	0	1	4000	0	0
+wide_no_wrap_simple_many	100001	ca91d2b0e110f9c5	0	0	1	400000	0	0
+wide_wrapping	10001	1c759e00d0df1ec5	0	0	2	240048	0	0

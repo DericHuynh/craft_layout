@@ -1,4 +1,7 @@
-use super::super::text_scan::{next_window16, windows::{low_lanes16, unicode_separator_width}};
+use super::super::text_scan::{NativeBitLanes, next_window16};
+use super::super::text_scan::windows::boundaries::{BitLanes, pop_lane16, prefix_count16, tail_mask16};
+use super::super::text_scan::windows::native::load_sse2;
+use super::super::text_scan::windows::{separator_lanes, span_width, transitions16, unicode_separator_width};
 use std::ops::Range;
 
 // Classify ASCII with SSE2 and decode only UTF-8 leads in mixed windows.
@@ -32,23 +35,23 @@ impl<'a, const WIDTHS: bool> MixedWords<'a, WIDTHS> {
     fn boundary(&mut self) -> (usize, usize) {
         while self.transitions == 0 {
             if WIDTHS && self.continuation != 0 {
-                self.preceding_continuations += self.continuation.count_ones() as usize;
+                let count = NativeBitLanes::count(u32::from(self.continuation)) as usize;
+                self.preceding_continuations = self.preceding_continuations.saturating_add(count);
             }
             self.continuation = 0;
-            let Some((block, count)) = next_window16(self.text.as_bytes(), self.cursor) else {
+            let Some((block, start, count)) = next_window16(self.text.as_bytes(), &mut self.cursor) else {
                 return (self.text.len(), self.preceding_continuations);
             };
-            self.block_start = self.cursor;
+            self.block_start = start;
             self.fill_window(block, count);
         }
-        let at = self.transitions.trailing_zeros();
-        self.transitions &= self.transitions - 1;
+        let at = pop_lane16::<NativeBitLanes>(&mut self.transitions);
         let skipped = if WIDTHS && self.continuation != 0 {
-            (self.continuation & ((1 << at) - 1)).count_ones() as usize
+            prefix_count16::<NativeBitLanes>(self.continuation, at)
         } else {
             0
         };
-        (self.block_start + at as usize, self.preceding_continuations + skipped)
+        (self.block_start.saturating_add(at as usize), self.preceding_continuations.saturating_add(skipped))
     }
 
     #[inline]
@@ -57,22 +60,21 @@ impl<'a, const WIDTHS: bool> MixedWords<'a, WIDTHS> {
         use super::super::text_scan::whitespace_bytes;
 
         let bytes = self.text.as_bytes();
-        let skip = 16 - count;
         // SAFETY: SSE2 is available on x86-64 and the array covers the load.
         let (ascii, continuations, possible_spaces) = unsafe {
-            let value = _mm_loadu_si128(block.as_ptr().cast());
-            let ascii = (_mm_movemask_epi8(whitespace_bytes(value)) as u16) >> skip;
-            let high = (_mm_movemask_epi8(value) as u16) >> skip;
+            let value = load_sse2(block);
+            let ascii = tail_mask16(_mm_movemask_epi8(whitespace_bytes(value)) as u16, count);
+            let high = tail_mask16(_mm_movemask_epi8(value) as u16, count);
             if high == 0 {
                 (ascii, 0, 0)
             } else {
-                let continuations = (_mm_movemask_epi8(_mm_cmpgt_epi8(_mm_set1_epi8(-64), value)) as u16) >> skip;
+                let continuations = tail_mask16(_mm_movemask_epi8(_mm_cmpgt_epi8(_mm_set1_epi8(-64), value)) as u16, count);
                 // Non-ASCII whitespace starts with C2 or E1–E3, so other leads
                 // can contribute to the width without being decoded.
                 let two_bytes = _mm_cmpeq_epi8(value, _mm_set1_epi8(0xc2_u8 as i8));
                 let biased = _mm_sub_epi8(value, _mm_set1_epi8(0x61));
                 let three_bytes = _mm_cmpgt_epi8(_mm_set1_epi8(-125), biased);
-                let possible_spaces = (_mm_movemask_epi8(_mm_or_si128(two_bytes, three_bytes)) as u16) >> skip;
+                let possible_spaces = tail_mask16(_mm_movemask_epi8(_mm_or_si128(two_bytes, three_bytes)) as u16, count);
                 (ascii, continuations, possible_spaces)
             }
         };
@@ -81,19 +83,14 @@ impl<'a, const WIDTHS: bool> MixedWords<'a, WIDTHS> {
         let mut spaces = u32::from(ascii) | self.carried_space;
         let mut leading = possible_spaces;
         while leading != 0 {
-            let at = leading.trailing_zeros();
-            let width = unicode_separator_width(bytes, self.cursor + at as usize);
+            let at = pop_lane16::<NativeBitLanes>(&mut leading);
+            let width = unicode_separator_width(bytes, self.block_start.saturating_add(at as usize));
             if width != 0 {
-                spaces |= ((1u32 << width) - 1) << at;
+                spaces |= separator_lanes(at, width);
             }
-            leading &= leading - 1;
         }
-        self.carried_space = spaces >> count;
-        let spaces = spaces as u16;
-        self.transitions = (spaces ^ ((spaces << 1) | self.previous_space)) & low_lanes16(count);
-        self.previous_space = (spaces >> (count - 1)) & 1;
+        (self.carried_space, self.previous_space, self.transitions) = transitions16(spaces, self.previous_space, count);
         self.continuation = continuations;
-        self.cursor += count;
     }
 }
 
@@ -105,7 +102,7 @@ impl<const WIDTHS: bool> Iterator for MixedWords<'_, WIDTHS> {
         let (start, skipped_before) = self.boundary();
         if start == self.text.len() { return None; }
         let (end, skipped_after) = self.boundary();
-        Some((start..end, (end - start) - (skipped_after - skipped_before)))
+        Some((start..end, span_width(start, end, skipped_before, skipped_after)?))
     }
 }
 

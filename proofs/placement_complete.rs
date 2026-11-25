@@ -417,10 +417,10 @@ impl PlacementDelta {
         let old=self.before[lookup(self.before,cur.key)];
         let work=(self.plan)(cur.key);
         &&& work is Place
-        // New incarnations and changed local rules require a direct mark.
-        // Selection as a sizing region also sets this mark.
+        // An inherited force covers descendants of an edited frame. A
+        // changed local rule outside that set requires a direct mark.
         &&& (!documented(self.before,cur.key) || !old.direct_same(cur))
-            ==> (self.claimed)(cur.key) is Subtree
+            ==> requested(work) || (self.claimed)(cur.key) is Subtree
         &&& (self.claimed)(cur.key) is Subtree ==> work->Place_mark is Subtree
     }
 
@@ -525,7 +525,7 @@ proof fn ordered_parent_index(nodes:Seq<NodeSource>,i:int,p:Key) -> (j:int)
 
 proof fn direct_registration_forces_writes(work:Work,mark:PlacementWork,old_exists:bool,same_rule:bool)
     requires work is Place,
-        (!old_exists || !same_rule) ==> mark is Subtree,
+        (!old_exists || !same_rule) ==> requested(work) || mark is Subtree,
         mark is Subtree ==> work->Place_mark is Subtree,
         !requested(work),
     ensures old_exists && same_rule,
@@ -665,6 +665,35 @@ pub proof fn clean_nodes_retain_their_raw_frames(d:PlacementDelta,draw:Draw,i:in
     assert(before[key].inherited==after[key].inherited);
     assert(replay_publication::local_input_matches(before[key],after[key]));
     assert(before[key].result==after[key].result);
+}
+
+/// Placement-only edits keep all solved producer words. A skipped rectangle
+/// therefore keeps its inputs and inherited frame, including the parent's
+/// unrounded edges and snapped origin.
+pub proof fn placement_only_keeps_skipped_rectangles(d: PlacementDelta, draw: Draw)
+    requires d.marks_cover_primitives(), d.before_sizing == d.after_sizing,
+    ensures forall|i: int| 0 <= i < d.after.len() && !requested((d.plan)((#[trigger] d.after[i]).key))
+        ==> {
+            let key = d.after[i].key;
+            let before = d.before_placement(draw);
+            let after = d.after_placement(draw);
+            &&& before.contains_key(key) && after.contains_key(key)
+            &&& before[key].result == after[key].result
+        },
+{
+    reveal(PlacementDelta::primitive_edits_covered);
+    reveal(PlacementDelta::skip_words_match);
+    assert(d.primitive_edits_covered());
+    assert forall|i: int| 0 <= i < d.after.len() && !requested((d.plan)((#[trigger] d.after[i]).key))
+        implies {
+            let key = d.after[i].key;
+            let before = d.before_placement(draw);
+            let after = d.after_placement(draw);
+            &&& before.contains_key(key) && after.contains_key(key)
+            &&& before[key].result == after[key].result
+        } by {
+        clean_nodes_retain_their_raw_frames(d, draw, i);
+    };
 }
 
 proof fn ordered_placement_is_covered(d:PlacementDelta,draw:Draw)

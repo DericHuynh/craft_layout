@@ -1,0 +1,32 @@
+--- a/benchmarks/src/taffy_03_helpers.rs
++++ b/benchmarks/src/taffy_03_helpers.rs
+@@ -2,6 +2,7 @@
+ use rand::Rng;
+ use rand_chacha::ChaCha8Rng;
+ use taffy::style::Style as TaffyStyle;
++use taffy_03::tree::LayoutTree;
+ 
+ use super::{BuildTree, BuildTreeExt, GenStyle};
+ 
+@@ -85,8 +86,8 @@
+         padding: convert_rect(style.padding, convert_length_percentage),
+         border: convert_rect(style.border, convert_length_percentage),
+         size: convert_size(style.size, convert_dimension),
+-        min_size: convert_size(style.min_size, convert_dimension),
+-        max_size: convert_size(style.max_size, convert_dimension),
++        min_size: convert_size(style.min_size, |bound| convert_dimension(bound.into())),
++        max_size: convert_size(style.max_size, |bound| convert_dimension(bound.into())),
+         aspect_ratio: style.aspect_ratio,
+         gap: convert_size(style.gap, convert_length_percentage),
+         // Alignment
+@@ -199,5 +200,8 @@
+         taffy::style::FlexWrap::NoWrap => taffy_03::style::FlexWrap::NoWrap,
+         taffy::style::FlexWrap::Wrap => taffy_03::style::FlexWrap::Wrap,
+         taffy::style::FlexWrap::WrapReverse => taffy_03::style::FlexWrap::WrapReverse,
+-    }
+-}
++        taffy::style::FlexWrap::Balance | taffy::style::FlexWrap::BalanceReverse => {
++            panic!("balanced wrapping is unavailable in Taffy 0.3")
++        }
++    }
++}

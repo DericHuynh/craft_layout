@@ -1,0 +1,12 @@
+[package]
+name = "keru-upstream-workloads"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+allocations = []
+
+[dependencies]
+current = { package = "keru_layout", path = "../../..", features = ["batch-pilot"] }
+original = { package = "keru_layout", git = "https://github.com/kekelp/keru_layout.git", rev = "56b2769b54fcf203d77ffe8c0874fa20a4ccfe12" }

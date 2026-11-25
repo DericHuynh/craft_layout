@@ -2,7 +2,7 @@
 use vstd::prelude::*;
 use super::cycles::dfs::{project, project_append, requests, Region};
 #[path = "../src/root_requests.rs"]
-mod kernel;
+pub(crate) mod kernel;
 use kernel::visit_sizing_roots;
 
 verus! {

@@ -10,7 +10,7 @@ pub enum LeafInput { Local, OppositeFinal, External }
 
 #[inline]
 #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-#[cfg_attr(verus_keep_ghost, verus_spec(returns input(form, constrained)))]
+#[cfg_attr(verus_keep_ghost, verus_spec(returns input(form, constrained), no_unwind))]
 pub fn input(form: Form, constrained: bool) -> LeafInput {
     match form {
         Form::Constant => LeafInput::Local,
@@ -23,7 +23,7 @@ pub fn input(form: Form, constrained: bool) -> LeafInput {
 impl LeafInput {
     #[inline]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
-    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.stable(opposite_known)))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.stable(opposite_known), no_unwind))]
     pub fn stable(self, opposite_known: bool) -> bool {
         match self {
             Self::Local => true,

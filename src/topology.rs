@@ -1,9 +1,11 @@
 mod state;
+mod reconcile;
+mod tracked;
 
-use state::{PriorNode, PriorStyle, TicketModel, TicketWriter};
-use crate::structural_changes::{ChildCursor, StructuralChange, advance_tickets, parent_change, ticket_index};
-use crate::work_stack::work_stack;
+use state::{CaptureModel, CaptureSource, LiveTicketWriter, PriorNode, PriorStyle, ROOT_PARENT, TicketModel, TicketWriter};
+use crate::structural_changes::{StructuralChange, advance_tickets};
 use crate::{Incremental, LayoutParams, NodeLayoutData, SameInput, TreeAdapter};
+use crate::vec_memory::{FallibleVecMemory, RustVec, try_append};
 
 // A cached node record can be detached, recycled, or brought in from another
 // adapter. Disjoint ticket ranges distinguish it from the current snapshot in
@@ -39,6 +41,7 @@ pub(crate) struct TopologySnapshot<I> {
     // Capture coalesces consecutive equal declarations. A later style edit
     // splits a shared entry or overwrites a private one in place.
     styles: Vec<PriorStyle<LayoutParams>>,
+    reconcile_spill: Vec<tracked::Frame<I>>,
 }
 
 impl<T: TreeAdapter + ?Sized> TicketModel for T {
@@ -48,14 +51,94 @@ impl<T: TreeAdapter + ?Sized> TicketModel for T {
 impl<T: TreeAdapter + ?Sized> TicketWriter for T {
     #[inline]
     fn write_ticket(&mut self, id: T::NodeId, ticket: u64) {
-        self.node_layout_data_mut(id).topology_index = ticket;
+        self.node_layout_data_mut(id).set_topology_index(ticket);
+    }
+}
+
+impl<T: TreeAdapter + ?Sized> LiveTicketWriter for T {
+    #[inline]
+    fn next_in_region(&self, root: T::NodeId, id: T::NodeId) -> Option<T::NodeId> {
+        let child = if self.node_layout_params(id).disabled { None } else { self.first_child(id) };
+        crate::tree_walk::next_forward(self, root, id, child)
+    }
+
+    #[inline]
+    fn same_id(&self, a: T::NodeId, b: T::NodeId) -> bool {
+        a == b
+    }
+}
+
+/// The capture loop owns the node vector. Style storage is written through
+/// this source because each appended row also takes a style reference.
+struct CaptureSnapshot<'a, T: ?Sized> {
+    tree: &'a T,
+    styles: &'a mut Vec<PriorStyle<LayoutParams>>,
+}
+
+impl<T: TreeAdapter + ?Sized> TicketModel for CaptureSnapshot<'_, T> {
+    type Id = T::NodeId;
+}
+
+impl<T: TreeAdapter + ?Sized> CaptureModel for CaptureSnapshot<'_, T> {}
+
+impl<T: TreeAdapter + ?Sized> CaptureSource for CaptureSnapshot<'_, T> {
+    fn first_child_to_capture(&self, id: T::NodeId) -> Option<T::NodeId> {
+        if self.tree.node_layout_params(id).disabled { None } else { self.tree.first_child(id) }
+    }
+
+    fn following_sibling(&self, id: T::NodeId) -> Option<T::NodeId> {
+        self.tree.next_sibling(id)
+    }
+
+    fn append(&mut self, nodes: &mut Vec<PriorNode<T::NodeId>>, id: T::NodeId, parent: usize, end: usize) -> bool {
+        if !RustVec::try_reserve(nodes, 1) { return false; }
+        let params = self.tree.node_layout_params(id);
+        let matches_last = self.styles.last().is_some_and(|last| last.params.same_input(params));
+        let Some(style) = state::add_style::<_, RustVec>(self.styles, *params, matches_last) else { return false; };
+        state::append_row::<_, RustVec>(nodes, id, parent, end, style);
+        true
+    }
+}
+
+struct ProjectTopology<'a, T: ?Sized>(&'a mut T);
+
+impl<T: TreeAdapter + ?Sized> reconcile::Model for ProjectTopology<'_, T> {
+    type Id = T::NodeId;
+    type Cache = NodeLayoutData;
+}
+
+impl<T: TreeAdapter + ?Sized> reconcile::Access for ProjectTopology<'_, T> {
+    #[inline]
+    fn inspect(&self, node: T::NodeId) -> (Option<T::NodeId>, bool, Option<NodeLayoutData>) {
+        let params = self.0.node_layout_params(node);
+        let first = self.0.first_child(node);
+        let fixed = self.0.node_layout_data(node).unchanged_pixel_box(params, first.is_none());
+        (first, params.disabled, fixed)
+    }
+
+    #[inline]
+    fn apply(&mut self, node: T::NodeId, projection: reconcile::Projection<NodeLayoutData>) {
+        let data = self.0.node_layout_data_mut(node);
+        match projection {
+            reconcile::Projection::Retain(fixed) => *data = fixed,
+            reconcile::Projection::RefreshChildren(fixed) => {
+                *data = fixed;
+                data.mark_children_changed();
+            }
+            reconcile::Projection::Rebuild => data.mark_subtree_changed(),
+        }
+    }
+
+    #[inline]
+    fn successor(&self, root: T::NodeId, node: T::NodeId, child: Option<T::NodeId>) -> Option<T::NodeId> {
+        crate::tree_walk::next_forward(&*self.0, root, node, child)
     }
 }
 
 impl<I: Eq> TopologySnapshot<I> {
     fn index(&self, id: I, ticket: u64) -> Option<usize> {
-        let index = ticket_index(self.first_ticket, self.nodes.len(), ticket)?;
-        (self.nodes.get(index)?.id == id).then_some(index)
+        let (index, row) = state::ticket_row(&self.nodes, self.first_ticket, ticket)?;
+        (row.id == id).then_some(index)
     }
 
     pub(crate) fn restore_region_tickets<T: TreeAdapter<NodeId = I> + ?Sized>(
@@ -65,32 +148,23 @@ impl<I: Eq> TopologySnapshot<I> {
         I: Copy,
     {
         let Some(start) = self.index(root, ticket) else { return false };
-        if state::restoration_end(&self.nodes, start, self.first_ticket).is_none() { return false; }
-        state::restore_region(tree, &self.nodes, start, self.first_ticket);
-        true
+        state::restore_region(tree, &self.nodes, start, self.first_ticket, root)
     }
 }
 
 impl<I> TopologySnapshot<I> {
     pub(crate) const fn new() -> Self {
-        Self { first_ticket: 1, nodes: Vec::new(), styles: Vec::new() }
+        Self { first_ticket: 1, nodes: Vec::new(), styles: Vec::new(), reconcile_spill: Vec::new() }
     }
 
-    fn store_style(&mut self, params: &LayoutParams) -> usize {
-        if let Some(last) = self.styles.last_mut() && last.params.same_input(params) {
-            last.uses += 1;
-        } else {
-            self.styles.push(PriorStyle { params: *params, uses: 1 });
-        }
-        self.styles.len() - 1
+    fn prior_style(&self, index: usize) -> Option<&PriorStyle<LayoutParams>> {
+        state::style_row(&self.nodes, &self.styles, index)
     }
 
-    fn update_style(&mut self, index: usize, params: LayoutParams) {
-        state::update_style(&mut self.nodes, &mut self.styles, index, params);
+    fn update_style(&mut self, index: usize, params: LayoutParams) -> bool {
+        state::update_style::<_, _, RustVec>(&mut self.nodes, &mut self.styles, index, params)
     }
 }
-
-const ROOT_PARENT: usize = usize::MAX;
 
 /// Records style edits while the old snapshot is still read-only.
 pub(crate) struct ReconcileState<'a, I> {
@@ -98,28 +172,72 @@ pub(crate) struct ReconcileState<'a, I> {
     styles: &'a mut Vec<I>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ReconcileFrame<I> {
-    node: I,
-    index: Option<usize>,
-    end: usize,
-    cursor: ChildCursor,
+struct ReconcileWalk<'a, 'b, T: TreeAdapter + ?Sized> {
+    tree: &'a mut T,
+    state: &'a mut ReconcileState<'b, T::NodeId>,
 }
 
-type ReconcileStart<I> = (ReconcileFrame<I>, Option<I>);
+impl<T: TreeAdapter + ?Sized> tracked::Model for ReconcileWalk<'_, '_, T> {
+    type Id = T::NodeId;
+    type Style = LayoutParams;
+}
 
-impl<I> ReconcileFrame<I> {
+impl<T: TreeAdapter + ?Sized> tracked::Access for ReconcileWalk<'_, '_, T> {
     #[inline]
-    fn advance_child(&mut self, child: Option<usize>, snapshot: &TopologySnapshot<I>) -> Option<()> {
-        let following = if self.cursor.expected < self.end {
-            let end = snapshot.nodes.get(self.cursor.expected)?.end;
-            if end <= self.cursor.expected || end > self.end { return None; }
-            Some(end)
-        } else {
-            None
-        };
-        self.cursor = self.cursor.observe(child, following);
-        Some(())
+    fn ticket(&self, node: T::NodeId) -> u64 {
+        self.tree.node_layout_data(node).topology_index()
+    }
+
+    #[inline]
+    fn same_id(&self, live: T::NodeId, prior: T::NodeId) -> bool { prior == live }
+
+    #[inline]
+    fn read_style(&self, node: T::NodeId) -> &LayoutParams { self.tree.node_layout_params(node) }
+
+    #[inline]
+    fn is_disabled(&self, style: &LayoutParams) -> bool { style.disabled }
+
+    #[inline]
+    fn same_style(&self, live: &LayoutParams, prior: &LayoutParams) -> bool { prior.same_input(live) }
+
+    #[inline]
+    fn first(&self, node: T::NodeId) -> Option<T::NodeId> { self.tree.first_child(node) }
+
+    #[inline]
+    fn invalidate_snapshot(&mut self) { self.state.current = false; }
+
+    #[inline]
+    fn remember_style_if_current(&mut self, node: T::NodeId) {
+        if self.state.current && !try_append::<_, RustVec>(self.state.styles, node) {
+            self.state.current = false;
+        }
+    }
+
+    #[inline]
+    fn register_style_change(&mut self, node: T::NodeId, prior: &LayoutParams) {
+        self.tree.incr_register_node_change(node, prior);
+    }
+
+    #[inline]
+    fn mark_parent_change(&mut self, node: T::NodeId, mark: StructuralChange) {
+        self.state.current = false;
+        let data = self.tree.node_layout_data_mut(node);
+        match mark {
+            StructuralChange::Subtree => data.mark_subtree_changed(),
+            StructuralChange::Moved => data.mark_moved(),
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn following(&self, child: T::NodeId) -> Option<T::NodeId> {
+        self.tree.next_sibling(child)
+    }
+
+    #[inline]
+    fn mark_children_changed(&mut self, node: T::NodeId) {
+        self.state.current = false;
+        self.tree.node_layout_data_mut(node).mark_children_changed();
     }
 }
 
@@ -134,21 +252,20 @@ pub(crate) trait Topology: TreeAdapter {
         let Some(mut snapshot) = data.topology.take() else { return };
         snapshot.nodes.clear();
         snapshot.styles.clear();
-        snapshot.nodes.reserve(self.layout_data().n_nodes_solved as usize);
+        // This reservation is only a capacity hint. The capture checks each
+        // actual append and can abandon optional topology tracking on failure.
+        let _ = snapshot.nodes.try_reserve(self.layout_data().n_nodes_solved as usize);
         let root = self.root();
-        let params = self.node_layout_params(root);
-        let style = snapshot.store_style(params);
-        snapshot.nodes.push(PriorNode { id: root, parent: ROOT_PARENT, end: 1, style });
-        if !params.disabled {
-            self.capture_descendants(root, &mut snapshot);
-            snapshot.nodes[0].end = snapshot.nodes.len();
-        }
+        let mut capture = CaptureSnapshot { tree: &*self, styles: &mut snapshot.styles };
+        let captured = state::capture_subtree(&mut capture, &mut snapshot.nodes, root);
 
-        if let Some(first) = reserve(snapshot.nodes.len()) {
+        if captured && let Some(first) = reserve(snapshot.nodes.len())
+            && state::restoration_end(&snapshot.nodes, 0, first).is_some()
+        {
             snapshot.first_ticket = first;
             state::restore_tickets(self, &snapshot.nodes, first);
         } else {
-            // No ticket range is available. An empty snapshot selects untracked
+            // No complete snapshot is available. An empty snapshot selects untracked
             // reconciliation next time and cannot match any old tickets.
             snapshot.nodes.clear();
             snapshot.styles.clear();
@@ -156,57 +273,35 @@ pub(crate) trait Topology: TreeAdapter {
         self.layout_data().topology = Some(snapshot);
     }
 
-    fn capture_descendants(&self, root: Self::NodeId, snapshot: &mut TopologySnapshot<Self::NodeId>) {
-        let mut parent = 0;
-        let mut next = self.first_child(root);
-        loop {
-            if let Some(node) = next {
-                let params = self.node_layout_params(node);
-                let style = snapshot.store_style(params);
-                let index = snapshot.nodes.len();
-                // Leaves already have their final end. The saved parent index
-                // lets a branch return without a recursive call or a stack.
-                snapshot.nodes.push(PriorNode { id: node, parent, end: index + 1, style });
-                if !params.disabled && let Some(first) = self.first_child(node) {
-                    parent = index;
-                    next = Some(first);
-                    continue;
-                }
-                next = self.next_sibling(node);
-            } else {
-                if parent == 0 { break; }
-                let (closed, enclosing) = state::close_branch(&mut snapshot.nodes, parent);
-                parent = enclosing;
-                next = self.next_sibling(closed);
-            }
-        }
-    }
-
     fn update_remembered_params(&mut self, node: Self::NodeId, old: &LayoutParams) {
-        let ticket = self.node_layout_data(node).topology_index;
+        let ticket = self.node_layout_data(node).topology_index();
         if ticket == 0 { return }
         let params = *self.node_layout_params(node);
         let Some(snapshot) = self.layout_data().topology.as_mut() else { return };
         let Some(index) = snapshot.index(node, ticket) else { return };
-        let style = &mut snapshot.styles[snapshot.nodes[index].style];
+        let Some(style) = snapshot.prior_style(index) else {
+            snapshot.nodes.clear();
+            snapshot.styles.clear();
+            return;
+        };
         // An earlier unlocalized edit may not have been reconciled yet. Only
         // advance a baseline that describes the caller's registered transition.
         if style.params.same_input(old) && !style.params.same_input(&params) {
-            snapshot.update_style(index, params);
+            if !snapshot.update_style(index, params) {
+                snapshot.nodes.clear();
+                snapshot.styles.clear();
+            }
         }
     }
 
     fn reconcile_topology(&mut self, styles: &mut Vec<Self::NodeId>) -> bool {
         let Some(mut snapshot) = self.layout_data().topology.take() else { return false };
         let mut state = ReconcileState { current: !snapshot.nodes.is_empty(), styles };
-        let available = state.current && self.reconcile_subtree(self.root(), Some(ROOT_PARENT), &snapshot, &mut state).is_some();
+        let available = state.current && self.reconcile_subtree(self.root(), Some(ROOT_PARENT), &mut snapshot, &mut state).is_some();
         let available = available && (!state.current || state.styles.iter().all(|&id| {
-            let ticket = self.node_layout_data(id).topology_index;
+            let ticket = self.node_layout_data(id).topology_index();
             let Some(index) = snapshot.index(id, ticket) else { return false };
-            let style = snapshot.nodes[index].style;
-            if !snapshot.styles.get(style).is_some_and(|entry| entry.uses > 0) { return false; }
-            snapshot.update_style(index, *self.node_layout_params(id));
-            true
+            snapshot.update_style(index, *self.node_layout_params(id))
         }));
         if !available {
             // An explicit full solve with no retained output or host measurements
@@ -223,34 +318,18 @@ pub(crate) trait Topology: TreeAdapter {
     }
 
     fn reconcile_untracked(&mut self, root: Self::NodeId) {
-        let mut next = Some(root);
-        while let Some(node) = next {
-            let params = self.node_layout_params(node);
-            let first = self.first_child(node);
-            let disabled = params.disabled;
-            let fixed = self.node_layout_data(node).unchanged_pixel_box(params, first.is_none());
-            let data = self.node_layout_data_mut(node);
-            if let Some(fixed) = fixed {
-                *data = fixed;
-                if first.is_some() { data.mark_children_changed(); }
-            } else {
-                data.mark_subtree_changed();
-            }
-            next = crate::tree_walk::next(
-                node, !disabled, |_| first, |id| self.next_sibling(id),
-                |id| self.parent(id), |id| id == root,
-            );
-        }
+        reconcile::project(&mut ProjectTopology(self), root);
     }
 
     fn mark_attached(&mut self, node: Self::NodeId) {
-        let ticket = self.node_layout_data(node).topology_index;
+        let ticket = self.node_layout_data(node).topology_index();
         let Some(snapshot) = self.layout_data().topology.as_ref() else {
             self.node_layout_data_mut(node).mark_subtree_changed();
             return;
         };
         let prior = snapshot.index(node, ticket)
-            .map(|index| snapshot.styles[snapshot.nodes[index].style].params);
+            .and_then(|index| snapshot.prior_style(index))
+            .map(|style| style.params);
         if prior.is_some_and(|params| !params.disabled && params.same_input(self.node_layout_params(node))) {
             self.node_layout_data_mut(node).mark_moved();
             return;
@@ -267,103 +346,14 @@ pub(crate) trait Topology: TreeAdapter {
     // Only the current traversal supplies IDs to adapter methods. The old child
     // list is traversed entirely by indices, even if its nodes have been deleted.
     fn reconcile_subtree(
-        &mut self, node: Self::NodeId, parent: Option<usize>, snapshot: &TopologySnapshot<Self::NodeId>,
+        &mut self, node: Self::NodeId, parent: Option<usize>, snapshot: &mut TopologySnapshot<Self::NodeId>,
         state: &mut ReconcileState<'_, Self::NodeId>,
     ) -> Option<()> {
-        let mut suspended = work_stack::<_, 8>(Vec::new());
-        let (mut frame, mut next) = self.enter_reconcile_node(node, parent, snapshot, state)?;
-        loop {
-            if let Some(child) = next {
-                let expected = frame.cursor.expected;
-                if !frame.cursor.changed && expected < frame.end {
-                    let entry = snapshot.nodes.get(expected)?;
-                    if entry.end == expected + 1
-                        && self.node_layout_data(child).topology_index == advance_tickets(snapshot.first_ticket, expected)?
-                        && entry.id == child
-                    {
-                        let old = &snapshot.styles.get(entry.style)?.params;
-                        // An unchanged leaf only advances the parent's old cursor.
-                        if old.same_input(self.node_layout_params(child)) && (old.disabled || self.first_child(child).is_none()) {
-                            frame.cursor = frame.cursor.observe(Some(expected), Some(entry.end));
-                            next = self.next_sibling(child);
-                            continue;
-                        }
-                    }
-                }
-
-                let (child_frame, first) = self.enter_reconcile_node(child, frame.index, snapshot, state)?;
-                if first.is_some() {
-                    suspended.push(frame);
-                    frame = child_frame;
-                    next = first;
-                    continue;
-                }
-                self.finish_reconcile_node(child_frame, state);
-                frame.advance_child(child_frame.index, snapshot)?;
-                next = self.next_sibling(child);
-            } else {
-                self.finish_reconcile_node(frame, state);
-                let Some(mut enclosing) = suspended.pop() else { return Some(()) };
-                enclosing.advance_child(frame.index, snapshot)?;
-                next = self.next_sibling(frame.node);
-                frame = enclosing;
-            }
-        }
-    }
-
-    fn enter_reconcile_node(
-        &mut self, node: Self::NodeId, parent: Option<usize>, snapshot: &TopologySnapshot<Self::NodeId>,
-        state: &mut ReconcileState<'_, Self::NodeId>,
-    ) -> Option<ReconcileStart<Self::NodeId>> {
-        let index = snapshot.index(node, self.node_layout_data(node).topology_index);
-        let prior = index.map(|index| &snapshot.nodes[index]);
-        let reusable = if let Some(entry) = prior {
-            let old = &snapshot.styles.get(entry.style)?.params;
-            let params = self.node_layout_params(node);
-            let changed = !old.same_input(params);
-            if changed {
-                if old.disabled != params.disabled {
-                    state.current = false;
-                }
-                if state.current {
-                    state.styles.push(node);
-                }
-                self.incr_register_node_change(node, old);
-            }
-            !old.disabled && !changed
-        } else {
-            false
-        };
-        match parent_change(prior.map(|entry| entry.parent), parent, reusable) {
-            StructuralChange::Subtree => {
-                state.current = false;
-                self.node_layout_data_mut(node).mark_subtree_changed();
-            }
-            StructuralChange::Moved => {
-                state.current = false;
-                self.node_layout_data_mut(node).mark_moved();
-            }
-            _ => {}
-        }
-        let disabled = self.node_layout_params(node).disabled;
-        let (end, expected, first) = if disabled {
-            (0, 0, None)
-        } else {
-            let end = prior.map_or(0, |entry| entry.end);
-            let expected = index.map_or(0, |index| index + 1);
-            if end < expected || end > snapshot.nodes.len() { return None; }
-            (end, expected, self.first_child(node))
-        };
-        let cursor = ChildCursor { expected, changed: false };
-        Some((ReconcileFrame { node, index, end, cursor }, first))
-    }
-
-    #[inline]
-    fn finish_reconcile_node(&mut self, frame: ReconcileFrame<Self::NodeId>, state: &mut ReconcileState<'_, Self::NodeId>) {
-        if frame.cursor.needs_invalidation(frame.end) {
-            state.current = false;
-            self.node_layout_data_mut(frame.node).mark_children_changed();
-        }
+        tracked::track_reusing::<_, RustVec>(
+            &mut ReconcileWalk { tree: self, state },
+            node, parent, &snapshot.nodes, &snapshot.styles, snapshot.first_ticket,
+            &mut snapshot.reconcile_spill,
+        )
     }
 }
 
@@ -402,7 +392,7 @@ mod tests {
         let snapshot = tree.layout.topology.as_ref().unwrap();
         assert!(snapshot.nodes.iter().map(|entry| entry.id).eq(order.iter().copied()));
         for (index,entry) in snapshot.nodes.iter().enumerate() {
-            assert_eq!(snapshot.index(entry.id, tree.records[entry.id].topology_index), Some(index));
+            assert_eq!(snapshot.index(entry.id, tree.records[entry.id].topology_index()), Some(index));
             assert!(snapshot.styles[entry.style].params.same_input(&tree.params[entry.id]));
         }
         for (index,style) in snapshot.styles.iter().enumerate() {
@@ -421,6 +411,31 @@ mod tests {
             assert_eq!(bits(r,l),bits(fr,fl));
         }
         snapshot.first_ticket
+    }
+
+    #[test]
+    fn regional_ticket_restore_never_writes_a_stale_snapshot_id() {
+        let mut tree = Adapter {
+            next: [None; 7],
+            first: [Some(1), None, None, None, None, None, None],
+            parent: [None, Some(0), None, None, None, None, None],
+            params: [LayoutParams::DEFAULT; 7],
+            records: [NodeLayoutData::new(); 7],
+            output: [None; 7],
+            layout: LayoutData::new(),
+        };
+        let first_ticket = (1_u64 << 32) + 5;
+        let snapshot = TopologySnapshot {
+            first_ticket,
+            nodes: vec![
+                PriorNode { id: 0, parent: ROOT_PARENT, end: 2, style: 0 },
+                PriorNode { id: usize::MAX, parent: 0, end: 2, style: 0 },
+            ],
+            ..TopologySnapshot::new()
+        };
+        assert!(!snapshot.restore_region_tickets(&mut tree, 0, first_ticket));
+        assert_eq!(tree.records[0].topology_index(), first_ticket);
+        assert_eq!(tree.records[1].topology_index(), 0);
     }
 
     #[test]
@@ -496,7 +511,7 @@ mod tests {
         assert!(snapshot.nodes.is_empty());
         assert!(snapshot.styles.is_empty());
         assert_eq!(snapshot.index(0, first), None);
-        assert_eq!(tree.records[0].topology_index, first);
+        assert_eq!(tree.records[0].topology_index(), first);
 
         tree.first[0] = Some(2);
         tree.next[2] = Some(1);
@@ -549,6 +564,11 @@ mod tests {
 
             let mut styles = Vec::new();
             assert!(tree.reconcile_topology(&mut styles));
+            let spill = &tree.layout.topology.as_ref().unwrap().reconcile_spill;
+            assert!(!spill.is_empty());
+            let storage = spill.as_ptr();
+            assert!(tree.reconcile_topology(&mut styles));
+            assert_eq!(tree.layout.topology.as_ref().unwrap().reconcile_spill.as_ptr(), storage);
             assert!(tree.records.iter().all(|record| record.structural_change == StructuralChange::Clean));
 
             // An unavailable old range must clear the snapshot and use the

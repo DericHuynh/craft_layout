@@ -31,6 +31,55 @@ PRELUDE = """
 (declare-const weight F)
 """
 
+# For finite operands IEEE RNE chooses the nearest point to the exact real
+# difference. Identify signed zeros and use ±2^128 for the two infinities.
+# These are the next points beyond ±FLT_MAX in the format with an unbounded
+# exponent, so rounding into those points uses precisely the IEEE overflow
+# thresholds. Beyond them the nearest point stays at the corresponding end.
+# On ties the specification's even choice is deterministic in this order.
+# Reversed rounded results would place a at or above their midpoint and b
+# at or below it. With a <= b, both would be the same midpoint.
+NEAREST_ORDER = """
+(set-logic QF_UFLRA)
+(declare-const x Real)
+(declare-const y Real)
+(declare-const c Real)
+(declare-fun rounded (Real) Real)
+(define-fun distance ((a Real) (b Real)) Real (ite (<= a b) (- b a) (- a b)))
+(define-fun a () Real (- x c))
+(define-fun b () Real (- y c))
+(assert (<= x y))
+; Each chosen point is at least as close as the other chosen point.
+(assert (<= (distance a (rounded a)) (distance a (rounded b))))
+(assert (<= (distance b (rounded b)) (distance b (rounded a))))
+(assert (> (rounded a) (rounded b)))
+(check-sat)
+"""
+
+INFINITE_ORDER = """
+(declare-const left F)
+(declare-const right F)
+(assert (fp.leq x y))
+(assert (or (fp.isInfinite x) (fp.isInfinite y)))
+(assert (valid left))
+(assert (valid right))
+(assert (=> (fp.isInfinite x) (= left x)))
+(assert (=> (fp.isInfinite y) (= right y)))
+(assert (not (fp.leq left right)))
+(check-sat)
+"""
+
+UNIT_WEIGHT_FOLD = """
+(set-logic QF_FPBV)
+(define-sort F () (_ FloatingPoint 8 24))
+(declare-const n (_ BitVec 32))
+(assert (bvult n #x01000000))
+(define-fun before () F ((_ to_fp_unsigned 8 24) RNE n))
+(define-fun after () F ((_ to_fp_unsigned 8 24) RNE (bvadd n #x00000001)))
+(assert (not (= after (fp.add RNE before ((_ to_fp 8 24) #x3f800000)))))
+(check-sat)
+"""
+
 
 def compile_definitions(directory):
     wrappers = [f'#[path=r"{SOURCE}"] mod budget;']
@@ -70,12 +119,32 @@ def compile_definitions(directory):
     return '\n'.join(definitions)
 
 
+def verify(z3, name, query):
+    result = subprocess.run([z3, '-in'], input=query, capture_output=True, text=True, check=True)
+    if result.stdout.strip() != 'unsat':
+        raise RuntimeError(f'{name}: {result.stdout.strip()} {result.stderr.strip()}')
+
+
+def verify_charge_order(z3, program):
+    def refute(name, prop):
+        verify(z3, name, program + f'\n(assert (not {prop}))\n(check-sat)\n')
+
+    # The analytic finite-operand argument applies only to IEEE RNE subtraction.
+    refute('production charge', '(= (charge x c) (fp.sub RNE x c))')
+    refute('infinite input to charge', '(=> (and (fp.isInfinite x) (fee c)) (= (charge x c) x))')
+    verify(z3, 'exact subtraction followed by nearest rounding', NEAREST_ORDER)
+    # The earlier cost law establishes that both outputs are ordered numbers.
+    verify(z3, 'charge order with infinite inputs', PRELUDE + INFINITE_ORDER)
+    print('cost preserves the upper bound verified', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--z3', default=os.environ.get('Z3', 'z3'))
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as tmp:
         definitions = compile_definitions(Path(tmp))
+    program = PRELUDE + definitions
     laws = {
         'initial upper bound': '(=> (and (fp.geq x zero) (fp.geq gaps zero)) '
                                '(and (valid (after_gaps x gaps)) (fp.leq (after_gaps x gaps) x)))',
@@ -85,15 +154,24 @@ def main():
                                       '(and (valid (charge x c)) (fp.leq (charge x c) x)))',
         'zero-cost tail edit': '(=> (and (valid x) (fp.isZero c)) (fp.eq (charge x c) x))',
         'positive-zero share': '(=> (fp.leq x zero) (= (share (nonnegative x) zero weight) zero))',
-        'cost preserves the upper bound': '(=> (and (fp.leq x y) (fee c)) '
-                                         '(fp.leq (charge x c) (charge y c)))',
+        'inactive finite pixel bounds give zero violation':
+            '(=> (and (valid x) (valid y) (not (fp.isInfinite x)) (not (fp.isInfinite y))) '
+            '(and (=> (fp.leq y x) (= (charge (ite (fp.lt x y) y x) x) zero)) '
+            '     (=> (fp.leq x y) (= (charge (ite (fp.lt y x) y x) x) zero)) '
+            '     (= (fp.add RNE zero zero) zero)))',
+        'one violation has the same freeze decision':
+            '(=> (fp.lt zero c) '
+            '(let ((total (fp.add RNE zero x))) '
+            '(= (fp.lt c (fp.abs x)) '
+            '   (and (not (fp.lt (fp.abs total) c)) '
+            '        (ite (fp.gt total zero) (fp.gt x c) (fp.lt x (fp.sub RNE zero c)))))))',
     }
     for name, law in laws.items():
-        query = PRELUDE + definitions + f'\n(assert (not {law}))\n(check-sat)\n'
-        r = subprocess.run([args.z3, '-in'], input=query, capture_output=True, text=True, check=True)
-        if r.stdout.strip() != 'unsat':
-            raise RuntimeError(f'{name}: {r.stdout.strip()} {r.stderr.strip()}')
+        verify(args.z3, name, program + f'\n(assert (not {law}))\n(check-sat)\n')
         print(f'{name} verified', flush=True)
+    verify_charge_order(args.z3, program)
+    verify(args.z3, 'ordered unit weights equal the exact count', UNIT_WEIGHT_FOLD)
+    print('ordered unit weights equal the exact count verified', flush=True)
 
 
 if __name__ == '__main__':

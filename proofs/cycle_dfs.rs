@@ -187,6 +187,167 @@ pub open spec fn fresh(s:Search,k:int) -> bool {
     let e = kernel::enter((s.state)(k));
     !(e is Reuse) && !(e is BackEdge)
 }
+
+/// A pending Finish has a preceding visit for each dependency that has yet
+/// to be entered. Back edges already expose their provisional values.
+pub open spec fn reads_scheduled(s: Search, edges: Edges) -> bool {
+    forall |i: int, j: int| 0 <= i < s.todo.len() && s.todo[i] is Finish
+        && 0 <= j < edges(s.todo[i].key()).len() && fresh(s, #[trigger] edges(s.todo[i].key())[j])
+        ==> s.todo.take(i).contains(Task::Visit(edges(s.todo[i].key())[j]))
+}
+
+pub open spec fn reads_available(s: Search, edges: Edges) -> bool {
+    s.todo.len() > 0 && s.todo.first() is Finish ==>
+        forall |j: int| 0 <= j < edges(s.todo.first().key()).len()
+            ==> !fresh(s, #[trigger] edges(s.todo.first().key())[j])
+}
+
+pub open spec fn ready_exterior(s: Search, restrict: Option<Region>) -> bool {
+    match restrict {
+        None => true,
+        Some(inside) => forall |k: int| !inside(k) ==> !#[trigger] fresh(s,k),
+    }
+}
+
+proof fn project_keeps_visit(keys: Seq<int>, inside: Region, key: int)
+    requires keys.contains(key), inside(key),
+    ensures project(requests(keys), inside).contains(Task::Visit(key)),
+    decreases keys.len(),
+{
+    let head = keys.first();
+    let tail = keys.drop_first();
+    assert(requests(keys).first() == Task::Visit(head));
+    assert(requests(keys).drop_first() =~= requests(tail));
+    let earlier = choose |j: int| 0 <= j < keys.len() && keys[j] == key;
+    if earlier != 0 {
+        assert(tail[earlier - 1] == key);
+        project_keeps_visit(tail, inside, key);
+        let rest = project(requests(tail), inside);
+        let found = choose |j: int| 0 <= j < rest.len() && rest[j] == Task::Visit(key);
+        let i = if inside(head) { found + 1 } else { found };
+        assert(project(requests(keys), inside)[i] == Task::Visit(key));
+    } else {
+        assert(project(requests(keys), inside)[0] == Task::Visit(key));
+    }
+}
+
+pub(crate) proof fn step_keeps_reads_scheduled(s: Search, edges: Edges, initial: spec_fn(int) -> Seq<u32>,
+    restrict: Option<Region>)
+    requires s.todo.len() > 0, reads_scheduled(s, edges), ready_exterior(s, restrict),
+    ensures reads_available(s, edges),
+        reads_scheduled(step(s, edges, initial, restrict).next, edges),
+        ready_exterior(step(s, edges, initial, restrict).next, restrict),
+{
+    let task = s.todo.first();
+    let key = task.key();
+    let after = step(s, edges, initial, restrict).next;
+    let expands = task is Visit && fresh(s, key);
+    let deps = match restrict {
+        None => requests(edges(key)),
+        Some(inside) => project(requests(edges(key)), inside),
+    };
+    let inserted = if expands { deps + seq![Task::Finish(key)] } else { Seq::empty() };
+    assert(after.todo =~= inserted + s.todo.drop_first());
+    assert(!fresh(after, key));
+    assert forall |k: int| #[trigger] fresh(after, k) implies fresh(s, k) by {};
+    if task is Finish {
+        assert forall |j: int| 0 <= j < edges(key).len()
+            implies !fresh(s, #[trigger] edges(key)[j]) by {
+            assert(s.todo[0] == task);
+            assert(s.todo.take(0) =~= Seq::<Task>::empty());
+        }
+    }
+    assert forall |i: int, j: int| 0 <= i < after.todo.len() && after.todo[i] is Finish
+        && 0 <= j < edges(after.todo[i].key()).len() && fresh(after, #[trigger] edges(after.todo[i].key())[j])
+        implies after.todo.take(i).contains(Task::Visit(edges(after.todo[i].key())[j])) by {
+        let dependency = edges(after.todo[i].key())[j];
+        let visit = Task::Visit(dependency);
+        if i < inserted.len() {
+            assert(expands);
+            if i < deps.len() {
+                match restrict {
+                    None => { assert(deps[i] is Visit); },
+                    Some(inside) => { projected_requests_are_visits(edges(key), inside, i); },
+                }
+                assert(after.todo[i] == deps[i]);
+                assert(false);
+            }
+            assert(i == deps.len() && after.todo[i] == Task::Finish(key));
+            match restrict {
+                None => { assert(deps[j] == visit); },
+                Some(inside) => {
+                    assert(inside(dependency));
+                    assert(edges(key).contains(dependency));
+                    project_keeps_visit(edges(key), inside, dependency);
+                }
+            }
+            assert(after.todo.take(i) =~= deps);
+        } else {
+            let prior = i - inserted.len() + 1;
+            assert(s.todo[prior] == after.todo[i]);
+            assert(s.todo.take(prior).contains(visit));
+            let before = choose |q: int| 0 <= q < prior && s.todo.take(prior)[q] == visit;
+            assert(s.todo[before] == visit);
+            if before == 0 {
+                assert(key == dependency);
+                assert(false);
+            }
+            let still_before = inserted.len() + before - 1;
+            assert(after.todo.take(i)[still_before] == visit);
+        }
+    }
+}
+
+proof fn projected_requests_are_visits(keys: Seq<int>, inside: Region, i: int)
+    requires 0 <= i < project(requests(keys), inside).len(),
+    ensures project(requests(keys), inside)[i] is Visit,
+    decreases keys.len(),
+{
+    let head = keys.first();
+    let rest = keys.drop_first();
+    assert(requests(keys).first() == Task::Visit(head));
+    assert(requests(keys).drop_first() =~= requests(rest));
+    if inside(head) {
+        if i > 0 { projected_requests_are_visits(rest, inside, i - 1); }
+    } else {
+        projected_requests_are_visits(rest, inside, i);
+    }
+}
+
+pub open spec fn available_through(s: Search, edges: Edges, initial: spec_fn(int) -> Seq<u32>,
+    restrict: Option<Region>, steps: nat) -> bool
+    decreases steps,
+{
+    steps == 0 || s.todo.len() == 0 || (reads_available(s, edges)
+        && available_through(step(s, edges, initial, restrict).next, edges, initial, restrict,
+            (steps - 1) as nat))
+}
+
+/// The full traversal and a restricted traversal with an already ready
+/// exterior both reach every scheduled read after its dependency was entered.
+pub proof fn dfs_roots_read_available_slots(roots: Seq<int>, state: spec_fn(int) -> u32,
+    edges: Edges, initial: spec_fn(int) -> Seq<u32>, restrict: Option<Region>, steps: nat)
+    requires ready_exterior(Search { todo: requests(roots), state }, restrict),
+    ensures available_through(Search { todo: requests(roots), state }, edges, initial, restrict, steps),
+{
+    let s = Search { todo: requests(roots), state };
+    assert forall |i: int| 0 <= i < s.todo.len() implies (#[trigger] s.todo[i]) is Visit by {};
+    dfs_reads_available_slots(s, edges, initial, restrict, steps);
+}
+
+proof fn dfs_reads_available_slots(s: Search, edges: Edges, initial: spec_fn(int) -> Seq<u32>,
+    restrict: Option<Region>, steps: nat)
+    requires reads_scheduled(s, edges), ready_exterior(s, restrict),
+    ensures available_through(s, edges, initial, restrict, steps),
+    decreases steps,
+{
+    if steps > 0 && s.todo.len() > 0 {
+        step_keeps_reads_scheduled(s, edges, initial, restrict);
+        dfs_reads_available_slots(step(s, edges, initial, restrict).next, edges, initial, restrict,
+            (steps - 1) as nat);
+    }
+}
+
 /// Unopened nodes pay for their own finish task and every potential child
 /// request. Dropping a hit uses one unit; expanding an unseen node also uses
 /// one net unit after transferring its credit to the work list.
@@ -201,6 +362,91 @@ pub open spec fn budget(s:Search,edges:Edges,n:nat) -> nat
 pub open spec fn bounded(s:Search,edges:Edges,n:nat) -> bool {
     &&& forall|j:int| 0 <= j < s.todo.len() ==> 0 <= (#[trigger] s.todo[j]).key() < n
     &&& forall|k:int,j:int| 0 <= k < n && 0 <= j < edges(k).len() ==> 0 <= #[trigger] edges(k)[j] < n
+}
+
+/// Finish markers on an explicit stack belong to distinct open slots.
+pub open spec fn active_finishes(s: Search) -> bool {
+    &&& forall |i: int| 0 <= i < s.todo.len() && (#[trigger] s.todo[i]) is Finish
+        ==> (s.state)(s.todo[i].key()) == kernel::IN_PROGRESS
+    &&& forall |i: int, j: int| 0 <= i < j < s.todo.len()
+        && (#[trigger] s.todo[i]) is Finish && (#[trigger] s.todo[j]) is Finish
+        ==> s.todo[i].key() != s.todo[j].key()
+}
+
+pub open spec fn pending_or_solved(s: Search, k: int) -> bool {
+    (s.state)(k) == kernel::SOLVED || s.todo.contains(Task::Finish(k))
+}
+
+pub(crate) proof fn full_step_preserves_goal(s: Search, edges: Edges,
+    initial: spec_fn(int) -> Seq<u32>, goal: int)
+    requires s.todo.len() > 0, pending_or_solved(s, goal),
+    ensures pending_or_solved(step(s, edges, initial, None).next, goal),
+{
+    let head = s.todo.first();
+    let next = step(s, edges, initial, None).next;
+    if (next.state)(goal) != kernel::SOLVED {
+        assert((s.state)(goal) != kernel::SOLVED);
+        let i = choose |i: int| 0 <= i < s.todo.len() && s.todo[i] == Task::Finish(goal);
+        if i == 0 { assert(head == Task::Finish(goal)); }
+        let extra = if head is Visit && fresh(s, head.key()) { edges(head.key()).len() + 1 } else { 0nat };
+        assert(next.todo[i - 1 + extra] == Task::Finish(goal));
+    }
+}
+
+pub(crate) proof fn full_step_preserves_driver_invariants(s: Search, edges: Edges,
+    initial: spec_fn(int) -> Seq<u32>, n: nat)
+    requires s.todo.len() > 0, bounded(s, edges, n), active_finishes(s),
+    ensures ({
+        let next = step(s, edges, initial, None).next;
+        &&& bounded(next, edges, n)
+        &&& active_finishes(next)
+        &&& next.todo.len() + budget(next, edges, n) < s.todo.len() + budget(s, edges, n)
+    }),
+{
+    let head = s.todo.first();
+    let k = head.key();
+    let next = step(s, edges, initial, None).next;
+    let deps = requests(edges(k));
+    let expands = head is Visit && fresh(s, k);
+    let extra = if expands { deps.len() + 1 } else { 0nat };
+    assert(s.todo[0] == head);
+    assert(next.todo.len() == s.todo.len() - 1 + extra);
+    assert(!fresh(next,k));
+    assert(!expands ==> !fresh(s,k));
+    budget_change(s,next,edges,n,k);
+    assert forall |i: int| 0 <= i < next.todo.len() implies 0 <= (#[trigger] next.todo[i]).key() < n by {
+        if i < extra {
+            if i == deps.len() { assert(next.todo[i] == Task::Finish(k)); }
+            else { assert(next.todo[i] == Task::Visit(edges(k)[i])); }
+        } else {
+            assert(next.todo[i] == s.todo[i-extra+1]);
+        }
+    }
+    assert forall |i: int| 0 <= i < next.todo.len() && (#[trigger] next.todo[i]) is Finish
+        implies (next.state)(next.todo[i].key()) == kernel::IN_PROGRESS by {
+        if i < extra {
+            if i < deps.len() { assert(next.todo[i] is Visit); }
+            assert(next.todo[i] == Task::Finish(k));
+        } else {
+            let prior = i-extra+1;
+            assert(next.todo[i] == s.todo[prior]);
+            assert((s.state)(s.todo[prior].key()) == kernel::IN_PROGRESS);
+            if head is Finish { assert(s.todo[prior].key() != s.todo[0].key()); }
+        }
+    }
+    assert forall |i: int, j: int| 0 <= i < j < next.todo.len()
+        && (#[trigger] next.todo[i]) is Finish && (#[trigger] next.todo[j]) is Finish
+        implies next.todo[i].key() != next.todo[j].key() by {
+        if i < extra {
+            assert(i == deps.len() && next.todo[i] == Task::Finish(k));
+            let prior = j-extra+1;
+            assert(next.todo[j] == s.todo[prior]);
+            assert((s.state)(s.todo[prior].key()) == kernel::IN_PROGRESS);
+        } else {
+            assert(next.todo[i] == s.todo[i-extra+1]);
+            assert(next.todo[j] == s.todo[j-extra+1]);
+        }
+    }
 }
 proof fn budget_change(a:Search, b:Search, edges:Edges,n:nat, key:int)
     requires forall|k:int| k != key ==> #[trigger] fresh(a,k) == fresh(b,k), !fresh(b,key),

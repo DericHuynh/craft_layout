@@ -6,31 +6,17 @@ pub(crate) mod rules;
 use rules::{Form, Input};
 #[path = "../src/sizing_stack.rs"]
 pub(crate) mod sizing_stack;
+#[path = "../src/sizing_requests.rs"]
+pub(crate) mod sizing_requests;
+#[path = "../src/sizing_child.rs"]
+mod sizing_child;
+#[path = "../src/sizing_finish.rs"]
+pub(crate) mod sizing_finish;
 #[path = "../src/registration_rules.rs"]
-mod registration;
+pub(crate) mod registration;
 use registration::{AxisEdits, Context, Seeds};
 
 verus! {
-
-pub enum ParentRequest { Final(bool), LineExtent }
-
-/// `false` denotes the requested axis and `true` its opposite. This uses
-/// the same request expansion as `request_available_from_parent`.
-pub fn parent_requests(in_flow:bool, wrap_cross:bool, width_grid_other:bool) -> (requests:Vec<ParentRequest>)
-    ensures requests@ == if in_flow && wrap_cross { seq![ParentRequest::LineExtent] }
-        else if in_flow && width_grid_other { seq![ParentRequest::Final(false),ParentRequest::Final(true)] }
-        else { seq![ParentRequest::Final(false)] },
-{
-    use rules::request_parent_inputs;
-    let mut out = Vec::new();
-    request_parent_inputs!(
-        in_flow && wrap_cross;
-        rules::reads_parent_axis(false,in_flow,width_grid_other);
-        other => { out.push(ParentRequest::Final(other)); };
-        { out.push(ParentRequest::LineExtent); }
-    );
-    out
-}
 
 pub enum Part { Declared(Form), Final, Share }
 
@@ -73,7 +59,7 @@ pub open spec fn full_read(reader: Part, input: Part, e: Edge) -> bool {
             Input::OppositeFinal => e.source is SameNode && !e.same_axis && input is Final,
             Input::ParentFinal => e.source is Parent && input is Final
                 && (e.same_axis || rules::reads_parent_axis(false, e.in_flow, e.grid_main)),
-            Input::ParentShare => e.source is Parent && e.same_axis && input is Share,
+            Input::ParentShare(()) => e.source is Parent && e.same_axis && input is Share,
             Input::IntrinsicChildren => match e.source {
                 Source::SameNode => !e.same_axis && input is Final
                     && rules::reads_intrinsic_constraint(e.intrinsic_other, e.grid_main),

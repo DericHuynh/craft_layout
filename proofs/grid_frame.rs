@@ -7,11 +7,160 @@ use crate::dependencies::{self, Edge, Part, Source};
 use crate::{replay_history, replay_prefix::{self, RootPrefix}};
 use crate::replay_view::{self, Replay, ReadWord};
 use crate::structural_plan::SubtreeCut;
+use crate::declarations::{Axis, ChildrenLayout, LayoutParams, MainAxisCellSize};
+use crate::prepare_nodes::RecordModel;
+use crate::cycles::kernel::Kind as SlotKind;
+use crate::dependencies::{rules::Form, sizing_requests as requests};
+use crate::node_flags::NodeFlags;
 
 #[path = "../src/grid_state.rs"]
-mod state;
+pub(crate) mod state;
+#[path = "../src/grid_width.rs"]
+pub(crate) mod width;
 
 verus! {
+
+pub(crate) open spec fn width_mode(layout: ChildrenLayout) -> Option<(Axis, bool)> {
+    match layout {
+        ChildrenLayout::Grid { columns: MainAxisCellSize::Width(_), main_axis, backfill, .. } => Some((main_axis, backfill)),
+        _ => None,
+    }
+}
+
+/// The actual grid reader follows the sibling links and projects enabled,
+/// in-flow child spans in the search's height/width order.
+pub(crate) open spec fn width_items<T: RecordModel + ?Sized>(tree: &T, children: Set<T::Id>, axis: Axis)
+    -> crate::grid::grid_sparse::GridItems<T::Id>
+{
+    let order = tree.order();
+    Map::new(children, |id: T::Id| {
+        let p = tree.layout_params(id);
+        ((order.sibling)(id), state::assignment_item(p.disabled, p.free_placement, p.grid_span.x, p.grid_span.y, axis is Y))
+    })
+}
+
+pub(crate) open spec fn width_search_summary<T: RecordModel + ?Sized>(tree: &T, parent: T::Id) -> (u32, bool) {
+    let data = tree.layout_record(parent);
+    (data.n_placed_children, data.flags.0 & NodeFlags::GRID_SPANS != 0)
+}
+
+/// A fresh assignment uses the prepared count and span flag, the main-axis
+/// width key's integer column count and the current ordered child links.
+pub(crate) open spec fn fresh_width_assignment<T: RecordModel + ?Sized>(tree: &T, parent: T::Id,
+    children: Set<T::Id>, remaining: nat, columns: usize,
+) -> (grid_search::GridRows, grid_sparse::CellWrites<T::Id>) {
+    let (axis, backfill) = width_mode(tree.layout_params(parent).children_layout).unwrap();
+    let (count, spans) = width_search_summary(tree, parent);
+    grid_search::assignment_result(width_items(tree, children, axis), (tree.order().first)(parent),
+        remaining, columns, count, spans, backfill)
+}
+
+/// Numeric declaration edits preserve Width mode and the ordered child spans
+/// read by `inspect`. Equal prepared summaries and columns then give the same
+/// fresh assignment on both frames.
+pub(crate) proof fn numeric_frame_keeps_width_grid_items<T: RecordModel + ?Sized>(
+    previous: &T, current: &T, parent: T::Id, children: Set<T::Id>, remaining: nat, columns: usize,
+)
+    requires previous.order() == current.order(),
+        width_mode(previous.layout_params(parent).children_layout).is_some(),
+        !dependencies::registration::sizing_structure_changed(&previous.layout_params(parent), &current.layout_params(parent)),
+        forall|id: T::Id| #[trigger] children.contains(id)
+            == ((previous.order().live)(id) && (previous.order().parent)(id) == Some(parent)),
+        forall|id: T::Id| #[trigger] children.contains(id)
+            ==> !dependencies::registration::sizing_structure_changed(&previous.layout_params(id), &current.layout_params(id)),
+    ensures
+        width_mode(current.layout_params(parent).children_layout) == width_mode(previous.layout_params(parent).children_layout),
+        width_items(previous, children, width_mode(previous.layout_params(parent).children_layout).unwrap().0)
+            == width_items(current, children, width_mode(current.layout_params(parent).children_layout).unwrap().0),
+        width_search_summary(previous, parent) == width_search_summary(current, parent)
+            ==> fresh_width_assignment(previous, parent, children, remaining, columns)
+                == fresh_width_assignment(current, parent, children, remaining, columns),
+{
+    let mode = width_mode(previous.layout_params(parent).children_layout);
+    assert(mode == width_mode(current.layout_params(parent).children_layout));
+    let axis = mode.unwrap().0;
+    let old_rows = width_items(previous, children, axis);
+    let new_rows = width_items(current, children, axis);
+    assert(old_rows =~= new_rows);
+}
+
+pub(crate) open spec fn declarations_on_axis<I: Copy>(
+    topology: requests::Topology<I>, node: I, params: LayoutParams, vertical: bool,
+) -> bool {
+    forall |kind: SlotKind| (topology.form)(#[trigger] requests::target(node, vertical, kind))
+        == match requests::resolved_size(params, vertical, kind, false, false) {
+            Some(size) => Some(size.dependency_form()),
+            None => None,
+        }
+}
+
+/// An accepted root preview supplies the same requests and levels as the
+/// ordinary solver. The root Regular reads the window or its declaration.
+/// Each following request adds exactly one dependency level.
+pub(crate) proof fn preview_request_chain<I: Copy>(
+    topology: requests::Topology<I>, root: I, grid: I,
+    root_params: LayoutParams, grid_params: LayoutParams, axis: Axis,
+)
+    requires
+        width::root_grid_boundary(grid_params, root_params, axis),
+        declarations_on_axis(topology, root, root_params, axis is Y),
+        declarations_on_axis(topology, grid, grid_params, axis is Y),
+        (topology.parent)(root).is_none(), (topology.parent)(grid) == Some(root),
+        (topology.stack_parent)(requests::target(root, axis is Y, SlotKind::Regular)).is_none(),
+        (topology.stack_parent)(requests::target(grid, axis is Y, SlotKind::Regular)).is_none(),
+        !(topology.parent_flow)(requests::target(grid, axis is Y, SlotKind::Regular), root),
+        !(topology.parent_other)(requests::target(grid, axis is Y, SlotKind::Regular), root),
+    ensures ({
+        let root_regular = requests::target(root, axis is Y, SlotKind::Regular);
+        let root_final = requests::target(root, axis is Y, SlotKind::Final);
+        let grid_regular = requests::target(grid, axis is Y, SlotKind::Regular);
+        let grid_final = requests::target(grid, axis is Y, SlotKind::Final);
+        &&& requests::inputs(topology, root_regular).len() == 0
+        &&& requests::inputs(topology, root_final) == seq![root_regular]
+        &&& requests::inputs(topology, grid_regular) == seq![root_final]
+        &&& requests::inputs(topology, grid_final) == seq![grid_regular]
+    }),
+{
+    reveal_with_fuel(requests::declaration_prefix, 4);
+    let vertical = axis is Y;
+    let root_regular = requests::target(root, vertical, SlotKind::Regular);
+    let grid_regular = requests::target(grid, vertical, SlotKind::Regular);
+    assert((topology.form)(root_regular) == Some(Form::Fill)
+        || (topology.form)(root_regular) == Some(Form::Constant));
+    assert((topology.form)(grid_regular) == Some(Form::Fill));
+    assert((topology.form)(requests::target(root, vertical, SlotKind::Min)).is_none());
+    assert((topology.form)(requests::target(root, vertical, SlotKind::Max)).is_none());
+    assert((topology.form)(requests::target(grid, vertical, SlotKind::Min)).is_none());
+    assert((topology.form)(requests::target(grid, vertical, SlotKind::Max)).is_none());
+}
+
+/// The admitted unchanged row leaves cannot read the changed width of their
+/// Stack parent. Pixels are local and FitContent can only read the leaf's
+/// own opposite Final.
+pub(crate) proof fn accepted_row_leaf_has_no_parent_size_requests<I: Copy>(
+    topology: requests::Topology<I>, node: I, params: LayoutParams, vertical: bool,
+)
+    requires
+        crate::prepare_nodes::independent_row_leaf(&params),
+        declarations_on_axis(topology, node, params, vertical),
+        (topology.children)(node).len() == 0,
+        !(topology.intrinsic_flow)(requests::target(node, vertical, SlotKind::Regular)),
+    ensures ({
+        let regular = requests::target(node, vertical, SlotKind::Regular);
+        let completed = requests::target(node, vertical, SlotKind::Final);
+        let opposite = requests::target(node, !vertical, SlotKind::Final);
+        &&& (requests::inputs(topology, regular).len() == 0
+            || requests::inputs(topology, regular) == seq![opposite])
+        &&& requests::inputs(topology, completed) == seq![regular]
+    }),
+{
+    reveal_with_fuel(requests::declaration_prefix, 4);
+    let regular = requests::target(node, vertical, SlotKind::Regular);
+    assert((topology.form)(regular) == Some(Form::Constant)
+        || (topology.form)(regular) == Some(Form::Intrinsic));
+    assert((topology.form)(requests::target(node, vertical, SlotKind::Min)).is_none());
+    assert((topology.form)(requests::target(node, vertical, SlotKind::Max)).is_none());
+}
 
 pub struct Span {
     pub height: usize,
@@ -100,6 +249,40 @@ impl Assignment {
     }
 }
 
+pub open spec fn span_heights(items: Seq<Span>, n: nat) -> nat
+    decreases n,
+{
+    if n == 0 { 0 } else { span_heights(items, (n - 1) as nat) + items[n - 1].height as nat }
+}
+
+/// The packed cursor grows by at most the height of the current rectangle.
+/// Thus the sum checked by preflight also bounds scratch occupancy at every
+/// prefix, with the extra row needed for the scanner's cursor arithmetic.
+pub proof fn spanned_prefix_fits_budget(run: Assignment, layout: Layout, items: Seq<Span>, n: nat, budget: nat)
+    requires
+        run.from(layout, items), n <= items.len(), layout.stride > 0,
+        span_heights(items, n) <= budget,
+        (budget + 1) * layout.stride <= state::MAX_PACKED_WORDS,
+        (budget + 1) * layout.stride <= (isize::MAX as int) / 8,
+    ensures
+        run.states[n as int].cursor.rows <= span_heights(items, n),
+        run.states[n as int].occupied.len() <= state::MAX_PACKED_WORDS,
+        run.states[n as int].occupied.len() * 8 <= isize::MAX,
+        n > 0 ==> (run.states[n - 1].cursor.rows + items[n - 1].height + 1) * layout.stride
+            <= (isize::MAX as int) / 8,
+    decreases n,
+{
+    if n > 0 {
+        let i = n - 1;
+        spanned_prefix_fits_budget(run, layout, items, i as nat, budget);
+        let before = run.states[i].cursor;
+        let after = run.states[n as int].cursor;
+        assert(run.states[i].place(run.states[n as int], layout, items[i], run.cells[i]));
+        vstd::arithmetic::mul::lemma_mul_inequality(before.rows + items[i].height + 1, budget as int + 1, layout.stride as int);
+        vstd::arithmetic::mul::lemma_mul_inequality(after.rows - after.first_row, budget as int + 1, layout.stride as int);
+    }
+}
+
 /// All three numerical kernels are driven by enabled, in-flow children in
 /// the same document order. Spanned inputs preserve both physical coordinates
 /// and the cross-track count across separately allocated scratch storage.
@@ -119,6 +302,316 @@ pub proof fn spanned_assignment_is_deterministic(a:Assignment,b:Assignment,layou
             layout,item,a.cells[i],b.cells[i]);
     }
     assert(a.cells.take(n as int) =~= b.cells.take(n as int));
+}
+
+/// In backfill mode the cache for a height/width pair is a lower bound
+/// on the first free cell. Wider or taller probes use the same bound.
+pub open spec fn backfill_limits(snapshot: Snapshot, layout: Layout) -> bool {
+    &&& snapshot.cursor.first_row == 0
+    &&& forall |h: int, w: int| 1 <= h <= CACHED_SPANS && 1 <= w <= CACHED_SPANS ==> {
+        let edge = #[trigger] snapshot.cursor.limits[h - 1][w - 1];
+        passed(packed(snapshot.occupied, layout.stride as int), layout.columns as int, h, w,
+            (0int, 0int), (edge.0 as int, edge.1 as int))
+    }
+}
+
+proof fn grow_passed(before_board: Board, after_board: Board, columns: int,
+    old_h: int, old_w: int, h: int, w: int, edge: Cell,
+)
+    requires 1 <= old_h <= h, 1 <= old_w <= w,
+        forall |p: Cell| #[trigger] before_board.contains(p) ==> after_board.contains(p),
+        passed(before_board, columns, old_h, old_w, (0int, 0int), edge),
+    ensures passed(after_board, columns, h, w, (0int, 0int), edge),
+{
+    assert forall |p: Cell| legal(p, columns, w) && !before(p, (0int, 0int)) && before(p, edge)
+        implies !#[trigger] fits(after_board, p, h, w) by {
+        assert(legal(p, columns, old_w));
+        assert(!fits(before_board, p, old_h, old_w));
+        let hit = choose |q: Cell| #[trigger] before_board.contains(q) && covers(p, old_h, old_w, q);
+        assert(after_board.contains(hit) && covers(p, h, w, hit));
+    }
+}
+
+/// Resolve a native packed step from the true backfill origin. The lower
+/// bound comes from earlier occupancy, and the newly written rectangle
+/// establishes the next bound for its exact span.
+pub proof fn packed_backfill_from_origin(before_state: Snapshot, after_state: Snapshot, layout: Layout,
+    item: Span, cell: (usize, usize),
+)
+    requires layout.backfill, 1 <= item.height, 1 <= item.width,
+        backfill_limits(before_state, layout),
+        before_state.place(after_state, layout, item, cell),
+    ensures
+        backfill_limits(after_state, layout),
+        first_fit(packed(before_state.occupied, layout.stride as int), layout.columns as int,
+            item.height as int, item.width as int, (0int, 0int), (cell.0 as int, cell.1 as int)),
+{
+    let board = packed(before_state.occupied, layout.stride as int);
+    let after = packed(after_state.occupied, layout.stride as int);
+    let columns = layout.columns as int;
+    let h = item.height as int;
+    let w = item.width as int;
+    let cell = (cell.0 as int, cell.1 as int);
+    let ih = vstd::math::min(h, CACHED_SPANS as int);
+    let iw = vstd::math::min(w, CACHED_SPANS as int);
+    let edge = before_state.cursor.limits[ih - 1][iw - 1];
+    let start = (edge.0 as int, edge.1 as int);
+    assert(passed(board, columns, ih, iw, (0int, 0int), start));
+    grow_passed(board, board, columns, ih, iw, h, w, start);
+    assert(first_fit(board, columns, h, w, start, cell));
+    assert forall |p: Cell| legal(p, columns, w) && !before(p, (0int, 0int)) && before(p, cell)
+        implies !#[trigger] fits(board, p, h, w) by {
+        if before(p, start) {
+            assert(passed(board, columns, h, w, (0int, 0int), start));
+        } else {
+            assert(passed(board, columns, h, w, start, cell));
+        }
+    }
+    assert(first_fit(board, columns, h, w, (0int, 0int), cell));
+    assert(after_state.cursor.first_row == 0);
+    assert forall |p: Cell| #[trigger] place(board, cell, h, w).contains(p) implies p.0 >= 0 by {
+        if board.contains(p) {
+            assert(p.0 >= 0);
+        } else {
+            assert(covers(cell, h, w, p));
+        }
+    }
+    suffix_zero(place(board, cell, h, w));
+    assert(after == place(board, cell, h, w));
+    assert forall |i: int, j: int| 1 <= i <= CACHED_SPANS && 1 <= j <= CACHED_SPANS implies {
+        let limits = #[trigger] after_state.cursor.limits[i - 1][j - 1];
+        passed(after, columns, i, j, (0int, 0int), (limits.0 as int, limits.1 as int))
+    } by {
+        let limits = after_state.cursor.limits[i - 1][j - 1];
+        let next = (limits.0 as int, limits.1 as int);
+        if i == h && j == w {
+            assert(!before((cell.0, cell.1 + w), next));
+            cache_lower_bound(board, after, columns, h, w, cell, i, j, next);
+        } else {
+            assert(limits == before_state.cursor.limits[i - 1][j - 1]);
+            grow_passed(board, after, columns, i, j, i, j, next);
+        }
+    }
+}
+
+/// The native cache starts empty and every accepted bitmap step has the
+/// same first-fit specification used by the sparse rectangle search.
+pub proof fn packed_backfill_is_absolute_first_fit(run: Assignment, layout: Layout, items: Seq<Span>, n: nat)
+    requires layout.backfill, run.from(layout, items), n <= items.len(),
+    ensures backfill_limits(run.states[n as int], layout), n > 0 ==> ({
+        let i = n - 1;
+        first_fit(packed(run.states[i].occupied, layout.stride as int), layout.columns as int,
+            items[i].height as int, items[i].width as int, (0int, 0int),
+            (run.cells[i].0 as int, run.cells[i].1 as int))
+    }),
+    decreases n,
+{
+    if n > 0 {
+        let i = n - 1;
+        packed_backfill_is_absolute_first_fit(run, layout, items, i as nat);
+        packed_backfill_from_origin(run.states[i], run.states[n as int], layout, items[i], run.cells[i]);
+    } else {
+        assert forall |i: int, j: int| 1 <= i <= CACHED_SPANS && 1 <= j <= CACHED_SPANS implies {
+            let edge = #[trigger] run.states[0].cursor.limits[i - 1][j - 1];
+            passed(packed(run.states[0].occupied, layout.stride as int), layout.columns as int, i, j,
+                (0int, 0int), (edge.0 as int, edge.1 as int))
+        } by {
+            assert(run.states[0].cursor.limits[i - 1][j - 1] == (0u16, 0u16));
+        }
+    }
+}
+
+/// Storage-independent grid state. The board uses absolute coordinates
+/// even when the executable packed buffer has discarded a prefix.
+pub(crate) struct CanonicalGrid {
+    pub board: Board,
+    pub rows: int,
+    pub forward: Cell,
+}
+
+pub(crate) open spec fn empty_grid() -> CanonicalGrid {
+    CanonicalGrid { board: ISet::empty(), rows: 0, forward: (0, 0) }
+}
+
+pub(crate) open spec fn grid_origin(grid: CanonicalGrid, backfill: bool) -> Cell {
+    if backfill { (0, 0) } else { grid.forward }
+}
+
+pub(crate) open spec fn grid_step(
+    grid: CanonicalGrid, columns: int, backfill: bool, height: int, width: int,
+) -> (CanonicalGrid, Cell) {
+    let origin = grid_origin(grid, backfill);
+    let cell = choose |cell: Cell| #[trigger] first_fit(grid.board, columns, height, width, origin, cell);
+    (CanonicalGrid {
+        board: place(grid.board, cell, height, width),
+        rows: vstd::math::max(grid.rows, cell.0 + height),
+        forward: if backfill { grid.forward } else { (cell.0, cell.1 + width) },
+    }, cell)
+}
+
+pub(crate) proof fn canonical_fit(grid: CanonicalGrid, columns: int, backfill: bool,
+    h: int, w: int, actual: Cell,
+)
+    requires first_fit(grid.board, columns, h, w, grid_origin(grid, backfill), actual),
+    ensures grid_step(grid, columns, backfill, h, w).1 == actual,
+{
+    let start = grid_origin(grid, backfill);
+    assert(exists |cell: Cell| #[trigger] first_fit(grid.board, columns, h, w, start, cell));
+    let chosen = grid_step(grid, columns, backfill, h, w).1;
+    finish_search(grid.board, columns, h, w, start, actual, chosen);
+}
+
+/// Evaluate the remaining siblings from a witnessed grid prefix. Skipped
+/// siblings consume no cell and a span clips to the real track count.
+pub(crate) closed spec fn canonical_run<I>(items: grid_sparse::GridItems<I>, next: Option<I>, steps: nat,
+    grid: CanonicalGrid, columns: usize, backfill: bool,
+) -> (CanonicalGrid, grid_sparse::CellWrites<I>)
+    decreases steps,
+{
+    match next {
+        Some(child) if steps > 0 => {
+            let item = items[child];
+            match item.1 {
+                Some((height, width)) => {
+                    let step = grid_step(grid, columns as int, backfill,
+                        grid_sparse::clamped_height(height), grid_sparse::clamped_width(width as usize, columns));
+                    let tail = canonical_run(items, item.0, (steps - 1) as nat, step.0, columns, backfill);
+                    (tail.0, seq![(child, (step.1.0 as u128, step.1.1 as usize))] + tail.1)
+                }
+                None => canonical_run(items, item.0, (steps - 1) as nat, grid, columns, backfill),
+            }
+        }
+        _ => (grid, Seq::empty()),
+    }
+}
+
+pub(crate) proof fn canonical_run_step<I>(items: grid_sparse::GridItems<I>, child: I, steps: nat,
+    grid: CanonicalGrid, columns: usize, backfill: bool,
+)
+    requires steps > 0,
+    ensures ({
+        let item = items[child];
+        let before = canonical_run(items, Some(child), steps, grid, columns, backfill);
+        match item.1 {
+            Some((height, width)) => {
+                let step = grid_step(grid, columns as int, backfill,
+                    grid_sparse::clamped_height(height), grid_sparse::clamped_width(width as usize, columns));
+                let tail = canonical_run(items, item.0, (steps - 1) as nat, step.0, columns, backfill);
+                before.0 == tail.0 && before.1 == seq![(child, (step.1.0 as u128, step.1.1 as usize))] + tail.1
+            }
+            None => before == canonical_run(items, item.0, (steps - 1) as nat, grid, columns, backfill),
+        }
+    }),
+{}
+
+pub(crate) proof fn canonical_run_end<I>(items: grid_sparse::GridItems<I>, steps: nat,
+    grid: CanonicalGrid, columns: usize, backfill: bool,
+)
+    ensures canonical_run(items, None, steps, grid, columns, backfill) == (grid, Seq::empty()),
+{}
+
+pub(crate) open spec fn packed_represents(snapshot: Snapshot, layout: Layout, grid: CanonicalGrid) -> bool {
+    &&& snapshot.cursor.rows == grid.rows
+    &&& (snapshot.cursor.forward.0 as int, snapshot.cursor.forward.1 as int) == grid.forward
+    &&& snapshot.cursor.first_row <= grid.forward.0
+    &&& packed(snapshot.occupied, layout.stride as int) == suffix(grid.board, snapshot.cursor.first_row as int)
+    &&& forall |p: Cell| #[trigger] grid.board.contains(p) ==> p.0 >= 0
+    &&& layout.backfill ==> backfill_limits(snapshot, layout)
+}
+
+pub(crate) proof fn packed_represents_empty(snapshot: Snapshot, layout: Layout)
+    requires snapshot.empty(),
+    ensures packed_represents(snapshot, layout, empty_grid()),
+{
+    assert(packed(snapshot.occupied, layout.stride as int) =~= ISet::<Cell>::empty());
+    assert(suffix(ISet::<Cell>::empty(), 0) =~= ISet::<Cell>::empty());
+    if layout.backfill {
+        assert forall |h: int, w: int| 1 <= h <= CACHED_SPANS && 1 <= w <= CACHED_SPANS implies {
+            let edge = #[trigger] snapshot.cursor.limits[h - 1][w - 1];
+            passed(packed(snapshot.occupied, layout.stride as int), layout.columns as int, h, w,
+                (0int, 0int), (edge.0 as int, edge.1 as int))
+        } by {
+            assert(snapshot.cursor.limits[h - 1][w - 1] == (0u16, 0u16));
+        }
+    }
+}
+
+pub(crate) proof fn packed_advances_absolute(before_state: Snapshot, after_state: Snapshot, layout: Layout,
+    grid: CanonicalGrid, item: Span, cell: (usize, usize),
+)
+    requires 1 <= item.height, 1 <= item.width, packed_represents(before_state, layout, grid),
+        before_state.place(after_state, layout, item, cell),
+    ensures ({
+        let step = grid_step(grid, layout.columns as int, layout.backfill, item.height as int, item.width as int);
+        step.1 == (cell.0 as int, cell.1 as int) && packed_represents(after_state, layout, step.0)
+    }),
+{
+    let absolute = (cell.0 as int, cell.1 as int);
+    let lower = before_state.cursor.first_row as int;
+    let higher = after_state.cursor.first_row as int;
+    let cols = layout.columns as int;
+    let h = item.height as int;
+    let w = item.width as int;
+    if layout.backfill {
+        packed_backfill_from_origin(before_state, after_state, layout, item, cell);
+        suffix_zero(grid.board);
+    } else {
+        absolute_first_fit(grid.board, lower, cols, h, w, grid.forward, (absolute.0 - lower, absolute.1));
+    }
+    assert(first_fit(grid.board, cols, h, w, grid_origin(grid, layout.backfill), absolute));
+    canonical_fit(grid, cols, layout.backfill, h, w, absolute);
+    suffix_after_placement(grid.board, lower, higher, absolute, h, w);
+    assert forall |p: Cell| #[trigger] place(grid.board, absolute, h, w).contains(p) implies p.0 >= 0 by {
+        if !grid.board.contains(p) {
+            assert(covers(absolute, h, w, p));
+        }
+    }
+}
+
+pub(crate) open spec fn packed_layout(shape: state::PackedShape, backfill: bool) -> Layout {
+    Layout { columns: shape.columns, stride: shape.stride, backfill }
+}
+
+pub(crate) fn start_canonical_grid() -> (model: Ghost<CanonicalGrid>)
+    ensures model@ == empty_grid(),
+    no_unwind
+{
+    Ghost(empty_grid())
+}
+
+pub(crate) fn save_packed(cursor: &SpanCursor, words: &Vec<u64>) -> (model: Ghost<Snapshot>)
+    ensures model@ == (Snapshot { cursor: *cursor, occupied: words@ }),
+    no_unwind
+{
+    Ghost(Snapshot { cursor: *cursor, occupied: words@ })
+}
+
+pub(crate) fn grow_canonical_grid(model: Ghost<CanonicalGrid>, before: Ghost<Snapshot>, after: Ghost<Snapshot>,
+    shape: state::PackedShape, backfill: bool, height: u16, width: u16, cell: (usize, usize),
+) -> (next: Ghost<CanonicalGrid>)
+    requires packed_represents(before@, packed_layout(shape, backfill), model@),
+        shape.columns > 0,
+        before@.place(after@, packed_layout(shape, backfill), Span {
+            height: grid_sparse::clamped_height(height) as usize,
+            width: grid_sparse::clamped_width(width as usize, shape.columns) as usize,
+        }, cell),
+    ensures ({
+        let step = grid_step(model@, shape.columns as int, backfill, grid_sparse::clamped_height(height),
+            grid_sparse::clamped_width(width as usize, shape.columns));
+        &&& step.1 == (cell.0 as int, cell.1 as int)
+        &&& next@ == step.0
+        &&& packed_represents(after@, packed_layout(shape, backfill), next@)
+    }),
+    no_unwind
+{
+    let ghost item = Span {
+        height: grid_sparse::clamped_height(height) as usize,
+        width: grid_sparse::clamped_width(width as usize, shape.columns) as usize,
+    };
+    proof {
+        packed_advances_absolute(before@, after@, packed_layout(shape, backfill), model@, item, cell);
+    }
+    Ghost(grid_step(model@, shape.columns as int, backfill, item.height as int, item.width as int).0)
 }
 
 pub enum Run {
@@ -267,6 +760,26 @@ pub proof fn skipped_notification_preserves_assignment(p:Producer,q:Producer,a:R
     assert(main_word(q.lines(b),q.vertical)==q.key);
     assert(p==q);
     initialized_grid_has_unique_words(p,a,b);
+}
+
+/// A numeric frame with the same ordered items and discrete grid key
+/// can use the prior run as its current assignment. The cached and fresh
+/// assignments publish identical physical words.
+pub proof fn retained_numeric_assignment(p: Producer, q: Producer, cached: Run)
+    requires
+        p.observes(cached),
+        state::reuse_width_cells(Some(p.key), q.key),
+        p.items == q.items, p.vertical == q.vertical,
+        p.binary32_to_columns == q.binary32_to_columns, p.encode == q.encode,
+        q.layout.columns == (q.binary32_to_columns)(q.key),
+        p.layout.backfill == q.layout.backfill,
+        p.layout.stride == q.layout.stride,
+    ensures q.observes(cached), q.lines(cached) == p.lines(cached),
+        forall |i: int| 0 <= i < p.items.len() ==> #[trigger] q.cell(cached, i) == p.cell(cached, i),
+{
+    assert(p.key == q.key);
+    assert(p.layout == q.layout);
+    assert(p == q);
 }
 
 /// A child rebuilt underneath this unchanged grid restores the physical cell

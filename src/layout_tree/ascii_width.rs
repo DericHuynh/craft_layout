@@ -1,4 +1,5 @@
-use super::{ascii_space, text_scan::whitespace_bytes};
+use super::text_scan::{text_avx2_supported, whitespace_bytes, windows::{TextAvx2, partition_windows, short_ascii_width}};
+use super::text_scan::windows::native::load_sse2;
 use std::arch::x86_64::*;
 
 mod avx2;
@@ -7,7 +8,7 @@ const WIDTH: usize = 16;
 
 #[inline(always)]
 pub(super) fn width(bytes: &[u8]) -> Option<usize> {
-    if let Some(last) = bytes.last_chunk::<32>() && is_x86_feature_detected!("avx2") {
+    if let Some(last) = bytes.last_chunk::<32>() && text_avx2_supported(TextAvx2::AsciiOrSvg) {
         // SAFETY: The detector checks both CPU support and saved vector state.
         return unsafe { avx2::normalized_width(bytes, last) };
     }
@@ -18,15 +19,7 @@ pub(super) fn width(bytes: &[u8]) -> Option<usize> {
         return short_width(bytes);
     }
 
-    let mut count = 0;
-    let mut previous_space = true;
-    for &byte in bytes {
-        if !byte.is_ascii() { return None; }
-        let white = ascii_space(byte);
-        if !white { count += 1 + usize::from(previous_space); }
-        previous_space = white;
-    }
-    Some(count.saturating_sub(1))
+    short_ascii_width(bytes)
 }
 
 // A short label is packed as its first and last 4 or 8 bytes. Keep the
@@ -57,18 +50,18 @@ fn short_width(bytes: &[u8]) -> Option<usize> {
     unsafe {
         let input = if let Some(first) = bytes.first_chunk::<8>() {
             let low = i64::from_ne_bytes(*first);
-            let high = i64::from_ne_bytes(*bytes.last_chunk().unwrap());
+            let high = i64::from_ne_bytes(*bytes.last_chunk()?);
             _mm_set_epi64x(high, low)
         } else {
-            let low = u64::from(u32::from_ne_bytes(*bytes.first_chunk().unwrap()));
-            let high = u64::from(u32::from_ne_bytes(*bytes.last_chunk().unwrap()));
+            let low = u64::from(u32::from_ne_bytes(*bytes.first_chunk()?));
+            let high = u64::from(u32::from_ne_bytes(*bytes.last_chunk()?));
             _mm_cvtsi64_si128(((high << 32) | low) as i64)
         };
         // Overlap is harmless for validation and the unused lanes are zero.
         if _mm_movemask_epi8(input) != 0 { return None; }
         let white = whitespace_bytes(input);
         let previous = _mm_or_si128(_mm_slli_si128::<1>(white), _mm_cvtsi32_si128(255));
-        let valid = _mm_loadu_si128(SHORT_WINDOW_MASKS[bytes.len()].as_ptr().cast());
+        let valid = load_sse2(SHORT_WINDOW_MASKS.get(bytes.len())?);
         let zero = _mm_setzero_si128();
         let counts = _mm_sub_epi8(zero, _mm_and_si128(negative_width(white, previous), valid));
         let sums = _mm_sad_epu8(counts, zero);
@@ -82,8 +75,9 @@ fn short_width(bytes: &[u8]) -> Option<usize> {
 /// separator from the input length to get the normalized width.
 fn normalized_width(bytes: &[u8], last: &[u8; WIDTH]) -> Option<usize> {
     // Leave the final window to the same masked operation at every length.
-    let (blocks, tail) = bytes[..bytes.len() - 1].as_chunks::<WIDTH>();
-    let final_lanes = tail.len() + 1;
+    let (prefix, tail) = partition_windows::<WIDTH>(bytes, true);
+    let (blocks, _) = prefix.as_chunks::<WIDTH>();
+    let final_lanes = tail.len();
     // SAFETY: SSE2 is part of the x86-64 baseline. Every unaligned load reads
     // exactly one complete WIDTH-byte array.
     unsafe {
@@ -95,7 +89,7 @@ fn normalized_width(bytes: &[u8], last: &[u8; WIDTH]) -> Option<usize> {
         for group in blocks.chunks(255) {
             let mut counts = zero;
             for block in group {
-                let data = _mm_loadu_si128(block.as_ptr().cast());
+                let data = load_sse2(block);
                 if _mm_movemask_epi8(data) != 0 { return None; }
                 let white = whitespace_bytes(data);
                 let previous = _mm_or_si128(_mm_slli_si128::<1>(white), carry);
@@ -104,7 +98,7 @@ fn normalized_width(bytes: &[u8], last: &[u8; WIDTH]) -> Option<usize> {
             }
             sums = _mm_add_epi64(sums, _mm_sad_epu8(counts, zero));
         }
-        let data = _mm_loadu_si128(last.as_ptr().cast());
+        let data = load_sse2(last);
         if _mm_movemask_epi8(data) != 0 { return None; }
         let white = whitespace_bytes(data);
         // The carry matters for lane zero only when the entire window is new.

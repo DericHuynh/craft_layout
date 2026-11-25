@@ -1,4 +1,5 @@
-use super::super::text_scan::whitespace_avx2 as whitespace;
+use super::super::text_scan::{whitespace_avx2 as whitespace, windows::partition_windows};
+use super::super::text_scan::windows::native::load_avx;
 use std::arch::x86_64::*;
 
 const WIDTH: usize = 32;
@@ -11,7 +12,8 @@ const WIDTH: usize = 32;
 /// AVX2 must be available on the current CPU.
 #[target_feature(enable = "avx2")]
 pub(super) unsafe fn normalized_width(bytes: &[u8], last: &[u8; WIDTH]) -> Option<usize> {
-    let (blocks, tail) = bytes.as_chunks::<WIDTH>();
+    let (prefix, tail) = partition_windows::<WIDTH>(bytes, false);
+    let (blocks, _) = prefix.as_chunks::<WIDTH>();
     let zero = _mm256_setzero_si256();
     let mut sums = zero;
     // The virtual byte before the string is whitespace, so this also removes
@@ -20,8 +22,7 @@ pub(super) unsafe fn normalized_width(bytes: &[u8], last: &[u8; WIDTH]) -> Optio
     for group in blocks.chunks(u8::MAX as usize) {
         let mut counts = zero;
         for block in group {
-            // SAFETY: The array supplies a full unaligned vector load.
-            let input = unsafe { _mm256_loadu_si256(block.as_ptr().cast()) };
+            let input = load_avx(block);
             if _mm256_movemask_epi8(input) != 0 {
                 return None;
             }
@@ -33,8 +34,7 @@ pub(super) unsafe fn normalized_width(bytes: &[u8], last: &[u8; WIDTH]) -> Optio
         sums = _mm256_add_epi64(sums, _mm256_sad_epu8(counts, zero));
     }
     if !tail.is_empty() {
-        // SAFETY: The last window is also a full vector.
-        let input = unsafe { _mm256_loadu_si256(last.as_ptr().cast()) };
+        let input = load_avx(last);
         if _mm256_movemask_epi8(input) != 0 {
             return None;
         }
