@@ -186,16 +186,6 @@
     </node>
     <warning kind="FitContentCollapsed" path="root.0" axis="x"/>
   </case>
-  <case reason="A freely placed child at Start stays at the parent’s inline and block starts even after a 10 px in-flow sibling; it occupies no flow space. CSS assigns an unspecified block inset the hypothetical flow position y=10."
-        fixtures="block/block_absolute_no_styles__border_box_ltr
-                  block/block_absolute_no_styles__content_box_ltr"
-        mirrored-fixtures="block/block_absolute_no_styles__border_box_rtl
-                  block/block_absolute_no_styles__content_box_rtl">
-    <node x="0" y="0" width="50" height="10">
-      <node x="0" y="0" width="50" height="10"/>
-      <node x="0" y="0" width="0" height="0"/>
-    </node>
-  </case>
   <case reason="Two 60 px stack children centered in 110 px overflow the two ends by 5 px. The independent 60 px overlay centers at x=25 and uses none of the shared space."
         fixtures="flex/absolute_layout_child_order__border_box_ltr
                   flex/absolute_layout_child_order__content_box_ltr"
@@ -426,6 +416,112 @@
       <node x="30" y="0" width="60" height="50">
         <node x="0" y="0" width="60" height="50"/>
         <node x="-60" y="0" width="60" height="50"/>
+      </node>
+    </node>
+  </case>
+  <case reason="A sole growable item receives its column's full 200 px minimum height. Its child's fractional height or minimum reads that actual 200 px allocation, through either block or flex placement."
+        fixtures="flex/flex_min_height_percent_of_indefinite_basis_item_is_auto__border_box_ltr
+                  flex/flex_min_height_percent_of_indefinite_basis_item_is_auto__content_box_ltr
+                  flex/flex_percent_child_of_indefinite_basis_item_is_auto__border_box_ltr
+                  flex/flex_percent_child_of_indefinite_basis_item_is_auto__content_box_ltr
+                  flex/flex_percent_propagates_through_nested_flex_container__border_box_ltr
+                  flex/flex_percent_propagates_through_nested_flex_container__content_box_ltr"
+        mirrored-fixtures="flex/flex_min_height_percent_of_indefinite_basis_item_is_auto__border_box_rtl
+                  flex/flex_min_height_percent_of_indefinite_basis_item_is_auto__content_box_rtl
+                  flex/flex_percent_child_of_indefinite_basis_item_is_auto__border_box_rtl
+                  flex/flex_percent_child_of_indefinite_basis_item_is_auto__content_box_rtl
+                  flex/flex_percent_propagates_through_nested_flex_container__border_box_rtl
+                  flex/flex_percent_propagates_through_nested_flex_container__content_box_rtl">
+    <node x="0" y="0" width="200" height="200">
+      <node x="0" y="0" width="200" height="200">
+        <node x="0" y="0" width="200" height="200"/>
+      </node>
+    </node>
+  </case>
+  <case reason="Opposing 10 px insets offer 80 px. Explicit minima of 50 and 60 exceed their 40 and 30 maxima. Each minimum wins and emits a warning on its axis. Direction chooses the inline inset that controls the position."
+        fixtures="block/block_absolute_minmax_top_left_bottom_right_min_max__border_box_ltr block/block_absolute_minmax_top_left_bottom_right_min_max__content_box_ltr flex/absolute_minmax_top_left_bottom_right_min_max__border_box_ltr flex/absolute_minmax_top_left_bottom_right_min_max__content_box_ltr" mirrored-fixtures="block/block_absolute_minmax_top_left_bottom_right_min_max__border_box_rtl block/block_absolute_minmax_top_left_bottom_right_min_max__content_box_rtl flex/absolute_minmax_top_left_bottom_right_min_max__border_box_rtl flex/absolute_minmax_top_left_bottom_right_min_max__content_box_rtl">
+    <warning path="root.0" kind="MinAboveMax" axis="x"/>
+    <warning path="root.0" kind="MinAboveMax" axis="y"/>
+    <node x="0" y="0" width="100" height="100">
+      <node x="10" y="10" width="50" height="60"/>
+    </node>
+  </case>
+  <case reason="A percentage block height reads the space the flex item actually received. The three column items receive 100, 200 and 200 pixels. Each first grandchild is 100 pixels tall, and the following grandchild occupies its parent's full allocated height even when it overflows."
+        fixtures="blockflex/blockflex_indefinite_percentage_flex_basis__border_box_ltr blockflex/blockflex_indefinite_percentage_flex_basis__border_box_rtl blockflex/blockflex_indefinite_percentage_flex_basis__content_box_ltr blockflex/blockflex_indefinite_percentage_flex_basis__content_box_rtl">
+    <node x="0" y="0" width="100" height="500">
+      <node x="0" y="0" width="100" height="100">
+        <node x="0" y="0" width="100" height="100">
+          <node x="0" y="0" width="100" height="100"/>
+          <node x="0" y="100" width="100" height="100"/>
+        </node>
+      </node>
+      <node x="0" y="100" width="100" height="200">
+        <node x="0" y="0" width="100" height="200">
+          <node x="0" y="0" width="100" height="100"/>
+          <node x="0" y="100" width="100" height="200"/>
+        </node>
+      </node>
+      <node x="0" y="300" width="100" height="200">
+        <node x="0" y="0" width="100" height="200">
+          <node x="0" y="0" width="100" height="100"/>
+          <node x="0" y="100" width="100" height="200"/>
+        </node>
+      </node>
+    </node>
+  </case>
+  <!-- The card is 34px wide with a 30px content box and lives 3px inside
+       the 206px outer border box. Its 25px-high containing padding box
+       cannot expose the full 35px message. Keep the message start visible,
+       including its own margin. The explicit 20px inset and the smaller
+       message retain their normal positions. -->
+  <case reason="Safe alignment keeps the leading margin of an oversized positioned item flush with its containing padding box."
+        fixtures="grid/grid_absolute_safe_static_outer_cb_tentative__border_box_ltr
+                  grid/grid_absolute_safe_static_outer_cb_tentative__content_box_ltr"
+        mirrored-fixtures="grid/grid_absolute_safe_static_outer_cb_tentative__border_box_rtl
+                           grid/grid_absolute_safe_static_outer_cb_tentative__content_box_rtl">
+    <node x="0" y="0" width="206" height="31">
+      <node x="3" y="3" width="34" height="31">
+        <node x="0" y="0" width="45" height="35"/>
+        <node x="0" y="20" width="45" height="35"/>
+        <node x="17" y="11" width="15" height="10"/>
+        <node x="4" y="2" width="45" height="35"/>
+        <node x="-13" y="-2" width="45" height="35"/>
+      </node>
+    </node>
+  </case>
+  <case reason="The nested 50 px block has a 0.5 px inline margin. Its physical x edges are -0.5 and 49.5. Native pixel snapping rounds each tie away from zero, publishing -1 and 50. The browser archive publishes 0 and 50."
+        fixtures="block/block_align_baseline_child_margin_percent__border_box_rtl
+                  block/block_align_baseline_child_margin_percent__content_box_rtl">
+    <node x="0" y="0" width="100" height="100">
+      <node x="55" y="5" width="40" height="50"/>
+      <node x="0" y="35" width="50" height="20">
+        <node x="-1" y="1" width="51" height="10"/>
+      </node>
+    </node>
+  </case>
+  <case reason="A column without a shared text baseline aligns its entries against the cross-start edge. In RTL each column's right edge stays aligned when wrapping turns on."
+        fixtures="flex/align_baseline_multiline_column__border_box_rtl
+                  flex/align_baseline_multiline_column__content_box_rtl
+                  flex/align_baseline_multiline_column2__border_box_rtl
+                  flex/align_baseline_multiline_column2__content_box_rtl">
+    <node x="0" y="0" width="100" height="100">
+      <node x="50" y="0" width="50" height="50"/>
+      <node x="70" y="50" width="30" height="50">
+        <node x="10" y="0" width="20" height="20"/>
+      </node>
+      <node x="10" y="0" width="40" height="70">
+        <node x="30" y="0" width="10" height="10"/>
+      </node>
+      <node x="0" y="70" width="50" height="20"/>
+    </node>
+  </case>
+  <case reason="The RTL grandchild starts at minus half a pixel. Its unsnapped edges are −0.5 and 49.5 px. Craft snaps absolute edges symmetrically away from zero on half ties, producing −1 and 50 px and a published width of 51 px. Its parent uses the child's unsnapped baseline to align at y = 44.5 px."
+        fixtures="flex/align_baseline_child_margin_percent__border_box_rtl
+                  flex/align_baseline_child_margin_percent__content_box_rtl">
+    <node x="0" y="0" width="100" height="100">
+      <node x="55" y="5" width="40" height="50"/>
+      <node x="0" y="45" width="50" height="20">
+        <node x="-1" y="0" width="51" height="10"/>
       </node>
     </node>
   </case>

@@ -60,3 +60,7 @@ The [case review](README.md) includes the fixture checkout and harness commands.
 A grid author should be able to describe a responsive thumbnail sheet and a content-sized live scoreboard using track declarations. The check for each author is to predict widths, cell addresses and the effect of edits before running the tree, then replay the same states with the retained solver, a fresh tree and Batch. An explicit placement or host-budgeted version supplies an independent comparison. [Asset browser](../../examples/asset_browser/README.md) · [Arena scoreboard](../../examples/scoreboard/README.md)
 
 The fixture harness must compare every provided numeric track list, in declaration order, as well as every published rectangle. A missing track assertion leaves that axis unverified by the source. Retain a per-input reason for everything the translator cannot express and measure the cost of handling many spanning contributions with the existing allocation counter. [Grid review and results](README.md) · [Application layout feature inventory](css-layout-scope.md)
+
+## Pinned translation acceptance
+
+All 6,604 pinned inputs must lower from authored declarations, execute in the native engine, and reach their rectangle, track and scroll comparisons. Every result must agree with the archive or with an independently specified native resolution. The two inventories, the trial outcomes and the regeneration command are recorded in the [current review](README.md) and [runner instructions](../../benchmarks/conformance/README.md).

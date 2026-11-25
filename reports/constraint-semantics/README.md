@@ -1,10 +1,49 @@
 # Constraint resolution and authoring review
 
-## CSS Grid and native track resolution
+## Complete translation of the pinned corpus
 
-Compared with `4d20ad7`, **1,402 additional CSS fixtures execute and agree with the archived browser geometry**. The old 1,642 browser results and 110 native contracts retain their exact rectangles and diagnostics. Each row in the [current ledger](current-cases.tsv) uses that commit as its previous result. An untranslated row names the first blocking input and has no geometry verdict.
+All 6,604 Taffy XML fixtures at `4e59968eda29ceeb0bbaeb3993c8cd38baa3d0a6` build a Craft tree, run the native solver and reach geometry comparison. Compared with `124551a`, all 3,450 previously unsupported inputs now run. Every earlier browser match still passes. Four earlier native exceptions for the static position of an absolute child now also match the browser because a preceding block sibling supplies the source position.
 
-| Result across all 6,604 fixtures | Before | Current |
+| Formatting context | Browser agreement | Verified Craft difference | Translated |
+| --- | ---: | ---: | ---: |
+| block | 1,106 | 14 | 1,120 |
+| blockflex | 44 | 8 | 52 |
+| blockgrid | 56 | 0 | 56 |
+| contain | 32 | 0 | 32 |
+| flex | 2,632 | 108 | 2,740 |
+| float | 160 | 0 | 160 |
+| grid | 2,336 | 4 | 2,340 |
+| gridflex | 44 | 0 | 44 |
+| leaf | 60 | 0 | 60 |
+| **All** | **6,470** | **134** | **6,604** |
+
+The checks cover 27,728 node rectangles, 5,664 published grid-axis lists and 872 scroll extents (436 width/height pairs). Track sizes and names are compared before pixel snapping. Boxes follow the fixture’s pixel-scale setting. A difference of 0.1 px fails. Warnings, their paths and their multiplicities participate in each result. The [case ledger](current-cases.tsv) gives the previous and current classification, case check, diagnostics, parent-local rectangles, published tracks and observed scroll extents. The [feature inventory](css-layout-scope.md) lists the 58 declaration names the fixtures exercise.
+
+A separate [declaration audit](../../benchmarks/conformance/check_declarations.py) removes one authored declaration from a source for each of the 58 names and checks for a change in observed layout. Its control cases rename the inputs and change an expected coordinate. Renaming must preserve geometry. Corrupting the expected coordinate must fail the comparison while preserving the geometry.
+
+### Decisions with visible consequences
+
+| Author request | Verified behavior |
+| --- | --- |
+| Give an item `height: 100%` inside a flexible region that ends up 200 px tall | The child receives the allocated 200 px. If it follows a 100 px sibling it can overflow. A fallback that collapses the child to zero would require the application to repeat an already available height. |
+| Safely center a 35 px notice inside a 25 px positioning ancestor | Its leading edge remains reachable at 0 px, or at 2 px with a leading margin. The tentative browser fixture starts it at 6 or 8 px. |
+| Snap a 50 px box whose unrounded RTL edges are −0.5 and 49.5 | Craft rounds signed half ties away from zero. Its edges are −1 and 50, and its published width is 51. The archived browser chooses 0 and 50. Adjacent boxes still share a snapped edge. |
+| Request a minimum larger than the maximum | Craft honors the minimum and reports `MinAboveMax` on the affected axis. The fixture must match the complete expected geometry and warning list. |
+| Place an absolute child after an ordinary block, with no vertical inset | Its static vertical position follows the preceding sibling. The default free-positioned native primitive remains available for ordinary overlays. |
+
+### Independent authoring trials
+
+* **News digest.** A 30-component article page combined a leading portrait float, a trailing sponsor, a summary with a width minimum and a clearing footer. Width and filtering changes matched the author's predictions. Keeping a manual 64 px sponsor reservation after hiding the sponsor wasted that space. Extending the trial to scrolling exposed a real error: a source-positioned action jumped from y=30 to y=0 after scrolling 20 px. Its corrected y=10 now has a retained regression test. A separate flexible magazine section checks wrapped heights of 30, 40 and 30 px across width edits. [Trial and reflection](../../examples/news_digest/README.md)
+* **Festival program.** Ordered cards request balanced lines and a ticket action uses an automatic leading margin. At 104 px, two rows occupied 104 and 78 px. At 103 px a third row became necessary, and the occupied widths were 78, 52 and 52. Several orders tie on balance. The earlier-fuller rule predicts which break survives the resize. Another author checked this boundary independently. [Trial and cross-review](../../examples/festival_program/README.md)
+* **Production timeline.** Named cues, a span, an overlay and a subgrid moved together when an 8 px preroll track was inserted. A scroll trial found a badge pinned to the grid incorrectly adding to the range of an intervening 40 px wrapper. The wrapper now scrolls its 90 px content by 50 px and the badge moves with the grid. [Predictions and observed results](grid-fixture-review.md) · [Executable trials](../../tests/grid_authoring.rs)
+
+An underdetermined size, an unsatisfiable pair of bounds, a browser convention and a retained-layout defect have different evidence. The native expectations specify a full tree and diagnostic list for each accepted divergence. Explicit arithmetic, fresh rebuilds and retained edits test the author's intent independently. These trials give no evidence of Rust memory unsafety or of the motives of an upstream fixture author.
+
+## Earlier Grid implementation at `124551a`
+
+Compared with `4d20ad7`, **1,402 additional CSS fixtures execute and agree with the archived browser geometry**. The old 1,642 browser results and 110 native contracts retain their exact rectangles and diagnostics. The ledger exported at that revision used that commit as its previous result. An untranslated row names the first blocking input and has no geometry verdict.
+
+| Result across all 6,604 fixtures | Before | At `124551a` |
 | --- | ---: | ---: |
 | Archived browser geometry | 1,642 | 3,044 |
 | Independently specified native difference | 110 | 110 |

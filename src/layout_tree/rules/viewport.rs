@@ -190,7 +190,28 @@ pub(super) fn gutter(style: ScrollStyle, overflowing: Xy<bool>) -> Xy<f32> {
     };
     Xy::new(width(Axis::Y), width(Axis::X))
 }
-fn positioned(reference: XyRect, insets: &Edges, style: &LayoutParams, initial: Xy<f32>) -> XyRect {
+fn inset_box(mut rect: XyRect, edges: Xy<[f32; 2]>) -> XyRect {
+    for a in [Axis::X, Axis::Y] {
+        rect[a][0] += edges[a][0];
+        rect[a][1] = (rect[a][1] - edges[a][1]).max(rect[a][0]);
+    }
+    rect
+}
+
+fn static_box(parent: XyRect, padding: Xy<[f32; 2]>, block_offset: f32) -> XyRect {
+    let mut rect = inset_box(parent, padding);
+    rect.y[0] += block_offset;
+    rect
+}
+
+fn positioned(
+    reference: XyRect,
+    insets: &Edges,
+    style: &LayoutParams,
+    initial: Xy<f32>,
+    model: super::BoxStyle,
+    static_box: XyRect,
+) -> XyRect {
     let available = size(reference);
     let mut length = initial;
     let mut rect = reference;
@@ -225,6 +246,13 @@ fn positioned(reference: XyRect, insets: &Edges, style: &LayoutParams, initial: 
             (Size::Auto | Size::Fill, Some(lo), Some(hi)) => {
                 available[a] - lo - hi - before - after
             }
+            (Size::Fill, lo, hi) => {
+                available[a] - lo.unwrap_or(0.) - hi.unwrap_or(0.) - before - after
+            }
+            (Size::FitContent, lo, hi) if let Some(min) = model.positioned_fit_min[a] => {
+                let available = available[a] - lo.unwrap_or(0.) - hi.unwrap_or(0.) - before - after;
+                initial[a].min(available).max(min)
+            }
             (size, _, _) => bound(size, a, initial[a.other()]),
         };
         length[a] = clamp(candidate, a, initial[a.other()]);
@@ -240,8 +268,35 @@ fn positioned(reference: XyRect, insets: &Edges, style: &LayoutParams, initial: 
         let [low, high] = insets[a].map(|v| v.map(|v| v.resolve(available[a])));
         let [before, after] = style.margin[a].map(|m| m.as_px().unwrap_or(0.));
         let start = match (low, high) {
+            (Some(lo), Some(hi)) => {
+                let free = available[a] - lo - hi - before - after - length[a];
+                let [auto_before, auto_after] = style.margin[a].map(|m| m.as_px().is_none());
+                let shift = match (auto_before, auto_after) {
+                    (true, false) => free,
+                    (true, true) if free >= 0. => free * 0.5,
+                    (false, false) | (true, true) if model.reverse_insets[a] => free,
+                    _ => 0.,
+                };
+                reference[a][0] + lo + before + shift
+            }
             (Some(lo), _) => reference[a][0] + lo + before,
             (_, Some(hi)) => reference[a][1] - hi - after - length[a],
+            _ if let Some(f) = model.absolute_static[a] => {
+                let candidate = static_box[a][0]
+                    + before
+                    + f * (static_box[a][1] - static_box[a][0] - before - after - length[a]);
+                if model.safe_static[a] {
+                    let lower = reference[a][0] + before;
+                    let upper = reference[a][1] - after - length[a];
+                    if model.reverse_insets[a] {
+                        candidate.max(lower).min(upper)
+                    } else {
+                        candidate.min(upper).max(lower)
+                    }
+                } else {
+                    candidate
+                }
+            }
             _ => reference[a][0] + before,
         };
         rect[a] = [start, start + length[a]];
@@ -258,9 +313,20 @@ pub(super) fn apply(frame: &mut Frame<'_>, i: usize, issues: &mut Vec<RuleIssue>
         Placement::Absolute { containing, insets } => {
             let rect = match containing {
                 BoxReference::Window => window,
-                BoxReference::Parent => port(frame.nodes[parent].rect, frame.nodes[parent].gutter),
+                BoxReference::Parent => port(&frame.nodes[parent]),
                 BoxReference::Node(target) => match frame.reference(i, target) {
-                    Some(j) => port(frame.nodes[j].rect, frame.nodes[j].gutter),
+                    Some(j) => {
+                        if let Some(area) = super::grid::ancestor_area(frame, j, i) {
+                            let origin = frame.nodes[j].rect;
+                            let local = shifted(area, Xy::new(-origin.x[0], -origin.y[0]));
+                            frame
+                                .grid_positioned_areas
+                                .insert(frame.nodes[i].id.key(), (j, local));
+                            area
+                        } else {
+                            port(&frame.nodes[j])
+                        }
+                    }
                     None => {
                         issues.push(RuleIssue::MissingReference(frame.nodes[i].id.clone()));
                         return;
@@ -280,7 +346,17 @@ pub(super) fn apply(frame: &mut Frame<'_>, i: usize, issues: &mut Vec<RuleIssue>
         reference,
         insets,
         &frame.nodes[i].base,
-        size(frame.nodes[i].rect),
+        if frame.nodes[i].assigned {
+            size(frame.nodes[i].rect)
+        } else {
+            frame.nodes[i].measured
+        },
+        frame.nodes[i].rule.box_model,
+        static_box(
+            frame.nodes[parent].rect,
+            frame.nodes[parent].effective.padding,
+            frame.nodes[i].block_static_y,
+        ),
     );
     let parent_rect = frame.nodes[parent].rect;
     let pad = frame.nodes[parent].effective.padding;
@@ -291,12 +367,17 @@ pub(super) fn apply(frame: &mut Frame<'_>, i: usize, issues: &mut Vec<RuleIssue>
     frame.place(i, parent, local);
 }
 
-fn port(rect: XyRect, reserved: Xy<f32>) -> XyRect {
-    let mut port = rect;
-    for axis in [Axis::X, Axis::Y] {
-        port[axis][1] = (port[axis][1] - reserved[axis]).max(port[axis][0]);
+fn port(node: &super::driver::FrameNode) -> XyRect {
+    let mut edges = node.rule.box_model.border;
+    for a in [Axis::X, Axis::Y] {
+        let flip = node
+            .rule
+            .box_model
+            .scroll_origin
+            .is_some_and(|origin| origin[a]);
+        edges[a][usize::from(!flip)] += node.gutter[a];
     }
-    port
+    inset_box(node.rect, edges)
 }
 
 fn delta(to: XyRect, from: XyRect) -> Xy<f32> {
@@ -355,7 +436,7 @@ fn scroll_frames(
         .nodes
         .iter()
         .map(|node| {
-            let port = port(node.rect, node.gutter);
+            let port = port(node);
             ScrollFrame {
                 port,
                 content: port,
@@ -364,13 +445,56 @@ fn scroll_frames(
             }
         })
         .collect();
+    // The positioning grid also owns this descendant's scrollable overflow.
+    // A static wrapper in between cannot acquire a spurious scroll range.
+    let mut hoisted = std::collections::HashMap::<usize, Vec<usize>>::new();
+    if !frame.grid_positioned_areas.is_empty() {
+        for (i, node) in frame.nodes.iter().enumerate() {
+            if let Some(&(target, _)) = frame.grid_positioned_areas.get(&node.id.key())
+                && node.parent != Some(target)
+            {
+                hoisted.entry(target).or_default().push(i);
+            }
+        }
+    }
     for i in (0..frame.nodes.len()).rev() {
         let node = &frame.nodes[i];
         let port = frames[i].port;
         let mut content = port;
-        for &c in &node.children {
+        let origin = node
+            .rule
+            .box_model
+            .scroll_origin
+            .unwrap_or(node.context.origins());
+        let mut trailing = Xy::new_symm(0.);
+        for a in [Axis::X, Axis::Y] {
+            let end = usize::from(!origin[a]);
+            trailing[a] = node.effective.padding[a][end]
+                - node.rule.box_model.border[a][end]
+                - node.gutter[a];
+            let extent = node.rule.box_model.content_extent[a];
+            if extent > 0. {
+                let start_pad =
+                    node.effective.padding[a][1 - end] - node.rule.box_model.border[a][1 - end];
+                let required = start_pad + extent + trailing[a];
+                if origin[a] {
+                    content[a][0] = content[a][0].min(port[a][1] - required);
+                } else {
+                    content[a][1] = content[a][1].max(port[a][0] + required);
+                }
+            }
+        }
+        for &c in node
+            .children
+            .iter()
+            .chain(hoisted.get(&i).into_iter().flatten())
+        {
             let child = &frame.nodes[c];
-            if child.base.disabled
+            if frame
+                .grid_positioned_areas
+                .get(&child.id.key())
+                .is_some_and(|(target, _)| *target != i)
+                || child.base.disabled
                 || matches!(
                     child.rule.placement,
                     Placement::Fixed(_)
@@ -385,8 +509,8 @@ fn scroll_frames(
             }
             let relative = match &child.rule.placement {
                 Placement::Relative(offset) => Xy::new(
-                    offset.x.resolve(size(port).x),
-                    offset.y.resolve(size(port).y),
+                    offset.x.resolve(frame.content_size(i).x),
+                    offset.y.resolve(frame.content_size(i).y),
                 ),
                 _ => Xy::new_symm(0.),
             };
@@ -396,16 +520,24 @@ fn scroll_frames(
                     child_bounds[0] = child_bounds[0].min(frames[c].content[a][0]);
                     child_bounds[1] = child_bounds[1].max(frames[c].content[a][1]);
                 }
-                content[a][0] = content[a][0].min(child_bounds[0] + relative[a]);
-                content[a][1] = content[a][1].max(
-                    child_bounds[1] + relative[a] + node.effective.padding[a][1] - node.gutter[a],
-                );
+                let pad = if child.base.free_placement {
+                    0.
+                } else {
+                    trailing[a]
+                };
+                let before = if origin[a] { pad } else { 0. };
+                let after = if origin[a] { 0. } else { pad };
+                content[a][0] = content[a][0].min(child_bounds[0] + relative[a] - before);
+                content[a][1] = content[a][1].max(child_bounds[1] + relative[a] + after);
             }
         }
         let asked = offsets.get(&node.id.key()).copied().unwrap_or_default();
         let mut overflowing = Xy::new_symm(false);
         for a in [Axis::X, Axis::Y] {
-            let range = [content[a][0] - port[a][0], content[a][1] - port[a][1]];
+            let mut range = [content[a][0] - port[a][0], content[a][1] - port[a][1]];
+            if let Some(origin) = node.rule.box_model.scroll_origin {
+                range[usize::from(origin[a])] = 0.;
+            }
             overflowing[a] = range[0] < 0. || range[1] > 0.;
             if node.rule.scroll.overflow[a].scrolls() {
                 frames[i].range[a] = range;
@@ -532,7 +664,7 @@ pub(super) fn publish(
             match &node.rule.placement {
                 Placement::Flow => {}
                 Placement::Relative(offset) => {
-                    let parent_extent = size(parent.scrollport);
+                    let parent_extent = frame.content_size(p);
                     rect = shifted(
                         rect,
                         Xy::new(
@@ -545,11 +677,27 @@ pub(super) fn publish(
                     rect = stick(rect, insets, containing_scroll, p, &views, window)
                 }
                 Placement::Fixed(insets) => {
-                    rect = positioned(window, insets, &node.base, size(node.rect));
+                    rect = positioned(
+                        window,
+                        insets,
+                        &node.base,
+                        size(node.rect),
+                        node.rule.box_model,
+                        static_box(
+                            parent.rect,
+                            parent_node.effective.padding,
+                            node.block_static_y,
+                        ),
+                    );
                     clip = window;
                     containing_scroll = Xy::new_symm(None);
                 }
                 Placement::Absolute { containing, insets } => {
+                    // Static alignment moves with the immediate parent's
+                    // scrolling content; explicit insets use their reference.
+                    let origin = shifted(parent.rect, Xy::new(-parent.offset.x, -parent.offset.y));
+                    let local_static =
+                        static_box(origin, parent_node.effective.padding, node.block_static_y);
                     let reference = match containing {
                         BoxReference::Parent => Some(p),
                         BoxReference::Node(_) => targets[i],
@@ -557,17 +705,43 @@ pub(super) fn publish(
                     };
                     if let Some(j) = reference {
                         let reference = &views[j];
+                        let target = if let Some(&(_, area)) =
+                            frame.grid_positioned_areas.get(&node.id.key())
+                        {
+                            // Like its reference coordinates, clipping and sticky ancestry
+                            // follow the positioning grid across intervening static wrappers.
+                            clip = reference.clip;
+                            containing_scroll = nearest[j];
+                            for a in [Axis::X, Axis::Y] {
+                                let overflow = frame.nodes[j].rule.scroll.overflow[a];
+                                if overflow != Overflow::Visible {
+                                    clip[a] = clip_interval(clip[a], reference.scrollport[a]);
+                                }
+                                if overflow.scrolls() {
+                                    containing_scroll[a] = Some(j);
+                                }
+                            }
+                            shifted(area, Xy::new(reference.rect.x[0], reference.rect.y[0]))
+                        } else {
+                            reference.scrollport
+                        };
                         rect = positioned(
-                            shifted(
-                                reference.scrollport,
-                                Xy::new(-reference.offset.x, -reference.offset.y),
-                            ),
+                            shifted(target, Xy::new(-reference.offset.x, -reference.offset.y)),
                             insets,
                             &node.base,
                             size(node.rect),
+                            node.rule.box_model,
+                            local_static,
                         );
                     } else if matches!(containing, BoxReference::Window) {
-                        rect = positioned(window, insets, &node.base, size(node.rect));
+                        rect = positioned(
+                            window,
+                            insets,
+                            &node.base,
+                            size(node.rect),
+                            node.rule.box_model,
+                            local_static,
+                        );
                     }
                 }
                 Placement::Anchor { sides, gap, .. } => {

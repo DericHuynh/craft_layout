@@ -62,6 +62,14 @@ required-features = ["incremental"]
 name = "scoreboard"
 required-features = ["incremental"]
 
+[[example]]
+name = "festival_program"
+required-features = ["incremental"]
+
+[[example]]
+name = "news_digest"
+required-features = ["incremental"]
+
 [[bench]]
 name = "grid_tracks"
 harness = false

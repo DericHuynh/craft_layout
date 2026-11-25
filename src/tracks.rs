@@ -4,6 +4,8 @@ use crate::placement_geometry::{RustFloat, line_start_and_gap};
 use crate::solve::grid_sparse::{Occupied, find_cell};
 use crate::{Arrange, Axis, Xy};
 use std::ops::Range;
+pub(crate) mod lines;
+pub use lines::{GridLine, LineNames, RepeatLineNames};
 
 // Bounded independently on each axis; a tall span never allocates a dense
 // two-dimensional matrix. Items beyond an axis boundary share the last area.
@@ -16,6 +18,10 @@ pub enum TrackMin {
     Pixels(f32),
     /// Fraction of the container's content size.
     Percent(f32),
+    /// Protect the full preferred contribution, even under a tight budget.
+    MaxContent,
+    /// Protect the minimum unbreakable content contribution.
+    MinContent,
     /// Minimum contribution of items occupying this track.
     Content,
 }
@@ -26,6 +32,8 @@ pub enum TrackMax {
     Pixels(f32),
     /// Grow into available space up to this fraction of the container.
     Percent(f32),
+    /// Stop at the minimum unbreakable contribution of the occupants.
+    MinContent,
     /// Grow to the preferred contributions of its items.
     Content,
     /// Grow to preferred contributions, then share any unclaimed space equally
@@ -52,6 +60,8 @@ pub enum Track {
     Fr(f32),
     /// Content sizing capped at this many pixels, subject to the minimum contribution.
     FitContent(f32),
+    /// Content sizing capped at a fraction of the definite content extent.
+    FitContentPercent(f32),
     /// Independent minimum and maximum sizing policies.
     MinMax(TrackMin, TrackMax),
 }
@@ -65,6 +75,7 @@ impl Track {
             Track::Fr(f) => (TrackMin::Pixels(0.), TrackMax::Fr(f)),
             Track::MinMax(min, max) => (min, max),
             Track::FitContent(cap) => (TrackMin::Content, TrackMax::Pixels(cap)),
+            Track::FitContentPercent(cap) => (TrackMin::Content, TrackMax::Percent(cap)),
         }
     }
 }
@@ -88,6 +99,24 @@ pub enum TrackAxis {
         /// Track declaration used for each repetition.
         track: Track,
     },
+    /// Prefix an explicit template by implicit tracks before its first line.
+    Prefixed {
+        /// Implicit tracks in final logical order.
+        implicit: Vec<Track>,
+        /// Original template retaining its line numbering.
+        explicit: Box<TrackAxis>,
+    },
+    /// Repeat a sequence between fixed leading and trailing declarations.
+    AutoRepeat {
+        /// Fixed leading tracks.
+        before: Vec<Track>,
+        /// The repeated sequence.
+        pattern: Vec<Track>,
+        /// Fixed trailing tracks.
+        after: Vec<Track>,
+        /// Collapse unoccupied tracks inside the repeated sequence.
+        fit: bool,
+    },
     /// Use the parent track boundaries spanned by this grid item.
     Subgrid,
 }
@@ -104,7 +133,36 @@ impl TrackAxis {
     pub(crate) fn count(&self, extent: f32, gap: f32, inherited: Option<usize>) -> usize {
         match self {
             Self::Tracks(v) => v.len().min(MAX_TRACKS),
+            Self::Prefixed { implicit, explicit } => {
+                (implicit.len() + explicit.count(extent, gap, inherited)).min(MAX_TRACKS)
+            }
             Self::Subgrid => inherited.unwrap_or(1).clamp(1, MAX_TRACKS),
+            Self::AutoRepeat {
+                before,
+                pattern,
+                after,
+                ..
+            } => {
+                let breadth = |t: &Track| {
+                    let state = sizing(*t, Some(extent));
+                    if state.cap.is_finite() {
+                        state.cap
+                    } else {
+                        state.base
+                    }
+                };
+                let gap = f64::from(gap);
+                let fixed: f64 = before.iter().chain(after).map(|t| breadth(t) + gap).sum();
+                let pitch: f64 = pattern.iter().map(|t| breadth(t).max(1.) + gap).sum();
+                let repeats = if pitch > 0. {
+                    ((f64::from(extent) + gap - fixed) / pitch).floor().max(1.) as usize
+                } else {
+                    0
+                };
+                (before.len() + after.len())
+                    .saturating_add(repeats.saturating_mul(pattern.len()))
+                    .min(MAX_TRACKS)
+            }
             Self::AutoFit { minimum, track } | Self::AutoFill { minimum, track } => {
                 let state = sizing(*track, Some(extent));
                 let reference = if state.cap.is_finite() {
@@ -118,9 +176,59 @@ impl TrackAxis {
             }
         }
     }
+    pub(crate) fn collapsed_range(&self, explicit: usize) -> Range<usize> {
+        match self {
+            Self::AutoFit { .. } => 0..explicit,
+            Self::AutoRepeat {
+                before,
+                after,
+                fit: true,
+                ..
+            } => {
+                before.len().min(explicit)
+                    ..explicit
+                        .saturating_sub(after.len())
+                        .max(before.len().min(explicit))
+            }
+            Self::Prefixed {
+                implicit,
+                explicit: inner,
+            } => {
+                let r = inner.collapsed_range(explicit.saturating_sub(implicit.len()));
+                implicit.len() + r.start..implicit.len() + r.end
+            }
+            _ => 0..0,
+        }
+    }
     pub(crate) fn at(&self, index: usize, explicit: usize, implicit: Track) -> Track {
         match self {
             Self::Tracks(v) => v.get(index).copied().unwrap_or(implicit),
+            Self::Prefixed {
+                implicit: before,
+                explicit: inner,
+            } => before.get(index).copied().unwrap_or_else(|| {
+                inner.at(
+                    index.saturating_sub(before.len()),
+                    explicit.saturating_sub(before.len()),
+                    implicit,
+                )
+            }),
+            Self::AutoRepeat {
+                before,
+                pattern,
+                after,
+                ..
+            } if index < explicit => {
+                if index < before.len() {
+                    before[index]
+                } else if index >= explicit.saturating_sub(after.len()) {
+                    after[index - explicit.saturating_sub(after.len())]
+                } else if pattern.is_empty() {
+                    implicit
+                } else {
+                    pattern[(index - before.len()) % pattern.len()]
+                }
+            }
             Self::AutoFit { track, .. } | Self::AutoFill { track, .. } if index < explicit => {
                 *track
             }
@@ -137,6 +245,10 @@ pub enum GridAlign {
     End,
     /// Center within the area.
     Center,
+    /// Center if the item fits, otherwise preserve its logical start.
+    SafeCenter,
+    /// Align to the end if the item fits, otherwise preserve its logical start.
+    SafeEnd,
     /// Align first baselines against the first spanned track's start edge.
     FirstBaseline,
     /// Align last baselines against the last spanned track's end edge.
@@ -173,6 +285,17 @@ pub struct TrackGrid {
     pub tracks: Xy<TrackAxis>,
     /// Tracks introduced by placement outside an explicit template.
     pub implicit: Xy<Track>,
+    /// A cyclic pattern for implicit tracks, extending in both directions.
+    pub implicit_pattern: Xy<Vec<Track>>,
+    /// Named rectangular areas. Each range uses zero-based explicit tracks.
+    /// A name supplies its start and end lines for placement on both axes.
+    pub areas: std::collections::BTreeMap<String, GridCell>,
+    /// Named lines keyed by zero-based explicit grid line.
+    pub line_names: Xy<LineNames>,
+    /// Line names that expand with an automatic track repetition.
+    pub repeat_line_names: Xy<RepeatLineNames>,
+    /// Keep the logical start visible when positional alignment overflows.
+    pub safe_justify: Xy<bool>,
     /// Gaps between noncollapsed tracks on each axis.
     pub gap: Xy<f32>,
     /// Advance along X for row-major placement, Y for column-major placement.
@@ -189,6 +312,11 @@ impl Default for TrackGrid {
         Self {
             tracks: Xy::default(),
             implicit: Xy::new_symm(Track::Content),
+            implicit_pattern: Xy::default(),
+            areas: Default::default(),
+            line_names: Xy::default(),
+            repeat_line_names: Xy::default(),
+            safe_justify: Xy::new_symm(false),
             gap: Xy::new_symm(0.),
             flow: Axis::X,
             dense: false,
@@ -211,6 +339,46 @@ fn bounded_start(start: usize, span: usize, limit: usize) -> usize {
     start.min(limit.saturating_sub(span))
 }
 impl TrackGrid {
+    pub(crate) fn explicit_count(&self, a: Axis, extent: f32, inherited: Option<usize>) -> usize {
+        let template = &self.tracks[a];
+        let tracks = template.count(extent, self.gap[a].max(0.), inherited);
+        if matches!(template, TrackAxis::Subgrid) || self.areas.is_empty() {
+            return tracks;
+        }
+        let preceding = match template {
+            TrackAxis::Prefixed { implicit, .. } => implicit.len(),
+            _ => 0,
+        };
+        self.areas
+            .values()
+            .map(|area| area[a].end.saturating_add(preceding))
+            .fold(tracks, usize::max)
+            .min(MAX_TRACKS)
+    }
+    #[cfg(feature = "incremental")]
+    pub(crate) fn placement_names(&self, axis: Axis) -> std::borrow::Cow<'_, LineNames> {
+        let mut names = std::borrow::Cow::Borrowed(&self.line_names[axis]);
+        for (name, area) in &self.areas {
+            for (i, side) in [(area[axis].start, "start"), (area[axis].end, "end")] {
+                names
+                    .to_mut()
+                    .entry(i)
+                    .or_default()
+                    .push(format!("{name}-{side}"));
+            }
+        }
+        names
+    }
+    pub(crate) fn track_at(&self, a: Axis, index: usize, explicit: usize) -> Track {
+        let pattern = &self.implicit_pattern[a];
+        let implicit = if pattern.is_empty() || index < explicit {
+            self.implicit[a]
+        } else {
+            pattern[(index - explicit) % pattern.len()]
+        };
+        self.tracks[a].at(index, explicit, implicit)
+    }
+
     /// Assign cells in tree order. A subgridded axis can occupy only its inherited
     /// span. Fully explicit overlapping assignments are respected. Each axis
     /// supports 65,536 tracks. Items past its boundary occupy the last possible area.
@@ -222,7 +390,7 @@ impl TrackGrid {
     ) -> (Xy<usize>, Vec<GridCell>) {
         let mut counts = Xy::new_symm(0);
         for a in [Axis::X, Axis::Y] {
-            counts[a] = self.tracks[a].count(inner[a], self.gap[a].max(0.), inherited[a]);
+            counts[a] = self.explicit_count(a, inner[a], inherited[a]);
         }
         let main = self.flow;
         let cross = main.other();
@@ -379,6 +547,9 @@ struct Sizing {
     base: f64,
     cap: f64,
     min_content: bool,
+    measured_floor: bool,
+    max_floor: bool,
+    min_ceiling: bool,
     ideal_content: bool,
     fr: f64,
     flexible: bool,
@@ -392,7 +563,7 @@ fn sizing(track: Track, extent: Option<f32>) -> Sizing {
     let lower = match min {
         TrackMin::Pixels(p) => Some(f64::from(p.max(0.))),
         TrackMin::Percent(f) => percent(f),
-        TrackMin::Content => None,
+        TrackMin::Content | TrackMin::MinContent | TrackMin::MaxContent => None,
     };
     let upper = match max {
         TrackMax::Pixels(p) => Some(f64::from(p.max(0.))),
@@ -413,12 +584,17 @@ fn sizing(track: Track, extent: Option<f32>) -> Sizing {
         base,
         cap: upper.unwrap_or(f64::INFINITY).max(base),
         min_content: lower.is_none(),
-        ideal_content: matches!(max, TrackMax::Content | TrackMax::Auto)
-            || matches!(track, Track::FitContent(_))
+        measured_floor: matches!(min, TrackMin::MinContent | TrackMin::MaxContent),
+        max_floor: min == TrackMin::MaxContent,
+        min_ceiling: max == TrackMax::MinContent,
+        ideal_content: matches!(
+            max,
+            TrackMax::Content | TrackMax::Auto | TrackMax::MinContent
+        ) || matches!(track, Track::FitContent(_) | Track::FitContentPercent(_))
             || matches!(max, TrackMax::Percent(_)) && extent.is_none(),
         fr,
         flexible: matches!(max, TrackMax::Fr(_)),
-        fit_content: matches!(track, Track::FitContent(_)),
+        fit_content: matches!(track, Track::FitContent(_) | Track::FitContentPercent(_)),
         stretch: matches!(max, TrackMax::Auto),
         grow_to_cap: matches!(
             track,
@@ -450,34 +626,73 @@ fn grow_toward(values: &mut [f64], caps: &[f64], mut deficit: f64) {
         deficit -= applied;
     }
 }
+#[derive(Clone, Copy)]
+struct Demand<'a> {
+    item: &'a TrackContribution,
+    min_content: f32,
+}
+impl std::ops::Deref for Demand<'_> {
+    type Target = TrackContribution;
+    fn deref(&self) -> &Self::Target {
+        self.item
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContributionPhase {
+    Minimum,
+    MeasuredFloor,
+    PreferredFloor,
+    MeasuredLimit,
+    PreferredLimit,
+}
+impl ContributionPhase {
+    fn target(self, item: &Demand<'_>) -> f64 {
+        f64::from(match self {
+            Self::Minimum => item.minimum,
+            Self::MeasuredFloor | Self::MeasuredLimit => item.min_content,
+            Self::PreferredFloor | Self::PreferredLimit => item.preferred,
+        })
+    }
+    fn eligible(self, s: &Sizing) -> bool {
+        match self {
+            Self::Minimum => s.min_content,
+            Self::MeasuredFloor => s.measured_floor,
+            Self::PreferredFloor => s.max_floor,
+            Self::MeasuredLimit => s.ideal_content,
+            Self::PreferredLimit => s.ideal_content && !s.min_ceiling,
+        }
+    }
+}
 // Compute demands at each span length from a common snapshot, so equally
 // spanning items produce the same track sizes in either source order.
 fn contributions(
     sizes: &mut [f64],
     states: &[Sizing],
-    items: &[&TrackContribution],
+    items: &[Demand<'_>],
     gap: f64,
-    minimum: bool,
+    phase: ContributionPhase,
 ) {
     // Single-span contributions constrain just one track. Folding their maxima
     // directly is equivalent to planning each increase from a shared snapshot.
+    let minimum = matches!(
+        phase,
+        ContributionPhase::Minimum
+            | ContributionPhase::MeasuredFloor
+            | ContributionPhase::PreferredFloor
+    );
     let eligible_cap = |s: &Sizing, value: f64| {
-        if minimum && s.min_content {
-            f64::INFINITY
-        } else if !minimum && s.ideal_content {
-            s.cap.max(value)
-        } else {
+        if !phase.eligible(s) {
             value
+        } else if minimum {
+            f64::INFINITY
+        } else {
+            s.cap.max(value)
         }
     };
     let single = items.partition_point(|item| item.tracks.len() == 1);
     for item in &items[..single] {
         let i = item.tracks.start;
-        let demand = f64::from(if minimum {
-            item.minimum
-        } else {
-            item.preferred
-        });
+        let demand = phase.target(item);
         // With mixed spans, all flexible floors are planned below together.
         if !(minimum && single < items.len() && states[i].flexible) {
             sizes[i] = sizes[i].max(demand.min(eligible_cap(&states[i], sizes[i])));
@@ -505,11 +720,7 @@ fn contributions(
             if states[r.clone()].iter().any(|s| s.flexible) {
                 continue;
             }
-            let demand = f64::from(if minimum {
-                item.minimum
-            } else {
-                item.preferred
-            });
+            let demand = phase.target(item);
             let missing =
                 demand - sizes[r.clone()].iter().sum::<f64>() - gap * (r.len() - 1) as f64;
             if missing <= 0. {
@@ -525,7 +736,9 @@ fn contributions(
                     .map(|(s, &v)| eligible_cap(s, v)),
             );
             for (cap, i) in caps.iter_mut().zip(r.clone()) {
-                if (minimum || states[i].fit_content)
+                if phase == ContributionPhase::PreferredFloor {
+                    *cap = cap.min(states[i].cap.max(sizes[i]));
+                } else if (minimum || states[i].fit_content)
                     && states[i].ideal_content
                     && single_preferred[i] > 0.
                 {
@@ -535,8 +748,16 @@ fn contributions(
             grow_toward(&mut local, &caps, missing);
             let remaining = demand - local.iter().sum::<f64>() - gap * (r.len() - 1) as f64;
             if remaining > 0. {
+                let prefer_intrinsic = phase == ContributionPhase::PreferredFloor
+                    && states[r.clone()]
+                        .iter()
+                        .any(|s| s.max_floor && s.ideal_content);
                 for (cap, i) in caps.iter_mut().zip(r.clone()) {
-                    *cap = eligible_cap(&states[i], sizes[i]);
+                    *cap = if prefer_intrinsic && !states[i].ideal_content {
+                        local[i - r.start]
+                    } else {
+                        eligible_cap(&states[i], sizes[i])
+                    };
                 }
                 grow_toward(&mut local, &caps, remaining);
             }
@@ -549,7 +770,7 @@ fn contributions(
     // A spanning minimum crossing a fractional track is carried by the
     // fractional tracks with intrinsic floors. All span lengths share one
     // snapshot, so an overlapping short item cannot bias a longer one.
-    if minimum && states.iter().any(|s| s.flexible && s.min_content) {
+    if phase == ContributionPhase::Minimum && states.iter().any(|s| s.flexible && s.min_content) {
         planned.copy_from_slice(sizes);
         for item in items {
             let r = item.tracks.clone();
@@ -626,7 +847,16 @@ impl TrackGrid {
         count: usize,
         items: &[TrackContribution],
     ) -> (f32, f32) {
-        let sized = self.size_axis(axis, None, count, items);
+        self.intrinsic_measurements(axis, count, items, &[])
+    }
+    pub(crate) fn intrinsic_measurements(
+        &self,
+        axis: Axis,
+        count: usize,
+        items: &[TrackContribution],
+        minimum: &[f32],
+    ) -> (f32, f32) {
+        let sized = self.size_axis(axis, None, count, items, minimum);
         (sized.minimum, sized.total)
     }
 
@@ -636,6 +866,7 @@ impl TrackGrid {
         extent: Option<f32>,
         count: usize,
         contributions_in: &[TrackContribution],
+        minimum_content: &[f32],
     ) -> SizedAxis {
         let count = count.min(MAX_TRACKS);
         let gap = self.gap[axis].max(0.);
@@ -643,6 +874,11 @@ impl TrackGrid {
         let explicit = template.count(extent.unwrap_or(0.), gap, None);
         let mut items: Vec<_> = contributions_in
             .iter()
+            .enumerate()
+            .map(|(i, item)| Demand {
+                item,
+                min_content: minimum_content.get(i).copied().unwrap_or(item.minimum),
+            })
             .filter(|c| c.tracks.start < c.tracks.end && c.tracks.end <= count)
             .collect();
         // Equal-span plans use a common snapshot. Their relative order is
@@ -651,8 +887,10 @@ impl TrackGrid {
             items.sort_unstable_by_key(|c| c.tracks.len());
         }
         let mut used = vec![true; count];
-        if matches!(template, TrackAxis::AutoFit { .. }) {
-            used[..explicit.min(count)].fill(false);
+        let range = template.collapsed_range(explicit);
+        let collapsible = range.start.min(count)..range.end.min(count);
+        if !collapsible.is_empty() {
+            used[collapsible].fill(false);
             for item in &items {
                 used[item.tracks.clone()].fill(true);
             }
@@ -662,7 +900,7 @@ impl TrackGrid {
         let states: Vec<_> = (0..count)
             .map(|i| {
                 if used[i] {
-                    let mut state = sizing(template.at(i, explicit, self.implicit[axis]), extent);
+                    let mut state = sizing(self.track_at(axis, i, explicit), extent);
                     if i < explicit
                         && let TrackAxis::AutoFit { minimum, .. }
                         | TrackAxis::AutoFill { minimum, .. } = template
@@ -677,10 +915,20 @@ impl TrackGrid {
             })
             .collect();
         let mut sizes: Vec<_> = states.iter().map(|s| s.base).collect();
-        contributions(&mut sizes, &states, &items, f64::from(gap), true);
+        let apply = |sizes: &mut [f64], phase: ContributionPhase| {
+            if states.iter().any(|s| phase.eligible(s)) {
+                contributions(sizes, &states, &items, f64::from(gap), phase);
+            }
+        };
+        apply(&mut sizes, ContributionPhase::Minimum);
+        apply(&mut sizes, ContributionPhase::MeasuredFloor);
+        apply(&mut sizes, ContributionPhase::PreferredFloor);
         let minimum = sizes.iter().sum::<f64>() as f32 + gaps;
         let mut ideal = sizes.clone();
-        contributions(&mut ideal, &states, &items, f64::from(gap), false);
+        if states.iter().any(|s| s.min_ceiling) {
+            apply(&mut ideal, ContributionPhase::MeasuredLimit);
+        }
+        apply(&mut ideal, ContributionPhase::PreferredLimit);
         if let Some(extent) = extent {
             let budget = f64::from(extent.max(0.) - gaps);
             let spare = budget - sizes.iter().sum::<f64>();
@@ -755,17 +1003,31 @@ impl TrackGrid {
         count: usize,
         contributions_in: &[TrackContribution],
     ) -> (Vec<[f32; 2]>, f32) {
+        self.resolve_measurements(axis, extent, count, contributions_in, &[])
+    }
+    pub(crate) fn resolve_measurements(
+        &self,
+        axis: Axis,
+        extent: Option<f32>,
+        count: usize,
+        contributions_in: &[TrackContribution],
+        minimum_content: &[f32],
+    ) -> (Vec<[f32; 2]>, f32) {
         let SizedAxis {
             sizes,
             used,
             visible,
             total,
             ..
-        } = self.size_axis(axis, extent, count, contributions_in);
+        } = self.size_axis(axis, extent, count, contributions_in, minimum_content);
         let gap = self.gap[axis].max(0.);
         let (mut cursor, step) = if visible > 0 {
             line_start_and_gap::<RustFloat>(
-                self.justify[axis],
+                if self.safe_justify[axis] && extent.is_some_and(|e| e < total) {
+                    Arrange::Start
+                } else {
+                    self.justify[axis]
+                },
                 [0., extent.unwrap_or(total)],
                 total,
                 visible as u32,

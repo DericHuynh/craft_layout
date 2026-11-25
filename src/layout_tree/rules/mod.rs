@@ -2,8 +2,12 @@
 //! available in authored form while the standard solver measures and places
 //! the effective boxes. Unconfigured trees use the original solve path.
 mod block;
+mod box_model;
+pub use box_model::BoxStyle;
 mod driver;
 mod flex;
+mod float_block;
+pub use float_block::{BlockAlignment, BlockStyle, Clear, Float};
 mod grid;
 mod responsive;
 mod viewport;
@@ -24,10 +28,14 @@ pub use viewport::{
 /// Extra rules for one node. A default value leaves its native declarations alone.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NodeRules {
+    /// Percentage edges, gap references and box-sizing information.
+    pub box_model: BoxStyle,
     /// Inherited writing context and optional logical declarations.
     pub logical: LogicalStyle,
     /// Lay children out as flexible lines.
     pub flex: Option<FlexLayout>,
+    /// Float exclusions, clearance, and alignment in normal block flow.
+    pub block_flow: BlockStyle,
     /// Heterogeneous track grid for this node's children.
     pub grid: Option<crate::tracks::TrackGrid>,
     /// Available content-box space for shrink-wrapping an intrinsic grid.
@@ -38,10 +46,23 @@ pub struct NodeRules {
     /// multiple tracks including a fraction. Fixed track maxima can cap it.
     /// Non-stretched Auto items also use this measure when fitting their area.
     pub grid_content_minimum: Xy<Option<crate::Size>>,
+    /// The measured minimum unbreakable size, used by min-content and max-content
+    /// track functions even when the automatic minimum is disabled (e.g. a scrollport).
+    /// FitContent measures the item after wrapping against its other dimension.
+    pub grid_intrinsic_minimum: Xy<Option<crate::Size>>,
+    /// Optional named or signed grid line declarations on each physical axis.
+    /// These override the numeric item on the corresponding axis.
+    pub grid_lines: Xy<Option<[crate::tracks::GridLine; 2]>>,
+    /// Place this overlay within its grid area without reserving tracks.
+    /// Absent insets use the grid item's alignment on that axis.
+    pub grid_overlay: Option<Edges>,
     /// Placement within the parent's track grid.
     pub grid_item: crate::tracks::GridItem,
     /// Preferred basis, weights, order and alignment when inside a flexible line.
     pub flex_item: FlexItem,
+    /// Constrain an intrinsic cross size to the available line width or height,
+    /// reserving the item's margins. The supplied min-content size may force overflow.
+    pub flex_fit_cross: Option<f32>,
     /// First and last baseline offsets from the low cross edge, including leading padding.
     pub baselines: Xy<Option<f32>>,
     /// Viewport, scrollbars and clip policy for this box.
@@ -104,8 +125,10 @@ pub(super) struct State {
     pub(super) baseline_contexts: HashMap<NodeKey, BaselineContext>,
     offsets: HashMap<NodeKey, Xy<f32>>,
     outputs: HashMap<NodeKey, ViewGeometry>,
+    grid_positioned_areas: HashMap<NodeKey, (usize, XyRect)>,
+    grid_line_names: HashMap<NodeKey, Xy<crate::tracks::LineNames>>,
     grid_tracks: HashMap<NodeKey, Xy<Vec<[f32; 2]>>>,
-    positioned_styles: HashMap<NodeKey, LayoutParams>,
+    positioned_styles: HashMap<NodeKey, (LayoutParams, f32)>,
     issues: Vec<RuleIssue>,
     pub(super) dirty: bool,
     window: Option<Xy<f32>>,
@@ -197,7 +220,27 @@ impl<T> LayoutTree<T> {
         axis: crate::Axis,
     ) -> Result<Option<&[[f32; 2]]>, TreeError> {
         self.layout(id)?;
-        Ok(self.rules_state.grid_tracks.get(&id.key()).map(|tracks| tracks[axis].as_slice()))
+        Ok(self
+            .rules_state
+            .grid_tracks
+            .get(&id.key())
+            .map(|tracks| tracks[axis].as_slice()))
+    }
+
+    /// Names on the last published grid, indexed in logical track order including
+    /// preceding implicit tracks. Returns None when this axis has no labels.
+    pub fn resolved_grid_line_names(
+        &self,
+        id: &NodeId,
+        a: crate::Axis,
+    ) -> Result<Option<&crate::tracks::LineNames>, TreeError> {
+        self.layout(id)?;
+        Ok(self
+            .rules_state
+            .grid_line_names
+            .get(&id.key())
+            .map(|v| &v[a])
+            .filter(|n| !n.is_empty()))
     }
 
     /// Geometry diagnostics from the latest managed solve.

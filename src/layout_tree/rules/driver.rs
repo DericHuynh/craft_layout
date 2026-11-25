@@ -26,20 +26,48 @@ pub(super) struct FrameNode {
     pub(super) context: WritingContext,
     pub(super) rect: XyRect,
     pub(super) query_content: Option<Xy<f32>>,
+    pub(super) grid_baseline_items: Option<Xy<[usize; 2]>>,
+    pub(super) grid_minimum: Xy<Option<f32>>,
+    pub(super) grid_origin: Xy<(usize, usize)>,
+    pub(super) content_dependency: Xy<bool>,
+    pub(super) allocation_origin: Option<Xy<f32>>,
+    pub(super) exported_baselines: Xy<[Option<f32>; 2]>,
+    pub(super) flex_baseline_items: Option<[[usize; 2]; 2]>,
     pub(super) natural: Xy<f32>,
     pub(super) measured: Xy<f32>,
     pub(super) overflowing: Xy<bool>,
     pub(super) gutter: Xy<f32>,
-    assigned: bool,
+    pub(super) assigned: bool,
+    pub(super) block_static_y: f32,
+    pub(super) managed_block: bool,
+    pub(super) grid_reference: Option<Xy<f32>>,
+    intrinsic_inline: Option<(Axis, f32)>,
     intrinsic_proposal: Xy<Option<f32>>,
 }
 
+impl FrameNode {
+    /// Percentage sizes depend on the tracks that the intrinsic pass is measuring,
+    /// including content-box percentages whose final border size is in pixels.
+    pub(super) fn relative_size(&self, axis: Axis) -> bool {
+        matches!(self.base.size[axis], Size::Frac(_))
+            || self.rule.box_model.content_box
+                && matches!(
+                    self.rule.logical.project(self.context, self.authored).size[axis],
+                    Size::Frac(_)
+                )
+    }
+}
+
 pub(super) struct Frame<'a> {
+    pub(super) export_baselines: bool,
     pub(super) nodes: Vec<FrameNode>,
     pub(super) window: Xy<f32>,
+    pub(super) measuring: bool,
     indices: HashMap<NodeKey, usize>,
     patches: &'a HashMap<NodeKey, TypographyPatch>,
     styles: &'a HashMap<NodeKey, NodeRules>,
+    pub(super) grid_positioned_areas: HashMap<NodeKey, (usize, XyRect)>,
+    pub(super) grid_line_names: HashMap<NodeKey, Xy<crate::tracks::LineNames>>,
     pub(super) grid_tracks: HashMap<NodeKey, Xy<Vec<[f32; 2]>>>,
     pub(super) grid_baselines: HashMap<usize, Xy<Vec<[Option<f32>; 2]>>>,
     pub(super) grid_cells: HashMap<usize, Xy<Range<usize>>>,
@@ -81,11 +109,22 @@ impl<'a> Frame<'a> {
                 context,
                 rect: record.rect,
                 query_content: None,
+                flex_baseline_items: None,
+                allocation_origin: None,
+                content_dependency: Xy::new_symm(false),
+                exported_baselines: Xy::new_symm([None; 2]),
+                grid_baseline_items: None,
+                grid_minimum: Xy::new_symm(None),
+                grid_origin: Xy::new_symm((0, 0)),
                 natural: Xy::new_symm(0.),
                 measured: Xy::new_symm(0.),
                 overflowing: Xy::new_symm(false),
                 gutter: Xy::new_symm(0.),
                 assigned: false,
+                block_static_y: 0.,
+                managed_block: false,
+                grid_reference: None,
+                intrinsic_inline: None,
                 intrinsic_proposal: Xy::new_symm(None),
             });
             indices.insert(key, index);
@@ -100,11 +139,15 @@ impl<'a> Frame<'a> {
         }
         Self {
             window,
+            measuring: true,
+            export_baselines: styles.values().any(flex::uses_baseline),
             nodes,
             indices,
             patches,
             styles,
             grid_cells: HashMap::new(),
+            grid_positioned_areas: HashMap::new(),
+            grid_line_names: HashMap::new(),
             grid_tracks: HashMap::new(),
             grid_baselines: HashMap::new(),
         }
@@ -130,7 +173,23 @@ impl<'a> Frame<'a> {
         let mut extent = super::size(n.rect);
         for a in [Axis::X, Axis::Y] {
             if let Size::Pixels(v) = n.effective.size[a] {
-                extent[a] = v;
+                let resolve = |bound: Option<Size>| match bound {
+                    Some(Size::Pixels(v)) => Some(v),
+                    Some(Size::Frac(f)) => {
+                        let reference = n.parent.map_or(self.window[a], |p| {
+                            let parent = &self.nodes[p];
+                            (super::size(parent.rect)[a]
+                                - parent.effective.padding[a].iter().sum::<f32>())
+                            .max(0.)
+                        });
+                        Some(reference * f)
+                    }
+                    Some(Size::FitContent) => Some(n.natural[a]),
+                    _ => None,
+                };
+                extent[a] = v
+                    .min(resolve(n.effective.max_size[a]).unwrap_or(f32::INFINITY))
+                    .max(resolve(n.effective.min_size[a]).unwrap_or(0.));
             }
             extent[a] = (extent[a] - n.effective.padding[a].iter().sum::<f32>()).max(0.);
         }
@@ -162,6 +221,9 @@ impl<'a> Frame<'a> {
         if let Some(main) = n.rule.logical.main_axis {
             f.axis = n.context.axis(main);
         }
+        let inner = self.content_size(i);
+        f.gap += n.rule.box_model.gap_fraction[f.axis] * inner[f.axis];
+        f.line_gap += n.rule.box_model.gap_fraction[f.axis.other()] * inner[f.axis.other()];
         f.reverse ^= n.base.children_origin_flipped[f.axis];
         f.cross_reverse ^= n.base.children_origin_flipped[f.axis.other()];
         Some(f)
@@ -178,6 +240,9 @@ impl<'a> Frame<'a> {
                     outer = outer.max(min);
                 }
                 self.nodes[i].intrinsic_proposal[a] = Some(outer);
+                if !self.nodes[i].assigned && p.min_size[a] == Some(Size::FitContent) {
+                    self.nodes[i].effective.min_size[a] = Some(Size::Pixels(outer));
+                }
                 if !self.nodes[i].assigned && self.is_intrinsic(i, a, p.size[a]) {
                     self.nodes[i].effective.size[a] = Size::Pixels(outer);
                 }
@@ -187,7 +252,9 @@ impl<'a> Frame<'a> {
     pub(super) fn place(&mut self, i: usize, parent: usize, rect: XyRect) {
         let inner = self.content_size(parent);
         let flipped = self.nodes[parent].effective.children_origin_flipped;
+        let padding = self.nodes[parent].effective.padding;
         let n = &mut self.nodes[i];
+        n.allocation_origin = Some(Xy::new(rect.x[0] + padding.x[0], rect.y[0] + padding.y[0]));
         n.assigned = true;
         n.effective.free_placement = true;
         for a in [Axis::X, Axis::Y] {
@@ -208,6 +275,8 @@ impl<'a> Frame<'a> {
         }
     }
     fn prepare(&mut self, issues: &mut Vec<RuleIssue>) {
+        self.grid_positioned_areas.clear();
+        self.grid_line_names.clear();
         self.grid_tracks.clear();
         self.grid_baselines.clear();
         self.grid_cells.clear();
@@ -222,9 +291,49 @@ impl<'a> Frame<'a> {
             } else {
                 responsive::apply(self, i, &mut p, issues)
             };
-            let gutter = viewport::gutter(n.rule.scroll, n.overflowing);
-            p.padding.x[1] += gutter.x;
-            p.padding.y[1] += gutter.y;
+            super::box_model::apply(self, i, &mut p);
+            let mut gutter = viewport::gutter(n.rule.scroll, n.overflowing);
+            // A scrollbar can consume all the available content space. An allocated
+            // small box still fits its parent even when a platform bar is thicker.
+            if let Some(j) = n.parent
+                && gutter != Xy::new_symm(0.)
+            {
+                let parent = &self.nodes[j];
+                for a in [Axis::X, Axis::Y] {
+                    let allocated = !matches!(p.size[a], Size::FitContent | Size::Auto)
+                        || !self.is_intrinsic(i, a, p.size[a])
+                        || (parent.rule.flex.is_some() && n.rule.flex_item.grow > 0.);
+                    if allocated && let Size::Pixels(_) = parent.effective.size[a] {
+                        let available = self.content_size(j)[a] - p.padding[a].iter().sum::<f32>();
+                        gutter[a] = gutter[a].min(available.max(0.));
+                    }
+                }
+            }
+            for a in [Axis::X, Axis::Y] {
+                let fixed = |s: Size| {
+                    if let Size::Pixels(v) = s {
+                        Some(v)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(mut outer) = fixed(p.size[a]).or_else(|| p.max_size[a].and_then(fixed))
+                {
+                    if let Some(maximum) = p.max_size[a].and_then(fixed) {
+                        outer = outer.min(maximum);
+                    }
+                    if let Some(minimum) = p.min_size[a].and_then(fixed) {
+                        outer = outer.max(minimum);
+                    }
+                    gutter[a] = gutter[a].min((outer - p.padding[a].iter().sum::<f32>()).max(0.));
+                }
+                let reverse = n
+                    .rule
+                    .box_model
+                    .scroll_origin
+                    .is_some_and(|origin| origin[a]);
+                p.padding[a][usize::from(!reverse)] += gutter[a];
+            }
             if n.rule.placement.out_of_flow() {
                 p.free_placement = true;
             }
@@ -249,7 +358,12 @@ impl<'a> Frame<'a> {
             p.isolate_block_margins |= n.rule.flex.is_some() || n.rule.grid.is_some();
             n.base = p;
             n.effective = p;
+            if let Some((axis, extent)) = n.intrinsic_inline {
+                n.effective.size[axis] = Size::Pixels(extent);
+            }
             n.assigned = false;
+            n.block_static_y = 0.;
+            n.managed_block = false;
             if block::vertical(n) {
                 n.effective.children_layout = ChildrenLayout::Free;
             }
@@ -257,6 +371,7 @@ impl<'a> Frame<'a> {
     }
     fn plan(&mut self, issues: &mut Vec<RuleIssue>) {
         let blocks = block::measure(self);
+        let float_blocks = super::float_block::Plan::new(self);
         for i in 0..self.nodes.len() {
             if self.nodes[i].base.disabled {
                 continue;
@@ -277,8 +392,14 @@ impl<'a> Frame<'a> {
             }
             if let Some(layout) = self.flex_layout(i) {
                 flex::apply(self, i, layout);
-            } else if let Some(layout) = self.nodes[i].rule.grid.clone() {
+            } else if let Some(mut layout) = self.nodes[i].rule.grid.clone() {
+                let inner = self.content_size(i);
+                for a in [Axis::X, Axis::Y] {
+                    layout.gap[a] += self.nodes[i].rule.box_model.gap_fraction[a] * inner[a];
+                }
                 grid::apply(self, i, &layout);
+            } else if float_blocks.is_root(i) {
+                float_blocks.layout(self, i);
             } else if block::vertical(&self.nodes[i]) {
                 block::place(self, i, &blocks);
             }
@@ -341,19 +462,25 @@ impl State {
                 // Positioning still evaluates insets against the moving reference box.
                 // Its sizes, bounds and margins come from the same resolved style that
                 // produced the last layout, including queries and typography.
-                n.base = self
+                (n.base, n.block_static_y) = self
                     .positioned_styles
                     .get(&n.id.key())
                     .copied()
-                    .unwrap_or(n.effective);
+                    .unwrap_or((n.effective, 0.));
                 if let Some(previous) = self.outputs.get(&n.id.key()) {
                     let rect = super::size(previous.rect);
                     let port = super::size(previous.scrollport);
-                    n.gutter = Xy::new((rect.x - port.x).max(0.), (rect.y - port.y).max(0.));
+                    for a in [Axis::X, Axis::Y] {
+                        n.gutter[a] =
+                            (rect[a] - port[a] - n.rule.box_model.border[a].iter().sum::<f32>())
+                                .max(0.);
+                    }
                 }
             }
             let mut issues = Vec::new();
+            frame.grid_positioned_areas = std::mem::take(&mut self.grid_positioned_areas);
             self.outputs = viewport::publish(&mut frame, &self.offsets, &mut issues);
+            self.grid_positioned_areas = frame.grid_positioned_areas;
             self.view_dirty = false;
             return Ok(());
         }
@@ -376,6 +503,23 @@ impl State {
         });
         let mut issues = Vec::new();
         frame.prepare(&mut issues);
+        for i in (0..frame.nodes.len()).rev() {
+            for a in [Axis::X, Axis::Y] {
+                let node = &frame.nodes[i];
+                let dependent = node.base.intrinsic_reads_other_axis(a)
+                    || node.children.iter().any(|&id| {
+                        let child = &frame.nodes[id];
+                        !child.base.disabled
+                            && !child.base.free_placement
+                            && child.content_dependency[a]
+                            && matches!(
+                                child.base.size[a],
+                                Size::Auto | Size::Fill | Size::FitContent
+                            )
+                    });
+                frame.nodes[i].content_dependency[a] = dependent;
+            }
+        }
         // An allocated query container can cross a breakpoint after the first
         // flex/grid pass. Capture the children's intrinsic contributions for
         // every context that may subsequently consume them.
@@ -408,16 +552,72 @@ impl State {
             if !managed {
                 continue;
             }
+            let intrinsic_axis = Xy::new(
+                !matches!(
+                    frame.nodes[parent].base.size.x,
+                    Size::Pixels(_) | Size::AspectRatio(_)
+                ),
+                !matches!(
+                    frame.nodes[parent].base.size.y,
+                    Size::Pixels(_) | Size::AspectRatio(_)
+                ),
+            );
             for index in 0..frame.nodes[parent].children.len() {
                 let child = frame.nodes[parent].children[index];
                 let item = &mut frame.nodes[child];
                 for a in [Axis::X, Axis::Y] {
                     if matches!(item.effective.size[a], Size::Auto | Size::Fill)
-                        || content_basis[a] && item.rule.flex_item.basis == FlexBasis::Content
+                        || managed && item.relative_size(a) && intrinsic_axis[a]
+                        || content_basis[a]
+                            && matches!(
+                                item.rule.flex_item.basis,
+                                FlexBasis::Content | FlexBasis::FitContent(_)
+                            )
                     {
                         item.effective.size[a] = Size::FitContent;
                     }
+                    // Flex distributes space from a base size, then freezes against
+                    // limits. An intrinsic base must therefore be probed before
+                    // the item's explicit minimum or maximum clamps it.
+                    if content_basis[a] && item.effective.size[a] == Size::FitContent {
+                        item.effective.min_size[a] = None;
+                        item.effective.max_size[a] = None;
+                    }
                 }
+            }
+        }
+        // A shrink-to-fit block takes the unwrapped contribution of its
+        // descendants. Let automatic descendants report that contribution
+        // in the initial measurement, before applying the final allocation.
+        let mut preferred = vec![false; frame.nodes.len()];
+        for i in 1..frame.nodes.len() {
+            let parent = frame.nodes[i].parent.unwrap();
+            let child = &frame.nodes[i];
+            preferred[i] = !child.base.disabled
+                && !child.base.free_placement
+                && (preferred[parent]
+                    || super::float_block::intrinsic_inline(&frame.nodes[parent], child)
+                    || frame.nodes[parent].base.children_layout == ChildrenLayout::Block
+                        && (frame.nodes[parent]
+                            .rule
+                            .box_model
+                            .positioned_fit_min
+                            .x
+                            .is_some()
+                            || frame.nodes[parent].parent.is_some_and(|gp| {
+                                (frame.nodes[gp].rule.grid.is_some()
+                                    || frame.nodes[parent].rule.flex_fit_cross.is_some())
+                                    && matches!(
+                                        frame.nodes[parent].base.size.x,
+                                        Size::Auto | Size::FitContent
+                                    )
+                            })))
+                && matches!(
+                    child.base.size.x,
+                    Size::Auto | Size::Fill | Size::FitContent
+                );
+            if preferred[i] {
+                frame.nodes[i].effective.size.x = Size::FitContent;
             }
         }
         frame.sync(tree, &mut self.authored);
@@ -427,6 +627,23 @@ impl State {
             n.natural = super::size(n.rect);
             n.measured = n.natural;
         }
+        frame.measuring = false;
+        // A block measuring its own inline size cannot derive that size from
+        // a child's percentage edges against itself. Use the measured extent
+        // as their containing block during placement on every solve.
+        for i in 0..frame.nodes.len() {
+            let n = &frame.nodes[i];
+            let inline = n.context.axis(crate::LogicalAxis::Inline);
+            if n.base.children_layout == ChildrenLayout::Block
+                && frame.is_intrinsic(i, inline, n.base.size[inline])
+                && n.children.iter().any(|&c| {
+                    let m = frame.nodes[c].rule.box_model;
+                    m.padding_fraction[inline] != [0.; 2] || m.margin_fraction[inline] != [0.; 2]
+                })
+            {
+                frame.nodes[i].intrinsic_inline = Some((inline, n.natural[inline]));
+            }
+        }
         // A chain of nested content-dependent containers can communicate a
         // measured size one level per iteration. Keep oscillations bounded.
         let limit = frame.nodes.len().saturating_add(4);
@@ -434,8 +651,8 @@ impl State {
         for _ in 0..limit {
             issues.clear();
             frame.prepare(&mut issues);
+            let mut metrics_changed = frame.export_baselines && flex::collect_baselines(&mut frame);
             frame.plan(&mut issues);
-            let mut metrics_changed = false;
             for n in &mut frame.nodes {
                 for a in [Axis::X, Axis::Y] {
                     if let Some(value) = n.intrinsic_proposal[a].take() {
@@ -452,8 +669,41 @@ impl State {
                 }
                 let p = frame.nodes[i].base;
                 for a in [Axis::X, Axis::Y] {
-                    if p.intrinsic_reads_other_axis(a)
-                        && matches!(p.size[a], Size::Auto | Size::Fill | Size::FitContent)
+                    let explicit_content = frame.nodes[i]
+                        .parent
+                        .and_then(|parent| frame.flex_layout(parent))
+                        .is_some_and(|layout| {
+                            layout.axis == a
+                                && matches!(
+                                    frame.nodes[i].rule.flex_item.basis,
+                                    FlexBasis::Content | FlexBasis::FitContent(_)
+                                )
+                        });
+                    let n = &frame.nodes[i];
+                    let wrapping_block = p.children_layout == ChildrenLayout::Block
+                        && !n.children.is_empty()
+                        && n.rule.grid.is_none()
+                        && n.rule.flex.is_none()
+                        && a == n.context.axis(crate::LogicalAxis::Block)
+                        && (n.rule.box_model.positioned_fit_min[a.other()].is_some()
+                            || n.rule.flex_fit_cross.is_some()
+                            || n.parent
+                                .is_some_and(|parent| frame.nodes[parent].rule.grid.is_some()));
+                    // Float layout has already measured the extent of its
+                    // explicitly placed children. A fit-content probe on the
+                    // projected Free shell would measure zero instead.
+                    let flexible_parent = n
+                        .parent
+                        .is_some_and(|parent| frame.nodes[parent].rule.flex.is_some());
+                    let native_descendants = !n.managed_block
+                        && (wrapping_block
+                            || flexible_parent
+                                && n.rule.flex.is_none()
+                                && n.rule.grid.is_none()
+                                && n.content_dependency[a]);
+                    if (p.intrinsic_reads_other_axis(a) || native_descendants)
+                        && (explicit_content
+                            || matches!(p.size[a], Size::Auto | Size::Fill | Size::FitContent))
                     {
                         probes.push((i, a, frame.nodes[i].effective.size[a]));
                         frame.nodes[i].effective.size[a] = Size::FitContent;
@@ -508,6 +758,8 @@ impl State {
         };
         // Publish the same tracks used for item placement and subgrid inheritance.
         // Idle and scroll-only solves keep this geometry, as does a rejected Batch solve.
+        self.grid_positioned_areas = std::mem::take(&mut frame.grid_positioned_areas);
+        self.grid_line_names = std::mem::take(&mut frame.grid_line_names);
         self.grid_tracks = std::mem::take(&mut frame.grid_tracks);
         self.positioned_styles.clear();
         self.positioned_styles
@@ -516,7 +768,7 @@ impl State {
                     n.rule.placement,
                     super::Placement::Fixed(_) | super::Placement::Absolute { .. }
                 )
-                .then_some((n.id.key(), n.base))
+                .then_some((n.id.key(), (n.base, n.block_static_y)))
             }));
         self.baseline_contexts.clear();
         self.baseline_contexts

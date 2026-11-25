@@ -9,6 +9,9 @@ use crate::placement_geometry::{RustFloat, line_start_and_gap};
 use crate::{Arrange, Axis, Margin, Xy, XyRect};
 use std::ops::Range;
 
+#[path = "flex_balance.rs"]
+mod balance;
+
 /// The outer main-axis size from which flexible sizing begins.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum FlexBasis {
@@ -21,6 +24,12 @@ pub enum FlexBasis {
     Pixels(f32),
     /// A fraction of the container's full inner main size, before gaps.
     Fraction(f32),
+    /// Fraction of the inner main size plus a fixed outer-box adjustment.
+    FractionPlus(f32, f32),
+    /// Fill available space after the item's main-axis margins.
+    Stretch,
+    /// Size to the available space within the content minimum and preferred size.
+    FitContent(f32),
 }
 
 /// Whether to collect items into one line or successive lines.
@@ -33,6 +42,13 @@ pub enum FlexWrap {
     Wrap,
     /// Wrap, with lines advancing from the opposite cross edge.
     WrapReverse,
+    /// Balance widths of consecutive lines, requesting at least this many nonempty lines.
+    Balance {
+        /// Minimum number of lines, limited by the number of items.
+        lines: u16,
+        /// Advance lines from the opposite cross edge.
+        reverse: bool,
+    },
 }
 
 /// Alignment within a flex line. Safe alignment falls back to Start on overflow.
@@ -215,6 +231,16 @@ impl FlexMetrics {
             .filter_map(Margin::as_px)
             .sum()
     }
+}
+
+/// Children supplying the container's first/last baselines along the main and
+/// cross directions. These are indices in the original input order.
+#[derive(Default)]
+pub(crate) struct FlexGeometry {
+    pub(crate) rects: Vec<XyRect>,
+    pub(crate) natural_cross: f32,
+    #[cfg(feature = "incremental")]
+    pub(crate) baseline_items: Option<[[usize; 2]; 2]>,
 }
 
 struct WorkingItem<'a> {
@@ -450,37 +476,64 @@ impl FlexLayout {
     pub fn intrinsic_main(&self, items: &[FlexMetrics]) -> f32 {
         let axis = self.axis;
         let gap = f64::from(self.gap.max(0.0));
-        let extents = items
-            .iter()
-            .map(|item| {
-                let preferred = item.preferred[axis];
-                let basis = match item.item.basis {
-                    FlexBasis::Preferred => preferred,
-                    FlexBasis::Content | FlexBasis::Fraction(_) => item.content_main,
-                    FlexBasis::Pixels(px) => px,
-                };
-                let contribution = if item.item.grow > 0.0 {
-                    basis.max(preferred)
-                } else {
-                    basis
-                };
-                item.bounded(f64::from(contribution), axis) + f64::from(item.margin_sum(axis))
-            })
-            .sum::<f64>();
+        let contribution = |item: &FlexMetrics| {
+            let preferred = item.preferred[axis];
+            let basis = match item.item.basis {
+                FlexBasis::Preferred => preferred,
+                FlexBasis::Content
+                | FlexBasis::Fraction(_)
+                | FlexBasis::FractionPlus(_, _)
+                | FlexBasis::FitContent(_)
+                | FlexBasis::Stretch => item.content_main,
+                FlexBasis::Pixels(px) => px,
+            };
+            let contribution = if item.item.grow > 0.0 {
+                basis.max(preferred)
+            } else {
+                basis
+            };
+            item.bounded(f64::from(contribution), axis) + f64::from(item.margin_sum(axis))
+        };
+        if let FlexWrap::Balance { lines, .. } = self.wrap
+            && lines > 1
+        {
+            let sizes: Vec<_> = items.iter().map(contribution).collect();
+            return balance::ranges(&sizes, gap, f64::INFINITY, lines)
+                .into_iter()
+                .map(|r| {
+                    sizes[r.clone()].iter().sum::<f64>() + gap * r.len().saturating_sub(1) as f64
+                })
+                .fold(0., f64::max) as f32;
+        }
+        let extents: f64 = items.iter().map(contribution).sum();
         (extents + gap * items.len().saturating_sub(1) as f64).max(0.0) as f32
     }
 
     /// Compute rectangles and the natural cross extent of the collected lines,
     /// before cross-axis alignment consumes the container's unused space.
     pub fn resolve_and_measure(&self, inner: Xy<f32>, items: &[FlexMetrics]) -> (Vec<XyRect>, f32) {
+        let geometry = self.geometry(inner, items, false);
+        (geometry.rects, geometry.natural_cross)
+    }
+
+    pub(crate) fn geometry(
+        &self,
+        inner: Xy<f32>,
+        items: &[FlexMetrics],
+        _export_baselines: bool,
+    ) -> FlexGeometry {
         if items.is_empty() {
-            return (Vec::new(), 0.0);
+            return FlexGeometry::default();
         }
         let main = self.axis;
         let cross = main.other();
         let limit = inner[main].max(0.0);
         let cross_limit = inner[cross].max(0.0);
-        let cross_reverse = self.cross_reverse ^ (self.wrap == FlexWrap::WrapReverse);
+        let cross_reverse = self.cross_reverse
+            ^ matches!(
+                self.wrap,
+                FlexWrap::WrapReverse | FlexWrap::Balance { reverse: true, .. }
+            );
         let gap = self.gap.max(0.0);
         let line_gap = self.line_gap.max(0.0);
         let mut states: Vec<_> = items
@@ -492,8 +545,15 @@ impl FlexLayout {
                     FlexBasis::Content => f64::from(input.content_main),
                     FlexBasis::Pixels(px) => f64::from(px),
                     FlexBasis::Fraction(f) => f64::from(limit) * f64::from(f),
+                    FlexBasis::FractionPlus(f, p) => f64::from(limit) * f64::from(f) + f64::from(p),
+                    FlexBasis::Stretch => f64::from(limit - input.margin_sum(main)),
+                    FlexBasis::FitContent(min) => f64::from(
+                        input
+                            .content_main
+                            .min((limit - input.margin_sum(main)).max(min)),
+                    ),
                 }
-                .max(0.0);
+                .max(input.padding_sum(main));
                 WorkingItem {
                     input,
                     index,
@@ -514,7 +574,20 @@ impl FlexLayout {
         let mut lines = Vec::new();
         let mut start = 0;
         let mut used = 0.0f64;
-        if self.wrap != FlexWrap::NoWrap {
+        if let FlexWrap::Balance { lines: minimum, .. } = self.wrap {
+            let widths: Vec<_> = states
+                .iter()
+                .map(|s| s.hypothetical + f64::from(s.input.margin_sum(main)))
+                .collect();
+            lines.extend(
+                balance::ranges(&widths, f64::from(gap), f64::from(limit), minimum)
+                    .into_iter()
+                    .map(|items| Line {
+                        items,
+                        ..Default::default()
+                    }),
+            );
+        } else if self.wrap != FlexWrap::NoWrap {
             for (i, state) in states.iter().enumerate() {
                 let extent = state.hypothetical + f64::from(state.input.margin_sum(main));
                 if i > start && used + f64::from(gap) + extent > f64::from(limit) {
@@ -528,15 +601,60 @@ impl FlexLayout {
                 used += extent + if i > start { f64::from(gap) } else { 0.0 };
             }
         }
-        lines.push(Line {
-            items: start..states.len(),
-            ..Line::default()
-        });
+        if !matches!(self.wrap, FlexWrap::Balance { .. }) {
+            lines.push(Line {
+                items: start..states.len(),
+                ..Line::default()
+            });
+        }
         for line in &mut lines {
             let slice = &mut states[line.items.clone()];
             distribute(slice, main, limit, gap);
             line_cross(slice, self, cross_reverse, line);
         }
+        #[cfg(feature = "incremental")]
+        let baseline_items = _export_baselines.then(|| {
+            let wrap_reverse = matches!(
+                self.wrap,
+                FlexWrap::WrapReverse | FlexWrap::Balance { reverse: true, .. }
+            );
+            let line_sources = |last: bool| {
+                let line = if last ^ wrap_reverse {
+                    &lines[lines.len() - 1]
+                } else {
+                    &lines[0]
+                };
+                let group = &states[line.items.clone()];
+                let edge = |end| {
+                    if end {
+                        group.last().unwrap()
+                    } else {
+                        &group[0]
+                    }
+                };
+                let kind = if last {
+                    FlexAlign::LastBaseline
+                } else {
+                    FlexAlign::FirstBaseline
+                };
+                let eligible = |s: &&WorkingItem| {
+                    alignment(s.input, self) == kind
+                        && s.input.margin[cross].iter().all(|m| m.as_px().is_some())
+                };
+                let participant = if last {
+                    group.iter().rev().find(eligible)
+                } else {
+                    group.iter().find(eligible)
+                };
+                (
+                    edge(last ^ self.reverse).index,
+                    participant.unwrap_or_else(|| edge(last)).index,
+                )
+            };
+            let (main_first, cross_first) = line_sources(false);
+            let (main_last, cross_last) = line_sources(true);
+            [[main_first, main_last], [cross_first, cross_last]]
+        });
         let natural_cross =
             lines.iter().map(|l| l.cross_size).sum::<f32>() + line_gap * (lines.len() - 1) as f32;
         let (mut line_start, line_step, stretch) = if self.wrap == FlexWrap::NoWrap {
@@ -602,6 +720,11 @@ impl FlexLayout {
             }
             line_start += line.cross_size + line_step;
         }
-        (result, natural_cross)
+        FlexGeometry {
+            rects: result,
+            natural_cross,
+            #[cfg(feature = "incremental")]
+            baseline_items,
+        }
     }
 }

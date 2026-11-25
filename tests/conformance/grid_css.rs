@@ -1,15 +1,18 @@
 //! Lower the fixture generator's Grid longhands. Track numbering remains in
 //! source order even when the writing context reverses a physical axis.
-use super::{Result, px, unsupported};
+use super::{Result, box_css, unsupported};
 use crate::css::Style;
-use keru_layout::tracks::{GridAlign, GridItem, Track, TrackAxis, TrackGrid, TrackMax, TrackMin};
+use keru_layout::tracks::{
+    GridAlign, GridItem, GridLine, LineNames, RepeatLineNames, Track, TrackAxis, TrackGrid,
+    TrackMax, TrackMin,
+};
 use keru_layout::{Arrange, Axis, LogicalAxis, WritingContext, Xy};
 
 #[derive(Debug, Clone, Copy)]
 pub struct GridContext {
     inline: Axis,
     pub origins: Xy<bool>,
-    explicit: Xy<Option<usize>>,
+
     items: Xy<Alignment>,
 }
 
@@ -28,6 +31,11 @@ fn alignment(raw: &str) -> Result<Alignment> {
         "start" | "flex-start" => GridAlign::Start,
         "end" | "flex-end" => GridAlign::End,
         "center" => GridAlign::Center,
+        "safe center" => GridAlign::SafeCenter,
+        "safe end" | "safe flex-end" => GridAlign::SafeEnd,
+        "safe start" | "safe flex-start" => GridAlign::Start,
+        "baseline" | "first baseline" => GridAlign::FirstBaseline,
+        "last baseline" => GridAlign::LastBaseline,
         "self-start" => return Ok(Alignment::SelfStart),
         "self-end" => return Ok(Alignment::SelfEnd),
         other => return unsupported(format!("grid item alignment={other}")),
@@ -47,7 +55,10 @@ impl Alignment {
 }
 
 fn arrangement(raw: &str) -> Result<(Arrange, bool)> {
-    let raw = raw.strip_prefix("unsafe ").unwrap_or(raw);
+    let raw = raw
+        .strip_prefix("unsafe ")
+        .or_else(|| raw.strip_prefix("safe "))
+        .unwrap_or(raw);
     let a = match raw {
         "normal" | "stretch" => return Ok((Arrange::Start, true)),
         "start" | "flex-start" => Arrange::Start,
@@ -80,6 +91,12 @@ fn track(raw: &str, stretch: bool) -> Result<Track> {
         // CSS's standalone fraction has an automatic minimum.
         return Ok(Track::MinMax(TrackMin::Content, TrackMax::Fr(f)));
     }
+    if raw == "min-content" {
+        return Ok(Track::MinMax(TrackMin::MinContent, TrackMax::MinContent));
+    }
+    if raw == "max-content" {
+        return Ok(Track::MinMax(TrackMin::MaxContent, TrackMax::Content));
+    }
     if raw == "auto" {
         return Ok(if stretch { Track::Auto } else { Track::Content });
     }
@@ -89,6 +106,13 @@ fn track(raw: &str, stretch: bool) -> Result<Track> {
         && let Some(limit) = breadth(args.trim(), "px")
     {
         return Ok(Track::FitContent(limit));
+    }
+    if let Some(limit) = raw
+        .strip_prefix("fit-content(")
+        .and_then(|s| s.strip_suffix(')'))
+        .and_then(|s| breadth(s, "%"))
+    {
+        return Ok(Track::FitContentPercent(limit / 100.));
     }
     if let Some(args) = raw
         .strip_prefix("minmax(")
@@ -100,6 +124,10 @@ fn track(raw: &str, stretch: bool) -> Result<Track> {
             TrackMin::Pixels(v)
         } else if let Some(v) = breadth(min, "%") {
             TrackMin::Percent(v / 100.)
+        } else if min == "min-content" {
+            TrackMin::MinContent
+        } else if min == "max-content" {
+            TrackMin::MaxContent
         } else if min == "auto" {
             TrackMin::Content
         } else {
@@ -111,6 +139,8 @@ fn track(raw: &str, stretch: bool) -> Result<Track> {
             TrackMax::Percent(v / 100.)
         } else if let Some(v) = breadth(max, "fr") {
             TrackMax::Fr(v)
+        } else if max == "min-content" {
+            TrackMax::MinContent
         } else if max == "auto" {
             if stretch {
                 TrackMax::Auto
@@ -130,16 +160,13 @@ fn track(raw: &str, stretch: bool) -> Result<Track> {
 // Split at whitespace outside functions. Commas and whitespace inside minmax
 // or repeat belong to the value of a single track.
 fn components(raw: &str) -> Result<Vec<&str>> {
-    if raw.contains(['[', ']']) {
-        return unsupported("named grid lines");
-    }
     let mut parts = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
     for (i, ch) in raw.char_indices() {
         match ch {
-            '(' => depth += 1,
-            ')' => {
+            '(' | '[' => depth += 1,
+            ')' | ']' => {
                 depth = depth
                     .checked_sub(1)
                     .ok_or("unbalanced grid track function")?
@@ -162,71 +189,165 @@ fn components(raw: &str) -> Result<Vec<&str>> {
     Ok(parts)
 }
 
-fn template(raw: &str, stretch: bool) -> Result<TrackAxis> {
+fn labels(raw: &str) -> Option<Vec<String>> {
+    raw.strip_prefix('[')?
+        .strip_suffix(']')
+        .map(|names| names.split_whitespace().map(str::to_owned).collect())
+}
+fn template(
+    raw: &str,
+    stretch: bool,
+    names: &mut LineNames,
+    repeat_names: &mut RepeatLineNames,
+) -> Result<TrackAxis> {
     if raw == "none" {
         return Ok(TrackAxis::default());
     }
-    let parts = components(raw)?;
+    if raw == "subgrid" || raw.starts_with("subgrid ") {
+        for (i, token) in components(raw)?.into_iter().skip(1).enumerate() {
+            names.insert(i, labels(token).ok_or("invalid subgrid line names")?);
+        }
+        return Ok(TrackAxis::Subgrid);
+    }
     let mut tracks = Vec::new();
-    for part in &parts {
-        if let Some(args) = part
+    let mut repeated = None;
+    for part in components(raw)? {
+        let local_names = if repeated.is_some() {
+            &mut repeat_names.suffix
+        } else {
+            &mut *names
+        };
+        if let Some(labels) = labels(part) {
+            local_names.entry(tracks.len()).or_default().extend(labels);
+        } else if let Some(args) = part
             .strip_prefix("repeat(")
             .and_then(|s| s.strip_suffix(')'))
         {
-            let (count, pattern) = args.split_once(',').ok_or("invalid grid repetition")?;
-            let pattern = components(pattern.trim())?
-                .into_iter()
-                .map(|s| track(s, stretch))
-                .collect::<Result<Vec<_>>>()?;
-            if pattern.is_empty() {
-                return unsupported("empty grid repetition");
-            }
-            if matches!(count.trim(), "auto-fit" | "auto-fill") {
-                if parts.len() != 1 || pattern.len() != 1 {
-                    return unsupported("mixed or multi-track automatic repetition");
-                }
-                let t = pattern[0];
-                return Ok(if count.trim() == "auto-fill" {
-                    TrackAxis::AutoFill {
-                        minimum: 0.,
-                        track: t,
-                    }
+            let (n, args) = args.split_once(',').ok_or("invalid grid repeat")?;
+            let mut group = Vec::new();
+            let mut group_names = LineNames::new();
+            for token in components(args.trim())? {
+                if let Some(labels) = labels(token) {
+                    group_names.entry(group.len()).or_default().extend(labels);
                 } else {
-                    TrackAxis::AutoFit {
-                        minimum: 0.,
-                        track: t,
+                    group.push(track(token, stretch)?);
+                }
+            }
+            if group.is_empty() {
+                return unsupported("empty grid repeat");
+            }
+            if matches!(n.trim(), "auto-fill" | "auto-fit") {
+                if repeated.is_some() {
+                    return unsupported("multiple automatic repeats");
+                }
+                repeat_names.group = group_names;
+                repeated = Some((std::mem::take(&mut tracks), group, n.trim() == "auto-fit"));
+            } else {
+                let count = n
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| "invalid repeat count")?;
+                for _ in 0..count {
+                    let start = tracks.len();
+                    if start == 65_536 {
+                        break;
                     }
-                });
+                    for (i, ns) in &group_names {
+                        if start + i <= 65_536 {
+                            local_names
+                                .entry(start + i)
+                                .or_default()
+                                .extend(ns.iter().cloned());
+                        }
+                    }
+                    tracks.extend(group.iter().take(65_536 - start));
+                }
             }
-            let count = count
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| "invalid grid repeat count")?;
-            if count == 0 {
-                return unsupported("zero grid repeat count");
-            }
-            // The native axis addresses 65,536 tracks. A pattern longer
-            // than that only needs its addressable prefix materialized.
-            let remaining = (usize::from(u16::MAX) + 1).saturating_sub(tracks.len());
-            let length = count.saturating_mul(pattern.len()).min(remaining);
-            tracks.extend(pattern.iter().copied().cycle().take(length));
         } else {
             let t = track(part, stretch)?;
-            if tracks.len() <= usize::from(u16::MAX) {
+            if tracks.len() < 65_536 {
                 tracks.push(t);
             }
         }
     }
+    if let Some((before, pattern, fit)) = repeated {
+        return Ok(TrackAxis::AutoRepeat {
+            before,
+            pattern,
+            after: tracks,
+            fit,
+        });
+    }
     Ok(TrackAxis::Tracks(tracks))
 }
 
+// Template areas form a rectangle. They also establish explicit tracks when
+// the template has fewer declarations than the area map.
+fn areas(raw: &str, grid: &mut TrackGrid, inline: Axis) -> Result<()> {
+    if raw == "none" {
+        return Ok(());
+    }
+    let mut rest = raw.trim();
+    let mut cols = None;
+    let mut rows = 0;
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    while !rest.is_empty() {
+        let quote = rest.chars().next().unwrap();
+        if !matches!(quote, '\'' | '"') {
+            return unsupported("unquoted grid-template-areas row");
+        }
+        let (row, tail) = rest[quote.len_utf8()..]
+            .split_once(quote)
+            .ok_or("unterminated grid-template-areas row")?;
+        let row = row.split_whitespace().collect::<Vec<_>>();
+        if row.is_empty() || cols.replace(row.len()).is_some_and(|n| n != row.len()) {
+            return unsupported("uneven grid-template-areas rows");
+        }
+        for (col, name) in row.into_iter().enumerate() {
+            if name.chars().all(|c| c == '.') {
+                continue;
+            }
+            let cell = grid.areas.entry(name.to_owned()).or_insert_with(|| {
+                let mut cell = Xy::default();
+                cell[inline] = col..col + 1;
+                cell[inline.other()] = rows..rows + 1;
+                cell
+            });
+            cell[inline].start = cell[inline].start.min(col);
+            cell[inline].end = cell[inline].end.max(col + 1);
+            cell[inline.other()].end = rows + 1;
+            *counts.entry(name.to_owned()).or_default() += 1;
+        }
+        rows += 1;
+        rest = tail.trim_start();
+    }
+    for (name, area) in &grid.areas {
+        if area.x.len().saturating_mul(area.y.len()) != counts[name] {
+            return unsupported("nonrectangular grid-template-areas");
+        }
+    }
+    for (a, count) in [(inline, cols.unwrap_or(0)), (inline.other(), rows)] {
+        if let TrackAxis::Tracks(tracks) = &mut grid.tracks[a] {
+            let start = tracks.len();
+            let pattern = &grid.implicit_pattern[a];
+            tracks.extend((start..count).map(|i| {
+                if pattern.is_empty() {
+                    grid.implicit[a]
+                } else {
+                    pattern[(i - start) % pattern.len()]
+                }
+            }));
+        }
+    }
+    Ok(())
+}
 pub fn container(style: &Style, writing: WritingContext) -> Result<(TrackGrid, GridContext)> {
     let inline = writing.axis(LogicalAxis::Inline);
     let mut grid = TrackGrid::default();
     let mut context = GridContext {
         inline,
         origins: writing.origins(),
-        explicit: Xy::new_symm(None),
+
         items: Xy::new_symm(Alignment::Value(GridAlign::Stretch)),
     };
     let (flow, dense) = match style.keyword("grid-auto-flow", "row") {
@@ -256,107 +377,161 @@ pub fn container(style: &Style, writing: WritingContext) -> Result<(TrackGrid, G
             "align-content",
         ),
     ] {
-        let (justify, stretch) = arrangement(style.keyword(content, "normal"))?;
+        let raw = style.keyword(content, "normal");
+        let (justify, stretch) = arrangement(raw)?;
+        grid.safe_justify[axis] = raw.starts_with("safe ");
         grid.justify[axis] = justify;
         context.items[axis] = alignment(style.keyword(items, "normal"))?;
         grid.align_items[axis] = context.items[axis].resolve(false);
-        grid.gap[axis] = px(style, gap)?;
-        grid.tracks[axis] = template(style.keyword(explicit, "none"), stretch)?;
-        if let TrackAxis::Tracks(ts) = &grid.tracks[axis] {
-            context.explicit[axis] = Some(ts.len());
+        grid.gap[axis] = box_css::gap(style, gap)?.0;
+        grid.tracks[axis] = template(
+            style.keyword(explicit, "none"),
+            stretch,
+            &mut grid.line_names[axis],
+            &mut grid.repeat_line_names[axis],
+        )?;
+        let ts = components(style.keyword(implicit, "auto"))?
+            .into_iter()
+            .map(|s| track(s, stretch))
+            .collect::<Result<Vec<_>>>()?;
+        grid.implicit[axis] = *ts.first().ok_or("empty implicit grid track list")?;
+        if ts.len() > 1 {
+            grid.implicit_pattern[axis] = ts;
         }
-        grid.implicit[axis] = track(style.keyword(implicit, "auto"), stretch)?;
     }
+    areas(
+        style.keyword("grid-template-areas", "none"),
+        &mut grid,
+        inline,
+    )?;
     Ok((grid, context))
 }
 
-#[derive(Clone, Copy)]
-enum Line {
-    Auto,
-    Number(i32),
-    Span(u16),
-}
-
-fn line(raw: &str) -> Result<Line> {
+fn line(raw: &str) -> Result<GridLine> {
     if raw == "auto" {
-        return Ok(Line::Auto);
+        return Ok(GridLine::Auto);
     }
-    if let Some(raw_span) = raw.strip_prefix("span ") {
-        let value = raw_span
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| format!("unsupported grid span={raw_span}"))?;
-        if value == 0 {
-            return unsupported("zero grid span");
+    let mut span = false;
+    let mut n = None;
+    let mut name = None;
+    for token in raw.split_whitespace() {
+        if token == "span" && !span {
+            span = true;
+        } else if let Ok(index) = token.parse::<i32>() {
+            if index == 0 || n.replace(index).is_some() {
+                return unsupported("invalid grid line index");
+            }
+        } else if name.replace(token.to_owned()).is_some() {
+            return unsupported("invalid grid line name");
         }
-        return u16::try_from(value)
-            .map(Line::Span)
-            .map_err(|_| "grid span exceeds native representation".into());
     }
-    if let Ok(n) = raw.parse::<i32>() {
-        if n != 0 {
-            return Ok(Line::Number(n));
-        }
-        return unsupported("zero grid line number");
-    }
-    unsupported(format!("named or unsupported grid line={raw}"))
-}
-
-fn placement(start: Line, end: Line, count: Option<usize>) -> Result<(Option<u16>, u16)> {
-    let number = |n: i32| -> Result<i64> {
-        let n = i64::from(n);
-        Ok(if n > 0 {
-            n - 1
-        } else {
-            count.ok_or("negative grid line against auto-repeat")? as i64 + 1 + n
+    if span {
+        Ok(GridLine::Span {
+            count: u16::try_from(n.unwrap_or(1)).map_err(|_| "invalid span count")?,
+            name,
         })
-    };
-    let (start, span) = match (start, end) {
-        (Line::Number(a), Line::Number(b)) => {
-            let (a, b) = (number(a)?, number(b)?);
-            (Some(a.min(b)), a.abs_diff(b).max(1))
-        }
-        (Line::Number(a), Line::Span(n)) => (Some(number(a)?), u64::from(n)),
-        (Line::Span(n), Line::Number(b)) => (Some(number(b)? - i64::from(n)), u64::from(n)),
-        (Line::Number(a), _) => (Some(number(a)?), 1),
-        (_, Line::Number(b)) => (Some(number(b)? - 1), 1),
-        (Line::Span(n), _) | (_, Line::Span(n)) => (None, u64::from(n)),
-        _ => (None, 1),
-    };
-    if start.is_some_and(|n| n < 0) {
-        return unsupported("grid tracks preceding the explicit grid");
+    } else if let Some(name) = name {
+        Ok(GridLine::Named {
+            name,
+            occurrence: n.unwrap_or(1),
+            area_edge: n.is_none(),
+        })
+    } else {
+        Ok(GridLine::Index(n.ok_or("empty grid line")?))
     }
-    let span = u16::try_from(span).map_err(|_| "grid span exceeds native representation")?;
-    let start = start.map(|n| u16::try_from(n).unwrap_or(u16::MAX));
-    Ok((start, span))
 }
-
-pub fn item(style: &Style, context: GridContext, writing: WritingContext) -> Result<GridItem> {
-    let mut item = GridItem::default();
-    for (axis, start, end, align) in [
+fn declared_lines(style: &Style) -> Result<[[GridLine; 2]; 2]> {
+    let mut row = [GridLine::Auto, GridLine::Auto];
+    let mut col = row.clone();
+    if let Some(area) = style.get("grid-area") {
+        let spec = area
+            .split('/')
+            .map(|v| line(v.trim()))
+            .collect::<Result<Vec<_>>>()?;
+        let implicit = |l: &GridLine| match l {
+            GridLine::Named {
+                area_edge: true, ..
+            } => l.clone(),
+            _ => GridLine::Auto,
+        };
+        if spec.is_empty() || spec.len() > 4 {
+            return unsupported("invalid grid-area");
+        }
+        row[0] = spec[0].clone();
+        col[0] = spec.get(1).cloned().unwrap_or_else(|| implicit(&row[0]));
+        row[1] = spec.get(2).cloned().unwrap_or_else(|| implicit(&row[0]));
+        col[1] = spec.get(3).cloned().unwrap_or_else(|| implicit(&col[0]));
+    }
+    for (axis, pair, start, end) in [
         (
-            context.inline,
+            "grid-column",
+            &mut col,
             "grid-column-start",
             "grid-column-end",
-            "justify-self",
         ),
-        (
-            context.inline.other(),
-            "grid-row-start",
-            "grid-row-end",
-            "align-self",
-        ),
+        ("grid-row", &mut row, "grid-row-start", "grid-row-end"),
     ] {
-        (item.start[axis], item.span[axis]) = placement(
-            line(style.keyword(start, "auto"))?,
-            line(style.keyword(end, "auto"))?,
-            context.explicit[axis],
-        )?;
-        let a = match style.keyword(align, "auto") {
+        if let Some(raw) = style.get(axis) {
+            let (a, b) = raw
+                .split_once('/')
+                .map_or((raw, None), |(a, b)| (a, Some(b)));
+            pair[0] = line(a.trim())?;
+            pair[1] = if let Some(b) = b {
+                line(b.trim())?
+            } else if matches!(
+                pair[0],
+                GridLine::Named {
+                    area_edge: true,
+                    ..
+                }
+            ) {
+                pair[0].clone()
+            } else {
+                GridLine::Auto
+            };
+        }
+        if let Some(raw) = style.get(start) {
+            pair[0] = line(raw)?;
+        }
+        if let Some(raw) = style.get(end) {
+            pair[1] = line(raw)?;
+        }
+    }
+    Ok([col, row])
+}
+pub(super) fn placement(
+    style: &Style,
+    writing: WritingContext,
+) -> Result<Xy<Option<[GridLine; 2]>>> {
+    physical_lines(style, writing.axis(LogicalAxis::Inline))
+}
+fn physical_lines(style: &Style, inline: Axis) -> Result<Xy<Option<[GridLine; 2]>>> {
+    let mut lines = Xy::default();
+    for (a, pair) in [inline, inline.other()]
+        .into_iter()
+        .zip(declared_lines(style)?)
+    {
+        if pair != [GridLine::Auto, GridLine::Auto] {
+            lines[a] = Some(pair);
+        }
+    }
+    Ok(lines)
+}
+pub fn item(
+    style: &Style,
+    context: GridContext,
+    writing: WritingContext,
+) -> Result<(GridItem, Xy<Option<[GridLine; 2]>>)> {
+    let mut item = GridItem::default();
+    for (axis, key) in [
+        (context.inline, "justify-self"),
+        (context.inline.other(), "align-self"),
+    ] {
+        let a = match style.keyword(key, "auto") {
             "auto" => context.items[axis],
             raw => alignment(raw)?,
         };
         item.align[axis] = Some(a.resolve(writing.origins()[axis] != context.origins[axis]));
     }
-    Ok(item)
+    Ok((item, physical_lines(style, context.inline)?))
 }
