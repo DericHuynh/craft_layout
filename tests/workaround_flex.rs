@@ -43,8 +43,6 @@ fn a_nested_title_yields_the_actions_space_without_a_zero_minimum() {
     let row = tree.add_node(&tree.root(), stack(Axis::X, 8.)).unwrap();
     let mut slot_params = box_size(Size::Fill, Size::Fill);
     let slot = tree.add_node(&row, slot_params).unwrap();
-    tree.set_rules(&slot, overflow(Overflow::Clip, Overflow::Visible))
-        .unwrap();
     let title = tree
         .add_node(
             &slot,
@@ -57,25 +55,37 @@ fn a_nested_title_yields_the_actions_space_without_a_zero_minimum() {
     let action = tree
         .add_node(&row, box_size(Size::Pixels(40.), Size::Fill))
         .unwrap();
-    // Explicit zero is a CSS workaround. Check the default before applying it.
-    for min in [None, Some(0.), Some(160.)] {
-        slot_params.min_size.x = min.map(Size::Pixels);
-        tree.update_node_params(&slot, slot_params).unwrap();
-        for width in [224., 144., 224.] {
-            tree.solve_layout_with_measure(Xy::new(width, 32.), |_, _, _| Xy::new(288., 16.));
-            let slot_width = (width - 48.).max(min.unwrap_or(0.));
-            assert!(tree.rule_issues().is_empty(), "{:?}", tree.rule_issues());
-            assert!(tree.warnings().is_empty(), "{:?}", tree.warnings());
-            assert_eq!(tree.layout(&slot).unwrap().x, [0., slot_width]);
-            assert_eq!(
-                tree.layout(&action).unwrap().x,
-                [slot_width + 8., slot_width + 48.]
-            );
-            assert_eq!(tree.layout(&title).unwrap().x, [0., 288.]);
-            assert_eq!(
-                tree.view_geometry(&title).unwrap().clip.x,
-                [0., slot_width.min(width)]
-            );
+    // Allocation and clipping are separate requests. Exercise both on the same tree.
+    for paint in [Overflow::Visible, Overflow::Clip] {
+        tree.set_rules(&slot, overflow(paint, Overflow::Visible))
+            .unwrap();
+        // Explicit zero is a CSS workaround. Check the default before applying it.
+        for min in [None, Some(0.), Some(160.)] {
+            slot_params.min_size.x = min.map(Size::Pixels);
+            tree.update_node_params(&slot, slot_params).unwrap();
+            for width in [224., 144., 224.] {
+                tree.solve_layout_with_measure(Xy::new(width, 32.), |_, _, _| Xy::new(288., 16.));
+                let slot_width = (width - 48.).max(min.unwrap_or(0.));
+                assert!(tree.rule_issues().is_empty(), "{:?}", tree.rule_issues());
+                assert!(tree.warnings().is_empty(), "{:?}", tree.warnings());
+                assert_eq!(tree.layout(&slot).unwrap().x, [0., slot_width]);
+                assert_eq!(
+                    tree.layout(&action).unwrap().x,
+                    [slot_width + 8., slot_width + 48.]
+                );
+                assert_eq!(tree.layout(&title).unwrap().x, [0., 288.]);
+                assert_eq!(
+                    tree.view_geometry(&title).unwrap().clip.x,
+                    [
+                        0.,
+                        if paint == Overflow::Clip {
+                            slot_width.min(width)
+                        } else {
+                            width
+                        }
+                    ]
+                );
+            }
         }
     }
 }

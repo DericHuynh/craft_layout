@@ -46,6 +46,21 @@ pub(super) struct FrameNode {
 }
 
 impl FrameNode {
+    pub(super) fn inner_size(&self, outer: Xy<f32>) -> Xy<f32> {
+        let inner = |a: Axis| (outer[a] - self.effective.padding[a].iter().sum::<f32>()).max(0.);
+        Xy::new(inner(Axis::X), inner(Axis::Y))
+    }
+
+    pub(super) fn content_offset(&self, outer: Xy<f32>) -> Xy<f32> {
+        let leading = |a: Axis| {
+            crate::placement_geometry::inner_start::<crate::placement_geometry::RustFloat>(
+                [0., outer[a]],
+                self.effective.padding[a][0],
+            )
+        };
+        Xy::new(leading(Axis::X), leading(Axis::Y))
+    }
+
     /// Percentage sizes depend on the tracks that the intrinsic pass is measuring,
     /// including content-box percentages whose final border size is in pixels.
     pub(super) fn relative_size(&self, axis: Axis) -> bool {
@@ -168,7 +183,7 @@ impl<'a> Frame<'a> {
         Some(idx)
     }
 
-    pub(super) fn content_size(&self, i: usize) -> Xy<f32> {
+    pub(super) fn outer_size(&self, i: usize) -> Xy<f32> {
         let n = &self.nodes[i];
         let mut extent = super::size(n.rect);
         for a in [Axis::X, Axis::Y] {
@@ -191,9 +206,16 @@ impl<'a> Frame<'a> {
                     .min(resolve(n.effective.max_size[a]).unwrap_or(f32::INFINITY))
                     .max(resolve(n.effective.min_size[a]).unwrap_or(0.));
             }
-            extent[a] = (extent[a] - n.effective.padding[a].iter().sum::<f32>()).max(0.);
         }
         extent
+    }
+
+    pub(super) fn content_size(&self, i: usize) -> Xy<f32> {
+        self.nodes[i].inner_size(self.outer_size(i))
+    }
+
+    pub(super) fn content_offset(&self, i: usize) -> Xy<f32> {
+        self.nodes[i].content_offset(self.outer_size(i))
     }
 
     pub(super) fn is_intrinsic(&self, i: usize, axis: Axis, size: Size) -> bool {
@@ -250,11 +272,12 @@ impl<'a> Frame<'a> {
         }
     }
     pub(super) fn place(&mut self, i: usize, parent: usize, rect: XyRect) {
-        let inner = self.content_size(parent);
+        let outer = self.outer_size(parent);
+        let inner = self.nodes[parent].inner_size(outer);
+        let offset = self.nodes[parent].content_offset(outer);
         let flipped = self.nodes[parent].effective.children_origin_flipped;
-        let padding = self.nodes[parent].effective.padding;
         let n = &mut self.nodes[i];
-        n.allocation_origin = Some(Xy::new(rect.x[0] + padding.x[0], rect.y[0] + padding.y[0]));
+        n.allocation_origin = Some(Xy::new(rect.x[0] + offset.x, rect.y[0] + offset.y));
         n.assigned = true;
         n.effective.free_placement = true;
         for a in [Axis::X, Axis::Y] {
@@ -769,6 +792,7 @@ impl State {
                     super::Placement::Fixed(_)
                         | super::Placement::Absolute { .. }
                         | super::Placement::Sticky(_)
+                        | super::Placement::StickyInGridArea(_)
                 )
                 .then_some((n.id.key(), (n.base, n.block_static_y)))
             }));

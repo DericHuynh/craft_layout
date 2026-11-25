@@ -230,9 +230,20 @@ fn a_sticky_title_keeps_its_margin_and_never_moves_against_a_top_only_inset() {
 
 #[test]
 fn a_heading_can_stick_across_the_grid_or_within_one_section() {
-    for (wrap_in_section, tops) in [
-        (false, [20., 2., 2., 2., 20.]),
-        (true, [20., 2., -16., -24., 20.]),
+    let top = Xy::new([None; 2], [Some(Length::px(2.)), None]);
+    for (placement, wrap_in_section, tops) in [
+        (Placement::Sticky(top), false, [20., 2., 2., 2., 20.]),
+        (Placement::Sticky(top), true, [20., 2., -16., -24., 20.]),
+        (
+            Placement::StickyInGridArea(top),
+            false,
+            [20., 2., -16., -24., 20.],
+        ),
+        (
+            Placement::StickyInGridArea(top),
+            true,
+            [20., 2., -16., -24., 20.],
+        ),
     ] {
         let mut tree = LayoutTree::<()>::new();
         let pane = tree.add_node(&tree.root(), column(120., 60.)).unwrap();
@@ -270,7 +281,7 @@ fn a_heading_can_stick_across_the_grid_or_within_one_section() {
         tree.set_rules(
             &header,
             NodeRules {
-                placement: Placement::Sticky(Xy::new([None; 2], [Some(Length::px(2.)), None])),
+                placement,
                 ..Default::default()
             },
         )
@@ -325,6 +336,208 @@ fn a_bottom_sticky_action_keeps_the_sections_leading_padding_and_margin() {
             tree.view_geometry(&action).unwrap().rect.y,
             [top, top + 16.]
         );
+        assert!(tree.rule_issues().is_empty());
+    }
+}
+
+#[test]
+fn a_sticky_spanning_item_uses_its_current_area_inside_a_scrolling_grid() {
+    use keru_layout::tracks::GridLine;
+    let mut tree = LayoutTree::<()>::new();
+    let mut panel = tile(120., 80.);
+    panel.padding.y = [8., 4.];
+    let grid = tree.add_node(&tree.root(), panel).unwrap();
+    let heading = tree.add_node(&grid, tile(120., 16.)).unwrap();
+    let last_row = tree.add_node(&grid, tile(120., 96.)).unwrap();
+    tree.set_rules(
+        &last_row,
+        NodeRules {
+            grid_lines: Xy::new(None, Some([GridLine::Index(3), GridLine::Index(4)])),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (first_row, end_line, offset, y) in [
+        (36., 3, 0., 8.),
+        (36., 3, 40., 2.),
+        (36., 3, 80., -12.),
+        (36., 2, 80., -52.),
+        (46., 3, 80., -2.),
+        (36., 3, 0., 8.),
+    ] {
+        let panel_rules = NodeRules {
+            grid: Some(TrackGrid {
+                tracks: Xy::new(
+                    TrackAxis::repeat(1, Track::Pixels(120.)),
+                    TrackAxis::Tracks(vec![
+                        Track::Pixels(first_row),
+                        Track::Pixels(36.),
+                        Track::Pixels(96.),
+                    ]),
+                ),
+                gap: Xy::new(0., 4.),
+                align_items: Xy::new_symm(GridAlign::Start),
+                ..Default::default()
+            }),
+            ..scroll(ScrollStyle {
+                overflow: Xy::new(Overflow::Visible, Overflow::Auto),
+                ..Default::default()
+            })
+        };
+        tree.set_rules(&grid, panel_rules).unwrap();
+        let heading_rules = NodeRules {
+            placement: Placement::StickyInGridArea(Xy::new(
+                [None; 2],
+                [Some(Length::px(2.)), None],
+            )),
+            grid_lines: Xy::new(None, Some([GridLine::Index(1), GridLine::Index(end_line)])),
+            ..Default::default()
+        };
+        tree.set_rules(&heading, heading_rules).unwrap();
+        tree.set_scroll_offset(&grid, Xy::new(0., offset)).unwrap();
+        solve(&mut tree, Xy::new(150., 140.));
+        assert_eq!(tree.view_geometry(&grid).unwrap().offset.y, offset);
+        assert_eq!(tree.view_geometry(&heading).unwrap().rect.y, [y, y + 16.]);
+        assert!(tree.rule_issues().is_empty());
+    }
+}
+
+#[test]
+fn a_timeline_chip_can_stick_to_one_column_or_its_full_span() {
+    use keru_layout::tracks::GridLine;
+    let mut tree = LayoutTree::<()>::new();
+    let pane = tree.add_node(&tree.root(), tile(90., 34.)).unwrap();
+    tree.set_rules(
+        &pane,
+        NodeRules {
+            scroll: ScrollStyle {
+                overflow: Xy::new(Overflow::Auto, Overflow::Visible),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let timeline = tree.add_node(&pane, tile(221., 34.)).unwrap();
+    tree.set_rules(
+        &timeline,
+        NodeRules {
+            grid: Some(TrackGrid {
+                tracks: Xy::new(
+                    TrackAxis::Tracks(vec![
+                        Track::Pixels(31.),
+                        Track::Pixels(67.),
+                        Track::Pixels(109.),
+                    ]),
+                    TrackAxis::repeat(1, Track::Pixels(34.)),
+                ),
+                gap: Xy::new(7., 0.),
+                align_items: Xy::new_symm(GridAlign::Start),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let chip = tree.add_node(&timeline, tile(18., 12.)).unwrap();
+    let insets = Xy::new([Some(Length::px(5.)), None], [None; 2]);
+    for (span_to, placement, expected) in [
+        (
+            3,
+            Placement::StickyInGridArea(insets),
+            [38., 8., 5., -3., -23., 38.],
+        ),
+        (3, Placement::Sticky(insets), [38., 8., 5., 5., 5., 38.]),
+        (
+            4,
+            Placement::StickyInGridArea(insets),
+            [38., 8., 5., 5., 5., 38.],
+        ),
+        (
+            3,
+            Placement::StickyInGridArea(insets),
+            [38., 8., 5., -3., -23., 38.],
+        ),
+    ] {
+        tree.set_rules(
+            &chip,
+            NodeRules {
+                grid_lines: Xy::new(Some([GridLine::Index(2), GridLine::Index(span_to)]), None),
+                placement,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (offset, want) in [0., 30., 50., 90., 110., 0.].into_iter().zip(expected) {
+            tree.set_scroll_offset(&pane, Xy::new(offset, 0.)).unwrap();
+            solve(&mut tree, Xy::new(90., 34.));
+            let chip_x = tree.view_geometry(&chip).unwrap().rect.x;
+            assert_eq!(chip_x, [want, want + 18.]);
+            assert_eq!(
+                tree.view_geometry(&pane).unwrap().scroll_range.x,
+                [0., 131.]
+            );
+            assert!(tree.rule_issues().is_empty() && tree.warnings().is_empty());
+        }
+    }
+}
+
+#[test]
+fn a_squeezed_grid_keeps_content_and_padding_box_references_distinct() {
+    use keru_layout::layout_rules::BoxReference;
+    use keru_layout::tracks::GridLine;
+    let mut tree = LayoutTree::<()>::new();
+    let mut style = tile(44., 20.);
+    style.padding.x = [18.; 2];
+    let panel = tree.add_node(&tree.root(), style).unwrap();
+    tree.set_rules(
+        &panel,
+        NodeRules {
+            grid: Some(TrackGrid {
+                tracks: Xy::new(
+                    TrackAxis::repeat(1, Track::Fr(1.)),
+                    TrackAxis::repeat(1, Track::Pixels(20.)),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let marker = tree.add_node(&panel, tile(0., 6.)).unwrap();
+    let insets = Xy::new([Some(Length::px(0.)); 2], [None; 2]);
+    tree.set_rules(
+        &marker,
+        NodeRules {
+            placement: Placement::StickyInGridArea(insets),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut fill = tile(0., 6.);
+    fill.size.x = Size::Fill;
+    let overlay = tree.add_node(&panel, fill).unwrap();
+    tree.set_rules(
+        &overlay,
+        NodeRules {
+            grid_lines: Xy::new(None, Some([GridLine::Index(1), GridLine::Index(2)])),
+            placement: Placement::Absolute {
+                containing: BoxReference::Node((*panel).clone()),
+                insets,
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (width, content_start) in [(44., 18.), (30., 18.), (10., 10.), (0., 0.), (44., 18.)] {
+        style.size.x = Size::Pixels(width);
+        tree.update_node_params(&panel, style).unwrap();
+        solve(&mut tree, Xy::new(120., 60.));
+        assert_eq!(
+            tree.view_geometry(&marker).unwrap().rect.x,
+            [content_start; 2]
+        );
+        assert_eq!(tree.view_geometry(&overlay).unwrap().rect.x, [0., width]);
         assert!(tree.rule_issues().is_empty());
     }
 }

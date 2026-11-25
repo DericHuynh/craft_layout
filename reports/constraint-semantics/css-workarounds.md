@@ -4,6 +4,8 @@ We took published CSS recipes, wrote down the component geometry we wanted, and 
 
 The [follow-up edge cases](edge-cases.md) cover grid minima, sticky limits, wrapping and writing direction, including a replay in Chrome 158.
 
+The [cross-engine follow-up](author-intent.md) measures the original repairs against native Craft, Taffy, Yoga, Chromium and Godot.
+
 ## Public Rust API
 
 | Component and original recipe | What the author asked for | What Craft did |

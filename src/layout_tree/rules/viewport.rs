@@ -71,9 +71,11 @@ pub enum Placement {
     Fixed(Edges),
     /// Keep the normal slot and constrain the visual box to its nearest
     /// scrollport on each axis. The parent's content edges and the sticky
-    /// item's margins limit its travel. A section inside a grid row can
-    /// provide a row-local boundary for its sticky children.
+    /// item's margins limit its travel.
     Sticky(Edges),
+    /// Stick within the item's assigned track-grid area, including all spanned tracks.
+    /// Outside a track grid, the parent's content box provides the boundary.
+    StickyInGridArea(Edges),
     /// Place a popup next to another box using ordered fallback sides.
     Anchor {
         /// Stable reference to another live node.
@@ -176,7 +178,7 @@ impl ViewGeometry {
 fn viewport(size: Xy<f32>) -> XyRect {
     Xy::new([0., size.x], [0., size.y])
 }
-fn shifted(mut r: XyRect, d: Xy<f32>) -> XyRect {
+pub(super) fn shifted(mut r: XyRect, d: Xy<f32>) -> XyRect {
     for a in [Axis::X, Axis::Y] {
         r[a][0] += d[a];
         r[a][1] += d[a];
@@ -194,8 +196,9 @@ pub(super) fn gutter(style: ScrollStyle, overflowing: Xy<bool>) -> Xy<f32> {
 }
 fn inset_box(mut rect: XyRect, edges: Xy<[f32; 2]>) -> XyRect {
     for a in [Axis::X, Axis::Y] {
-        rect[a][0] += edges[a][0];
-        rect[a][1] = (rect[a][1] - edges[a][1]).max(rect[a][0]);
+        rect[a] = crate::placement_geometry::inner_range::<crate::placement_geometry::RustFloat>(
+            rect[a], edges[a],
+        );
     }
     rect
 }
@@ -361,15 +364,19 @@ pub(super) fn apply(frame: &mut Frame<'_>, i: usize, issues: &mut Vec<RuleIssue>
         ),
     );
     let parent_rect = frame.nodes[parent].rect;
-    let pad = frame.nodes[parent].effective.padding;
+    let offset = frame.content_offset(parent);
     let local = shifted(
         rect,
-        Xy::new(-parent_rect.x[0] - pad.x[0], -parent_rect.y[0] - pad.y[0]),
+        Xy::new(-parent_rect.x[0] - offset.x, -parent_rect.y[0] - offset.y),
     );
     frame.place(i, parent, local);
 }
 
 fn port(node: &super::driver::FrameNode) -> XyRect {
+    port_in(node, node.rect)
+}
+
+pub(super) fn port_in(node: &super::driver::FrameNode, rect: XyRect) -> XyRect {
     let mut edges = node.rule.box_model.border;
     for a in [Axis::X, Axis::Y] {
         let flip = node
@@ -379,7 +386,7 @@ fn port(node: &super::driver::FrameNode) -> XyRect {
             .is_some_and(|origin| origin[a]);
         edges[a][usize::from(!flip)] += node.gutter[a];
     }
-    inset_box(node.rect, edges)
+    inset_box(rect, edges)
 }
 
 fn delta(to: XyRect, from: XyRect) -> Xy<f32> {
@@ -563,7 +570,21 @@ fn stick(
     frame: &Frame<'_>,
 ) -> XyRect {
     let containing = &views[parent];
-    let content_box = inset_box(containing.rect, frame.nodes[parent].effective.padding);
+    let node = &frame.nodes[child];
+    let grid_area = match node.rule.placement {
+        Placement::StickyInGridArea(_) => frame.grid_positioned_areas.get(&node.id.key()),
+        _ => None,
+    };
+    let content_box = match grid_area {
+        Some((_, local)) => shifted(
+            *local,
+            Xy::new(
+                containing.rect.x[0] - containing.offset.x,
+                containing.rect.y[0] - containing.offset.y,
+            ),
+        ),
+        None => inset_box(containing.rect, frame.nodes[parent].effective.padding),
+    };
     let window = viewport(frame.window);
     for a in [Axis::X, Axis::Y] {
         let [before, after] = insets[a];
@@ -580,7 +601,7 @@ fn stick(
         let normal = rect[a][0];
         let wanted = normal.clamp(low, high.max(low)) - normal;
         let mut bounds = content_box[a];
-        if nearest[a] == Some(parent) {
+        if grid_area.is_none() && nearest[a] == Some(parent) {
             // The content box moves with the parent's scrollable contents.
             // Extend it by the overflow on each side, preserving its padding.
             bounds[0] += containing.content[a][0] - containing.offset[a];
@@ -684,7 +705,7 @@ pub(super) fn publish(
                         ),
                     );
                 }
-                Placement::Sticky(insets) => {
+                Placement::Sticky(insets) | Placement::StickyInGridArea(insets) => {
                     rect = stick(rect, insets, containing_scroll, p, i, &views, frame)
                 }
                 Placement::Fixed(insets) => {

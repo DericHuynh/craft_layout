@@ -231,9 +231,8 @@ fn an_action_auto_margin_uses_only_the_space_on_its_current_line() {
     }
 }
 
-// Simple native wraps use pixel margins. The managed flex declaration also distributes auto margins.
 #[test]
-fn switching_a_toolbar_to_managed_flex_enables_end_pushing_auto_margins() {
+fn a_trailing_action_stays_at_the_edge_when_switching_between_simple_and_managed_wrap() {
     let mut tree = LayoutTree::<()>::new();
     let mut style = at_start(Size::Fill, Size::FitContent);
     style.children_layout = keru_layout::ChildrenLayout::Wrap {
@@ -260,13 +259,69 @@ fn switching_a_toolbar_to_managed_flex_enables_end_pushing_auto_margins() {
             },
         )
         .unwrap();
-        for (window, x_simple, x_managed, y) in [(106., 80., 86., 0.), (99., 0., 79., 14.)] {
+        for (window, x, y) in [(106., 86., 0.), (99., 79., 14.)] {
             solve(&mut tree, window);
-            let x = if managed { x_managed } else { x_simple };
             assert_eq!(
                 tree.layout(&action).unwrap(),
                 Xy::new([x, x + 20.], [y, y + 10.])
             );
+        }
+    }
+}
+
+#[test]
+fn a_toolbar_resolves_fill_before_automatic_margins() {
+    let mut tree = LayoutTree::<()>::new();
+    let bar = tree.root();
+    let stack = keru_layout::ChildrenLayout::Stack {
+        axis: keru_layout::Axis::X, arrange: Arrange::Center, spacing: 4.,
+    };
+    tree.update_node_params(&bar, LayoutParams {
+        children_layout: stack, ..LayoutParams::DEFAULT
+    }).unwrap();
+    let body = tree.add_node(&bar, at_start(Size::Fill, Size::Pixels(10.))).unwrap();
+    let mut action = at_start(Size::Pixels(20.), Size::Pixels(10.));
+    action.margin.x[0] = Margin::AUTO;
+    let action = tree.add_node(&bar, action).unwrap();
+    for (maximum, body_end) in [(None, 76.), (Some(Size::Pixels(30.)), 30.), (None, 76.)] {
+        let mut style = *tree.params(&body).unwrap();
+        style.max_size.x = maximum;
+        tree.update_node_params(&body, style).unwrap();
+        solve(&mut tree, 100.);
+        assert_eq!(tree.layout(&body).unwrap().x, [0., body_end]);
+        assert_eq!(tree.layout(&action).unwrap().x, [80., 100.]);
+    }
+}
+
+#[cfg(feature = "batch-pilot")]
+#[test]
+fn appending_or_removing_a_tail_repositions_preceding_automatic_margins() {
+    for batch in [false, true] {
+        let mut tree = LayoutTree::<()>::new();
+        let root = tree.root();
+        tree.update_node_params(&root, LayoutParams {
+            children_layout: keru_layout::ChildrenLayout::Stack {
+                axis: keru_layout::Axis::Y, arrange: Arrange::Start, spacing: 5.,
+            },
+            ..LayoutParams::DEFAULT
+        }).unwrap();
+        tree.add_node(&root, at_start(Size::Pixels(12.), Size::Pixels(18.))).unwrap();
+        let mut chip = at_start(Size::Pixels(12.), Size::Pixels(20.));
+        chip.margin.y = [Margin::AUTO; 2];
+        let chip = tree.add_node(&root, chip).unwrap();
+        let mut tail = None;
+        for (include_tail, y) in [(false, 45.5), (true, 38.), (false, 45.5), (true, 38.)] {
+            if include_tail {
+                tail = Some(tree.add_node(&root, at_start(Size::Pixels(12.), Size::Pixels(10.))).unwrap());
+            } else if let Some(node) = tail.take() {
+                tree.remove(&node).unwrap();
+            }
+            let view = Xy::new(50., 88.);
+            if batch { tree.solve_layout_batch(view).unwrap(); } else { tree.solve_layout(view); }
+            assert_eq!(tree.layout(&chip).unwrap().y, [y, y + 20.]);
+            if let Some(node) = &tail {
+                assert_eq!(tree.layout(node).unwrap().y, [78., 88.]);
+            }
         }
     }
 }

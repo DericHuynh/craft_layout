@@ -1,5 +1,7 @@
 # Constraint resolution and authoring review
 
+The [direct layout comparison](author-intent.md) tracks the author declarations, independent component trials, earlier workarounds and measured results from Craft, Taffy, Yoga, Chromium and Godot.
+
 ## Complete translation of the pinned corpus
 
 All 6,604 Taffy XML fixtures at `4e59968eda29ceeb0bbaeb3993c8cd38baa3d0a6` build a Craft tree, run the native solver and reach geometry comparison. Compared with `124551a`, all 3,450 previously unsupported inputs now run. Every earlier browser match still passes. Four earlier native exceptions for the static position of an absolute child now also match the browser because a preceding block sibling supplies the source position.

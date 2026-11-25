@@ -103,7 +103,7 @@ fn prepare<T: StartActions + ?Sized, const VERTICAL: bool>(
         record.values[main_regular] = main_size;
         record.values[main_final] = main_size;
         #[cfg(any(feature = "incremental", verus_keep_ghost))]
-        let row = if count < expected && matches!(*params.position.component(cross), Pos::Start) {
+        let row = if count < expected && !params.has_auto_margin(main) && matches!(*params.position.component(cross), Pos::Start) {
             let [leading, trailing] = *params.margin.component(main);
             let [cross_leading, _] = *params.margin.component(cross);
             let trailing = T::Float::margin(trailing);

@@ -4,7 +4,7 @@ use crate::placement_adapter::{stable_edges, stack_style};
 use crate::placement_geometry::{RustFloat, inner_range};
 use crate::placement_work::PlacementWork;
 use crate::solve::{Kind, slot_index};
-use crate::{Arrange, Axis, ChildrenLayout, NodeLayoutData, Pos, TreeAdapter, Xy};
+use crate::{Arrange, Axis, ChildrenLayout, LayoutParams, NodeLayoutData, Pos, TreeAdapter, Xy};
 
 type Edges = [[f32; 2]; 2];
 
@@ -40,6 +40,14 @@ impl StackPlacement {
     }
 }
 
+// Specialised stack publishers advance from each preceding rectangle. A
+// line-wide share requires the ordinary placement cursor.
+fn needs_auto_margin_share(node: Node, params: &LayoutParams, styles: &[LayoutParams]) -> bool {
+    !zero_margins(params) && node.parent().is_some_and(|parent| {
+        matches!(styles[parent].children_layout, ChildrenLayout::Stack { axis, .. } if params.has_auto_margin(axis))
+    })
+}
+
 impl Frame {
     /// A forward, start-aligned Stack needs only its next item and cursor.
     /// Keep just the pending branches for this common unsnapped geometry.
@@ -56,6 +64,7 @@ impl Frame {
             self.nodes.iter().zip(&self.params).all(|(node, params)| {
                 node.is_none_or(|node| {
                     !params.free_placement
+                        && !needs_auto_margin_share(node, params, &self.params)
                         && (node.first().is_none()
                             || (!params.children_origin_flipped.x
                                 && !params.children_origin_flipped.y
@@ -212,6 +221,7 @@ impl Frame {
             self.nodes.iter().zip(&self.params).all(|(node, params)| {
                 node.is_none_or(|node| {
                     !params.free_placement
+                        && !needs_auto_margin_share(node, params, &self.params)
                         && (node.first().is_none()
                             || (!params.children_origin_flipped.x
                                 && !params.children_origin_flipped.y

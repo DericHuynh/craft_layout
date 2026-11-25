@@ -133,10 +133,15 @@ impl FloatBounds for RustFloat {
 
 #[cfg(verus_keep_ghost)]
 verus! {
+pub(crate) open spec fn padded_start<F: FrameFloat>(edges: [f32; 2], padding: f32) -> f32 {
+    let start = F::sum(edges[0], padding);
+    if strict::<F>(0.0, padding) && strict::<F>(edges[1], start) { edges[1] } else { start }
+}
+
 pub(crate) open spec fn padded_range<F: FrameFloat>(edges: [f32; 2], padding: [f32; 2]) -> [f32; 2] {
-    let [start, end] = edges;
-    let [pad_start, pad_end] = padding;
-    [F::sum(start, pad_start), F::difference(end, pad_end)]
+    let start = padded_start::<F>(edges, padding[0]);
+    let end = F::difference(edges[1], padding[1]);
+    [start, if strict::<F>(end, start) { start } else { end }]
 }
 
 pub(crate) open spec fn centered<F: FrameFloat>(start: f32, end: f32, size: f32) -> [f32; 2] {
@@ -146,13 +151,22 @@ pub(crate) open spec fn centered<F: FrameFloat>(start: f32, end: f32, size: f32)
 }
 }
 
+/// The physical left/top inset consumes at most the width/height of the box.
+#[inline(always)]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(returns padded_start::<F>(edges, padding), no_unwind))]
+pub(crate) fn inner_start<F: FrameFloat>(edges: [f32; 2], padding: f32) -> f32 {
+    let start = F::add(edges[0], padding);
+    if F::less_than(0.0, padding) && F::less_than(edges[1], start) { edges[1] } else { start }
+}
+
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(returns padded_range::<F>(edges, padding), no_unwind))]
 pub(crate) fn inner_range<F: FrameFloat>(edges: [f32; 2], padding: [f32; 2]) -> [f32; 2] {
-    let [start, end] = edges;
-    let [pad_start, pad_end] = padding;
-    [F::add(start, pad_start), F::subtract(end, pad_end)]
+    let start = inner_start::<F>(edges, padding[0]);
+    let end = F::subtract(edges[1], padding[1]);
+    [start, if F::less_than(end, start) { start } else { end }]
 }
 
 #[inline(always)]
@@ -162,6 +176,14 @@ pub(crate) fn centered_range<F: FrameFloat>(start: f32, end: f32, size: f32) -> 
     let center = F::divide(F::add(start, end), 2.0);
     let half = F::divide(size, 2.0);
     [F::subtract(center, half), F::add(center, half)]
+}
+
+/// Each automatic edge receives the same positive remainder from its resolved line.
+#[inline]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+pub(crate) fn auto_margin_share(remaining: f32, edges: usize) -> f32 {
+    if remaining > 0.0 && edges > 0 { remaining / edges as f32 } else { 0.0 }
 }
 
 /// Restart a stack or wrap line at the chosen alignment.
@@ -395,18 +417,19 @@ pub(crate) fn grid_track_size<F: FloatBounds>(size: f32, [pad_start, pad_end]: [
 #[inline]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
-pub(crate) fn grid_cell_edges<F: FloatBounds>([start, end]: [f32; 2], [pad_start, pad_end]: [f32; 2],
+pub(crate) fn grid_cell_edges<F: FrameFloat>(edges: [f32; 2], padding: [f32; 2],
     flipped: bool, index: f32, cell: f32, spacing: f32, span: u16, lines: f32,
 ) -> [f32; 2] {
     let span = if span == 0 { 1 } else { span };
     let span = F::min(span as f32, F::max(lines, 1.0));
     let offset = index * (cell + spacing);
     let length = span * cell + (span - 1.0) * spacing;
+    let [start, end] = inner_range::<F>(edges, padding);
     if !flipped {
-        let start = start + pad_start + offset;
+        let start = start + offset;
         [start, start + length]
     } else {
-        let end = end - pad_end - offset;
+        let end = end - offset;
         [end - length, end]
     }
 }

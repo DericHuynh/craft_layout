@@ -218,7 +218,10 @@ fn inherited_tracks(frame: &Frame<'_>, id: usize, a: Axis) -> Option<ResolvedAxi
     let bounds = boundary(resolved, indices);
     let rect = item_edges(frame, id, parent, pg, a, bounds, indices);
     let node = &frame.nodes[id];
-    let origin = rect[0] + node.effective.padding[a][0];
+    let origin = crate::placement_geometry::inner_start::<crate::placement_geometry::RustFloat>(
+        rect,
+        node.effective.padding[a][0],
+    );
     let extent = frame.content_size(id)[a];
     let mut edges: Vec<_> = resolved[indices.clone()]
         .iter()
@@ -528,20 +531,16 @@ fn area_for(
     shift: Xy<usize>,
 ) -> crate::XyRect {
     let p = &frame.nodes[parent];
-    let inner = frame.content_size(parent);
+    let outer = frame.outer_size(parent);
+    let inner = p.inner_size(outer);
+    let offset = p.content_offset(outer);
+    // An unspecified grid line uses the padding box. Convert that box to
+    // content coordinates once, even when both insets exhaust the grid.
+    let port = super::viewport::port_in(p, Xy::new([0., outer.x], [0., outer.y]));
     let mut rect = Xy::new_symm([0.; 2]);
     for a in [Axis::X, Axis::Y] {
         let flip = p.base.children_origin_flipped[a];
-        let mut pad =
-            [0, 1].map(|side| p.effective.padding[a][side] - p.rule.box_model.border[a][side]);
-        let gutter_side = usize::from(
-            !p.rule
-                .box_model
-                .scroll_origin
-                .is_some_and(|origin| origin[a]),
-        );
-        pad[gutter_side] -= p.gutter[a];
-        let mut area = [-pad[0], inner[a] + pad[1]];
+        let mut area = port[a].map(|edge| edge - offset[a]);
         if let Some(pair) = &frame.nodes[id].rule.grid_lines[a] {
             let lines =
                 crate::tracks::lines::endpoints(pair, explicit[a], &grid.placement_names(a), true);
@@ -592,8 +591,9 @@ pub(super) fn ancestor_area(frame: &Frame<'_>, parent: usize, id: usize) -> Opti
         Xy::new(origin.x.0, origin.y.0),
         Xy::new(origin.x.1, origin.y.1),
     );
+    let offset = frame.content_offset(parent);
     for a in [Axis::X, Axis::Y] {
-        let before = p.rect[a][0] + p.effective.padding[a][0];
+        let before = p.rect[a][0] + offset[a];
         rect[a] = rect[a].map(|x| x + before);
     }
     Some(rect)
@@ -816,25 +816,20 @@ pub(super) fn apply(frame: &mut Frame<'_>, parent: usize, grid: &TrackGrid) {
     for (id, cell) in ids.into_iter().zip(cells) {
         let area = Xy::new(boundary(&edges.x, &cell.x), boundary(&edges.y, &cell.y));
         frame.nodes[id].grid_reference = Some(super::size(area));
+        if matches!(
+            frame.nodes[id].rule.placement,
+            super::Placement::StickyInGridArea(_)
+        ) {
+            // Cache the same parent-local coordinates used by positioned grid descendants.
+            // Scroll-only updates translate these edges without sizing the tracks again.
+            let local = super::viewport::shifted(area, frame.content_offset(parent));
+            frame
+                .grid_positioned_areas
+                .insert(frame.nodes[id].id.key(), (parent, local));
+        }
         let mut rect = Xy::new(
-            item_edges(
-                frame,
-                id,
-                parent,
-                grid,
-                Axis::X,
-                boundary(&edges.x, &cell.x),
-                &cell.x,
-            ),
-            item_edges(
-                frame,
-                id,
-                parent,
-                grid,
-                Axis::Y,
-                boundary(&edges.y, &cell.y),
-                &cell.y,
-            ),
+            item_edges(frame, id, parent, grid, Axis::X, area.x, &cell.x),
+            item_edges(frame, id, parent, grid, Axis::Y, area.y, &cell.y),
         );
         let n = &frame.nodes[id];
         for a in [Axis::X, Axis::Y] {

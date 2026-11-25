@@ -398,9 +398,6 @@ impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placeme
     }
 
     #[inline(always)]
-    fn free_placement(&self, id: T::NodeId) -> bool { self.tree.node_layout_params(id).free_placement }
-
-    #[inline(always)]
     fn prefers_batch(&self) -> bool { self.snapper().is_some_and(Snapper::prefers_batch) }
 
     #[inline(always)]

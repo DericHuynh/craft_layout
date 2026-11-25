@@ -508,6 +508,7 @@ fn pixel_bound<F: TailFloat>(bound: Option<Size>) -> bool {
 #[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
 fn collect_child<I: Copy, F: TailFloat>(cache: &mut TailCache<I>, p: &LayoutParams, is_leaf: bool, axis: Axis) -> Option<()> {
     if p.disabled || p.free_placement { return Some(()); }
+    if p.has_auto_margin(axis) { return None; }
     let [start, end] = F::margins(p, axis);
     let margin = start + end;
     if margin < 0.0 || !F::finite(margin) { return None; }
@@ -630,7 +631,7 @@ impl<T> LayoutTree<T> {
         let ChildrenLayout::Stack { axis, .. } = parent_node.params.children_layout else { return };
         let p = &node.params;
         if !tail_leaf(p, axis, node.next_sibling.is_none(), node.first_child.is_none())
-            || !p.fill_weight.is_finite() || p.fill_weight <= 0.0 || margins(p, axis) != [0.0; 2]
+            || !p.fill_weight.is_finite() || p.fill_weight <= 0.0 || margins(p, axis) != [0.0; 2] || p.has_auto_margin(axis)
         {
             return;
         }

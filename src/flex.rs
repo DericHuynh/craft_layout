@@ -5,7 +5,7 @@
 //! The existing `Stack` and `Wrap` declarations keep their original sizing rules.
 
 use crate::place::stack_line;
-use crate::placement_geometry::{RustFloat, line_start_and_gap};
+use crate::placement_geometry::{RustFloat, auto_margin_share, line_start_and_gap};
 use crate::{Arrange, Axis, Margin, Xy, XyRect};
 use std::ops::Range;
 
@@ -685,11 +685,7 @@ impl FlexLayout {
                 .filter(|m| m.as_px().is_none())
                 .count();
             let free = limit - total;
-            let auto = if autos > 0 {
-                free.max(0.0) / autos as f32
-            } else {
-                0.0
-            };
+            let auto = auto_margin_share(free, autos);
             let arrange = if auto > 0.0 || self.safe_justify && free < 0.0 {
                 Arrange::Start
             } else {

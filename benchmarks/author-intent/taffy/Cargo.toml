@@ -1,0 +1,11 @@
+[package]
+name = "author-intent-taffy"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# benchmarks/conformance/fetch.sh checks out the exact upstream revision.
+[dependencies]
+taffy = { path = "../../../target/taffy-fixtures", version = "=0.15.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "content_size"] }
+
+[workspace]

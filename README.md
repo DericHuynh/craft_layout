@@ -161,17 +161,22 @@ Declare the dimension you know and put `Size::AspectRatio(width / height)` on th
 
 A stack also preserves explicit pixel and fractional sizes when its children overflow. For children that should share the available space, use `Size::Fill` and `fill_weight`. A `FitContent` stack can derive its own size from fractional children. For example, in a row with no gaps, margins, or padding, a 1 px child beside a child requesting `Size::Frac(1023.0 / 1024.0)` gives a 1,024 px row. The fractional child occupies the remaining 1,023 px.
 
+When equally sized cards become narrower than their padding, their outer widths stay equal. A child filling the content box can shrink to zero. Physical left/top padding consumes the available span first, so even an empty content box has its origin inside or on the edge of the card.
+
 A maximum can make a row fit even when the requested fractions add up to more than one. Put a 1 px item beside two 75% items and cap the first 75% item at 12 px. The row is 52 px wide, with children occupying 1, 12, and 39 px. Removing the cap makes the same declarations impossible to satisfy and produces an `ImpossibleFracChildren` warning on the row.
 
 ### Wrapping, margins, and block flow
 
 - `ChildrenLayout::Wrap` lays out successive rows or columns. Choose an axis, per-line arrangement, item spacing, and line spacing. Line breaks use item sizes before distributing the remaining main-axis space to weighted `Fill` children. The tallest or widest intrinsic item sets the cross-axis extent of its line. Cross-axis `Fill` children stretch inside that extent.
+- In a stack or wrap, put `Margin::AUTO` on the leading main-axis edge of a trailing action to push it to the end of its line. Two automatic edges share the space equally. Item sizes and authored gaps are allocated first. Use the child's cross-axis position for start, center or end alignment.
 - `LayoutParams::margin` takes pairs of physical left/right and top/bottom edges. `Margin::px` accepts finite pixel values, including negative margins. Margins affect the space a child occupies in a stack, wrap, grid, or block, and the output rectangle is the child's box inside those margins.
 - `ChildrenLayout::Block` implements CSS normal flow for block boxes. `Size::Auto` fills the containing width for an in-flow block and fits the content on the height axis. `Margin::AUTO` distributes spare inline space, so two auto inline margins center a fixed-width block. Adjoining vertical margins collapse between siblings, through empty blocks, and across eligible parent-child edges. Box dimensions include padding. In an owned tree, `NodeRules::block_flow` adds physical left and right floats, side-specific clearance, group alignment and inline self-alignment in horizontal block flow. Set `isolate_block_margins` to give a block an independent formatting context that avoids adjacent floats and encloses its own. The [news digest](examples/news_digest) demonstrates these behaviors through resizes and filter changes. The host still measures text lines.
 
 ### Grid tracks and intrinsic sizes
 
 For a responsive card grid, `TrackAxis::auto_fit_within(120.)` uses 120 px per column plus gaps to decide how many fit, then shares the available width equally among occupied columns. If the container shrinks to 90 px, a single card can use those 90 px. Choose `TrackAxis::AutoFit { minimum: 120., track: Track::Fr(1.) }` when a card must retain at least 120 px, including in a narrower container. [CSS workaround comparisons](reports/constraint-semantics/css-workarounds.md)
+
+A sticky grid child can keep its normal slot and stop at the end of its own cell or span using `Placement::StickyInGridArea(insets)`. Use `Placement::Sticky(insets)` for a heading that should travel across the parent grid. [Measured examples across layout engines](reports/constraint-semantics/author-intent.md)
 
 Use `Track::Content` for a column that stops at its preferred content width and `Track::Auto` for one that can also take leftover room. In a 300 px grid with two such auto columns, content preferences of 70 and 30 px and a 10 px gutter leave 190 px. Each column gets another 95 px, producing 165 and 125 px. A fractional track takes its share before this stretching step.
 
