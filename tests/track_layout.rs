@@ -513,3 +513,388 @@ fn text_grid_shares_the_measured_last_baseline_after_line_wrap() {
         assert_eq!(t.layout(&b).unwrap().y, bb);
     }
 }
+
+#[test]
+fn auto_tracks_share_leftover_equally_after_intrinsic_and_fractional_sizing() {
+    let grid = TrackGrid {
+        tracks: Xy::new(
+            TrackAxis::Tracks(vec![
+                Track::Auto,
+                Track::Content,
+                Track::MinMax(TrackMin::Pixels(10.), TrackMax::Auto),
+                Track::Fr(0.5),
+            ]),
+            TrackAxis::default(),
+        ),
+        gap: Xy::new(2., 0.),
+        ..Default::default()
+    };
+    let items = [measure(0..1, 20., 30.), measure(1..2, 40., 40.)];
+    // At 286, gaps and preferred track sizes consume 86. Half an fr takes 100.
+    // The two auto maxima split the remaining 100 equally, despite different bases.
+    let (edges, total) = grid.resolve_axis(Axis::X, Some(286.), 4, &items);
+    assert_eq!(edges, [[0., 80.], [82., 122.], [124., 184.], [186., 286.]]);
+    assert_eq!(total, 286.);
+    assert_eq!(grid.resolve_axis(Axis::X, None, 4, &items).1, 86.);
+    assert_eq!(grid.resolve_axis(Axis::X, Some(50.), 4, &items).1, 76.);
+}
+
+#[test]
+fn collapsed_auto_fit_slots_never_receive_stretch_space() {
+    let grid = TrackGrid {
+        tracks: Xy::new(
+            TrackAxis::AutoFit {
+                minimum: 20.,
+                track: Track::Auto,
+            },
+            TrackAxis::default(),
+        ),
+        gap: Xy::new(5., 0.),
+        ..Default::default()
+    };
+    let (n, _) = grid.place_cells(
+        Xy::new(100., 30.),
+        &[GridItem::default()],
+        Xy::new_symm(None),
+    );
+    let (edges, _) = grid.resolve_axis(Axis::X, Some(100.), n.x, &[measure(0..1, 10., 12.)]);
+    assert_eq!(
+        edges,
+        [[0., 100.], [100., 100.], [100., 100.], [100., 100.]]
+    );
+}
+
+#[cfg(feature = "incremental")]
+#[test]
+fn published_track_edges_keep_subpixels_empty_axes_and_rtl_template_order() {
+    use keru_layout::layout_rules::NodeRules;
+    use keru_layout::{Direction, LayoutParams, LayoutTree, LogicalStyle, PixelScale, TreeError};
+
+    fn scene() -> LayoutTree<()> {
+        let mut tree = LayoutTree::new();
+        let root = tree.root();
+        tree.update_node_params(
+            &root,
+            LayoutParams {
+                padding: Xy::new([7., 3.], [0., 0.]),
+                ..LayoutParams::DEFAULT
+            },
+        )
+        .unwrap();
+        tree.set_rules(
+            &root,
+            NodeRules {
+                logical: LogicalStyle {
+                    direction: Some(Direction::Rtl),
+                    ..Default::default()
+                },
+                grid: Some(TrackGrid {
+                    tracks: Xy::new(
+                        TrackAxis::Tracks(vec![Track::Pixels(20.25), Track::Fr(1.)]),
+                        TrackAxis::default(),
+                    ),
+                    gap: Xy::new(2.5, 0.),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        tree.set_pixel_scale(Some(PixelScale::ONE));
+        tree
+    }
+
+    let mut tree = scene();
+    let root = tree.root();
+    assert_eq!(
+        tree.resolved_grid_tracks(&root, Axis::X),
+        Err(TreeError::LayoutUnavailable)
+    );
+    for width in [96.5, 121.5, 96.5] {
+        let window = Xy::new(width, 40.);
+        tree.solve_layout(window);
+        let inner = width - 10.;
+        let expected = [[inner - 20.25, inner], [0., inner - 22.75]];
+        assert_eq!(
+            tree.resolved_grid_tracks(&root, Axis::X).unwrap(),
+            Some(expected.as_slice())
+        );
+        assert_eq!(
+            tree.resolved_grid_tracks(&root, Axis::Y).unwrap(),
+            Some([].as_slice())
+        );
+
+        let mut fresh = scene();
+        fresh.solve_layout(window);
+        assert_eq!(
+            fresh.resolved_grid_tracks(&fresh.root(), Axis::X).unwrap(),
+            Some(expected.as_slice())
+        );
+        assert_eq!(
+            tree.resolved_grid_tracks(&fresh.root(), Axis::X),
+            Err(TreeError::ForeignNode)
+        );
+        tree.set_scroll_offset(&root, Xy::new(2., 3.)).unwrap();
+        tree.solve_layout(window);
+        assert_eq!(
+            tree.resolved_grid_tracks(&root, Axis::X).unwrap(),
+            Some(expected.as_slice())
+        );
+    }
+
+    let copy = tree.clone();
+    assert_eq!(
+        copy.resolved_grid_tracks(&copy.root(), Axis::X).unwrap(),
+        tree.resolved_grid_tracks(&root, Axis::X).unwrap()
+    );
+    tree.set_rules(&root, NodeRules::default()).unwrap();
+    tree.solve_layout(Xy::new(110., 40.));
+    assert_eq!(tree.resolved_grid_tracks(&root, Axis::X).unwrap(), None);
+
+    let child = tree.add_node(&root, LayoutParams::DEFAULT).unwrap();
+    tree.set_rules(
+        &child,
+        NodeRules {
+            grid: Some(TrackGrid::default()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    tree.solve_layout(Xy::new(110., 40.));
+    assert_eq!(
+        tree.resolved_grid_tracks(&child, Axis::X).unwrap(),
+        Some([].as_slice())
+    );
+    tree.update_node_params(
+        &child,
+        LayoutParams {
+            disabled: true,
+            ..LayoutParams::DEFAULT
+        },
+    )
+    .unwrap();
+    tree.solve_layout(Xy::new(110., 40.));
+    assert_eq!(
+        tree.resolved_grid_tracks(&child, Axis::X),
+        Err(TreeError::LayoutUnavailable)
+    );
+    tree.remove(&child).unwrap();
+    assert_eq!(
+        tree.resolved_grid_tracks(&child, Axis::X),
+        Err(TreeError::StaleNode)
+    );
+}
+
+#[cfg(feature = "batch-pilot")]
+#[test]
+fn rejected_batch_retains_track_lists_until_the_corrected_frame_publishes() {
+    use keru_layout::layout_rules::NodeRules;
+    use keru_layout::{BatchLayoutError, LayoutParams, LayoutTree, Size};
+
+    let mut tree = LayoutTree::<()>::new();
+    let root = tree.root();
+    tree.set_rules(
+        &root,
+        NodeRules {
+            grid: Some(TrackGrid {
+                tracks: Xy::new(TrackAxis::repeat(2, Track::Fr(1.)), TrackAxis::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let field = tree.add_node(&root, LayoutParams::DEFAULT).unwrap();
+    tree.solve_layout_batch(Xy::new(120., 40.)).unwrap();
+    let initial = [[0., 60.], [60., 120.]];
+    assert_eq!(
+        tree.resolved_grid_tracks(&root, Axis::X).unwrap(),
+        Some(initial.as_slice())
+    );
+    tree.update_node_params(
+        &field,
+        LayoutParams {
+            size: Xy::new_symm(Size::AspectRatio(1.)),
+            ..LayoutParams::DEFAULT
+        },
+    )
+    .unwrap();
+    let resized = Xy::new(240., 40.);
+    assert_eq!(
+        tree.solve_layout_batch(resized),
+        Err(BatchLayoutError::Cycle)
+    );
+    assert_eq!(
+        tree.resolved_grid_tracks(&root, Axis::X).unwrap(),
+        Some(initial.as_slice())
+    );
+    tree.update_node_params(&field, LayoutParams::DEFAULT)
+        .unwrap();
+    tree.solve_layout_batch(resized).unwrap();
+    assert_eq!(
+        tree.resolved_grid_tracks(&root, Axis::X).unwrap(),
+        Some([[0., 120.], [120., 240.]].as_slice())
+    );
+}
+
+#[test]
+fn fractional_floors_share_each_items_demand_by_weight_from_one_snapshot() {
+    let flex = |weight| Track::MinMax(TrackMin::Content, TrackMax::Fr(weight));
+    for (weights, expected) in [
+        ([1., 3.], [25., 75.]),
+        ([0., 1.], [0., 100.]),
+        ([0., 0.], [50., 50.]),
+        ([0.2, 0.3], [40., 60.]),
+    ] {
+        let grid = TrackGrid {
+            tracks: Xy::new(
+                TrackAxis::Tracks(weights.map(flex).to_vec()),
+                TrackAxis::default(),
+            ),
+            ..Default::default()
+        };
+        let (tracks, _) = grid.resolve_axis(Axis::X, Some(40.), 2, &[measure(0..2, 100., 100.)]);
+        assert!((tracks[0][1] - expected[0]).abs() < 0.001);
+        assert!((tracks[1][1] - tracks[1][0] - expected[1]).abs() < 0.001);
+    }
+    let grid = TrackGrid {
+        tracks: Xy::new(TrackAxis::repeat(4, flex(1.)), TrackAxis::default()),
+        ..Default::default()
+    };
+    for (mut demands, expected) in [
+        (
+            [measure(0..2, 60., 60.), measure(1..4, 150., 150.)],
+            [30., 50., 50., 50.],
+        ),
+        (
+            [measure(0..1, 60., 60.), measure(0..3, 150., 150.)],
+            [60., 50., 50., 0.],
+        ),
+    ] {
+        for _ in 0..2 {
+            let (edges, _) = grid.resolve_axis(Axis::X, Some(40.), 4, &demands);
+            assert_eq!(
+                edges.iter().map(|e| e[1] - e[0]).collect::<Vec<_>>(),
+                expected
+            );
+            demands.reverse();
+        }
+    }
+}
+
+#[test]
+fn natural_fractional_sizes_respect_hard_floors_and_partial_factors() {
+    let axis = |tracks: Vec<Track>| TrackGrid {
+        tracks: Xy::new(TrackAxis::Tracks(tracks), TrackAxis::default()),
+        ..Default::default()
+    };
+    let grid = axis(vec![Track::Pixels(50.), Track::Fr(0.5)]);
+    let demand = [measure(0..2, 0., 100.)];
+    assert_eq!(
+        grid.resolve_axis(Axis::X, None, 2, &demand).0,
+        [[0., 50.], [50., 75.]]
+    );
+    assert_eq!(
+        grid.resolve_axis(Axis::X, Some(75.), 2, &demand).0,
+        [[0., 50.], [50., 62.5]]
+    );
+    let grid = axis(vec![
+        Track::MinMax(TrackMin::Content, TrackMax::Fr(0.)),
+        Track::Fr(1.),
+    ]);
+    assert_eq!(
+        grid.resolve_axis(Axis::X, None, 2, &[measure(0..1, 100., 100.)])
+            .1,
+        200.
+    );
+    let grid = axis(vec![Track::MinMax(
+        TrackMin::Content,
+        TrackMax::Pixels(10.),
+    )]);
+    assert_eq!(grid.resolve_axis(Axis::X, None, 1, &[]).1, 10.);
+}
+
+#[test]
+fn spanning_labels_use_available_content_tracks_before_enlarging_a_fitted_neighbor() {
+    let grid = TrackGrid {
+        tracks: Xy::new(
+            TrackAxis::Tracks(vec![Track::FitContent(110.), Track::FitContent(40.)]),
+            TrackAxis::default(),
+        ),
+        gap: Xy::new(5., 0.),
+        ..Default::default()
+    };
+    let (_, total) = grid.resolve_axis(Axis::X, None, 2, &[measure(0..1, 125., 140.)]);
+    assert_eq!(total, 130.);
+    let demand = [measure(1..2, 20., 20.), measure(0..2, 30., 70.)];
+    assert_eq!(
+        grid.resolve_axis(Axis::X, Some(100.), 2, &demand).0,
+        [[0., 45.], [50., 70.]]
+    );
+    let grid = TrackGrid {
+        tracks: Xy::new(
+            TrackAxis::Tracks(vec![Track::Content, Track::Content, Track::Fr(1.)]),
+            TrackAxis::default(),
+        ),
+        ..Default::default()
+    };
+    let demand = [measure(0..1, 100., 100.), measure(0..2, 120., 120.)];
+    assert_eq!(
+        grid.resolve_axis(Axis::X, Some(320.), 3, &demand).0,
+        [[0., 100.], [100., 120.], [120., 320.]]
+    );
+}
+
+#[test]
+fn fractional_budgets_match_the_largest_feasible_unit_for_two_tracks() {
+    // Independently enumerate every subset of binding floors. With partial
+    // factors a smaller feasible unit can also leave unused space. The largest
+    // feasible unit gives the declared fractional tracks their full share.
+    for a in [0., 0.25, 1., 2.] {
+        for b in [0., 0.5, 1., 3.] {
+            for floors in [[0., 0.], [12., 0.], [0., 21.], [12., 21.]] {
+                let tracks = [a, b]
+                    .into_iter()
+                    .zip(floors)
+                    .map(|(weight, floor)| {
+                        Track::MinMax(TrackMin::Pixels(floor), TrackMax::Fr(weight))
+                    })
+                    .collect();
+                let grid = TrackGrid {
+                    tracks: Xy::new(TrackAxis::Tracks(tracks), TrackAxis::default()),
+                    gap: Xy::new(4., 0.),
+                    ..Default::default()
+                };
+                for width in [0., 4., 19., 37., 80., 129.] {
+                    let budget: f32 = width - 4.;
+                    let mut best = 0.0f32;
+                    for active in [[false, false], [true, false], [false, true], [true, true]] {
+                        let mut fixed = 0.;
+                        let mut weight: f32 = 0.;
+                        for (i, factor) in [a, b].into_iter().enumerate() {
+                            if active[i] && factor > 0. {
+                                weight += factor;
+                            } else {
+                                fixed += floors[i];
+                            }
+                        }
+                        let unit = (budget - fixed).max(0.) / weight.max(1.);
+                        let sizes = [floors[0].max(a * unit), floors[1].max(b * unit)];
+                        let unused = (1. - weight).max(0.) * unit;
+                        if sizes[0] + sizes[1] + unused <= budget + 0.00001 {
+                            best = best.max(unit);
+                        }
+                    }
+                    let edges = grid.resolve_axis(Axis::X, Some(width), 2, &[]).0;
+                    for (i, factor) in [a, b].into_iter().enumerate() {
+                        let expected = floors[i].max(best * factor);
+                        assert!(
+                            (edges[i][1] - edges[i][0] - expected).abs() < 0.0002,
+                            "width {width} factors {a},{b} floors {floors:?} edges {edges:?} unit {best}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

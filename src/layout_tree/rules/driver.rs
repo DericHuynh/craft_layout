@@ -40,7 +40,7 @@ pub(super) struct Frame<'a> {
     indices: HashMap<NodeKey, usize>,
     patches: &'a HashMap<NodeKey, TypographyPatch>,
     styles: &'a HashMap<NodeKey, NodeRules>,
-    pub(super) grid_tracks: HashMap<usize, Xy<Vec<[f32; 2]>>>,
+    pub(super) grid_tracks: HashMap<NodeKey, Xy<Vec<[f32; 2]>>>,
     pub(super) grid_baselines: HashMap<usize, Xy<Vec<[Option<f32>; 2]>>>,
     pub(super) grid_cells: HashMap<usize, Xy<Range<usize>>>,
 }
@@ -246,6 +246,7 @@ impl<'a> Frame<'a> {
                 n.layout_query = layout_query;
             }
             n.gutter = gutter;
+            p.isolate_block_margins |= n.rule.flex.is_some() || n.rule.grid.is_some();
             n.base = p;
             n.effective = p;
             n.assigned = false;
@@ -505,6 +506,9 @@ impl State {
         } else {
             HashMap::new()
         };
+        // Publish the same tracks used for item placement and subgrid inheritance.
+        // Idle and scroll-only solves keep this geometry, as does a rejected Batch solve.
+        self.grid_tracks = std::mem::take(&mut frame.grid_tracks);
         self.positioned_styles.clear();
         self.positioned_styles
             .extend(frame.nodes.iter().filter_map(|n| {

@@ -53,3 +53,15 @@ required-features = ["incremental"]
 [[example]]
 name = "maintenance_console"
 required-features = ["incremental"]
+
+[[example]]
+name = "asset_browser"
+required-features = ["incremental"]
+
+[[example]]
+name = "scoreboard"
+required-features = ["incremental"]
+
+[[bench]]
+name = "grid_tracks"
+harness = false

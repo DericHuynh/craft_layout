@@ -3,7 +3,7 @@
 //! block and inline axes. The public physical Block format remains unchanged.
 use super::driver::{Frame, FrameNode};
 use crate::flow::{
-    BlockFlow, BlockItem, BlockMargins, block_can_collapse, item_adjoins, zero_minimum,
+    BlockFlow, BlockItem, BlockMargins, item_adjoins, zero_minimum,
 };
 use crate::placement_geometry::{RustFloat, block_inline_edges};
 use crate::{
@@ -71,9 +71,7 @@ fn in_flow(node: &FrameNode) -> bool {
 
 fn collapse_with(node: &FrameNode, parent: &FrameNode) -> bool {
     node.context.writing_mode == parent.context.writing_mode
-        && block_can_collapse(&node.base)
-        && node.rule.flex.is_none()
-        && node.rule.grid.is_none()
+        && node.base.block_margins_can_collapse()
 }
 
 fn replay(

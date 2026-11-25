@@ -344,6 +344,10 @@ pub struct LayoutParams {
     pub margin: Xy<[Margin; 2]>,
     /// How this node positions its children.
     pub children_layout: ChildrenLayout,
+    /// Keep child block margins inside this box and separate its own before and after
+    /// margins when empty. Its outer margins can still collapse with adjacent siblings.
+    /// Managed flex and track grids establish this boundary automatically.
+    pub isolate_block_margins: bool,
     /// Place this node freely within the parent, outside the parent's in-flow layout.
     pub free_placement: bool,
     /// Whether this node should occupy more than one cell if this node is a child of a grid.
@@ -368,6 +372,16 @@ pub struct LayoutParams {
 }
 
 impl LayoutParams {
+    #[inline]
+    #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.block_margins_can_collapse(), no_unwind))]
+    pub(crate) fn block_margins_can_collapse(&self) -> bool {
+        !self.isolate_block_margins
+            && matches!(self.children_layout, ChildrenLayout::Block | ChildrenLayout::Free)
+            && matches!(self.text, TextContent::None) && self.image.is_none()
+            && matches!(self.content_measure, ContentMeasure::None)
+    }
+
     #[inline(always)]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
     #[cfg_attr(verus_keep_ghost, verus_spec(returns self.text_wraps_on(axis), no_unwind))]
@@ -391,6 +405,7 @@ impl LayoutParams {
         padding: Xy { x: [0.0, 0.0], y: [0.0, 0.0] },
         margin: Xy::new_symm([Margin::ZERO; 2]),
         children_layout: ChildrenLayout::Free,
+        isolate_block_margins: false,
         free_placement: false,
         grid_span: Xy { x: 1, y: 1 },
         text: TextContent::None,

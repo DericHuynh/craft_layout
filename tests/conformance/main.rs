@@ -39,7 +39,9 @@ enum Outcome {
 
 struct Expected {
     rect: [f32; 4],
-    tracks: bool,
+    columns: Option<String>,
+    rows: Option<String>,
+    inline_axis: Axis,
     children: Vec<Expected>,
 }
 
@@ -47,7 +49,9 @@ fn expectation(node: roxmltree::Node) -> Expected {
     let number = |name: &str| node.attribute(name).and_then(|v| v.parse().ok()).unwrap_or(f32::NAN);
     Expected {
         rect: [number("x"), number("y"), number("width"), number("height")],
-        tracks: node.attribute("resolved-rows").is_some() || node.attribute("resolved-columns").is_some(),
+        columns: node.attribute("resolved-columns").map(str::to_owned),
+        rows: node.attribute("resolved-rows").map(str::to_owned),
+        inline_axis: Axis::X,
         children: node.children().filter(|c| c.is_element()).map(expectation).collect(),
     }
 }
@@ -97,7 +101,12 @@ fn native_cases<'a>(document: &'a roxmltree::Document) -> BTreeMap<&'a str, Nati
 // The fixture generator measures out-of-flow positions from their CSS containing
 // block. Convert those reference coordinates to the parent-local frame used here.
 fn browser_positions(expected: &mut Expected, input: roxmltree::Node, parent: [f32; 2],
-    containing: [f32; 2], viewport: Option<[f32; 2]>) {
+    containing: [f32; 2], viewport: Option<[f32; 2]>, inherited_inline: Axis) {
+    expected.inline_axis = match input.attribute("writing-mode") {
+        Some("vertical-rl" | "vertical-lr") => Axis::Y,
+        Some("horizontal-tb") => Axis::X,
+        _ => inherited_inline,
+    };
     // The XML serializer omits the computed value "static".
     let position = input.attribute("position").unwrap_or("static");
     let reference = match (viewport, position) {
@@ -112,7 +121,7 @@ fn browser_positions(expected: &mut Expected, input: roxmltree::Node, parent: [f
     }
     let next = if viewport.is_none() || position != "static" { absolute } else { containing };
     for (node, child) in input.children().filter(|n| n.is_element()).zip(&mut expected.children) {
-        browser_positions(child, node, absolute, next, Some(viewport.unwrap_or(absolute)));
+        browser_positions(child, node, absolute, next, Some(viewport.unwrap_or(absolute)), expected.inline_axis);
     }
 }
 
@@ -152,9 +161,25 @@ fn diagnostic(warning: &LayoutWarning<NodeId>, built: &Built) -> String {
     format!("{kind}@{path}{axis}")
 }
 
+fn rule_diagnostic(issue: &keru_layout::layout_rules::RuleIssue, built: &Built) -> String {
+    use keru_layout::layout_rules::RuleIssue::*;
+    let (kind, node, axis) = match issue {
+        MissingReference(node) => ("MissingReference", node, None),
+        CyclicReference(node) => ("CyclicReference", node, None),
+        MissingContainer(node) => ("MissingContainer", node, None),
+        ConflictingFormattingContexts(node) => ("ConflictingFormattingContexts", node, None),
+        MissingParentTracks(node, axis) => ("MissingParentTracks", node, Some(axis)),
+        UnstableLayout => return "UnstableLayout".into(),
+    };
+    let path = node_path(node, built).unwrap_or_else(|| "viewport".to_owned());
+    let suffix = match axis { Some(Axis::X) => ".x", Some(Axis::Y) => ".y", None => "" };
+    format!("{kind}@{path}{suffix}")
+}
+
 #[derive(Default)]
 struct Details {
     rectangles: Vec<String>,
+    tracks: Vec<String>,
     warnings: Vec<String>,
 }
 
@@ -195,14 +220,15 @@ fn run(path: &Path, native: Option<&NativeCase>, details: &mut Details, capture:
         Xy::new(width, height)
     });
     details.warnings = tree.warnings().iter().map(|w| diagnostic(w, &built)).collect();
+    details.warnings.extend(tree.rule_issues().iter().map(|i| rule_diagnostic(i, &built)));
     details.warnings.sort();
     let Some(mut expected) = expectations.first_element_child().map(expectation) else {
         return Outcome::Fail("no expectations".into());
     };
-    browser_positions(&mut expected, input_root, [0.0; 2], [0.0; 2], None);
+    browser_positions(&mut expected, input_root, [0.0; 2], [0.0; 2], None, Axis::X);
     let mut failures = Vec::new();
-    compare(&tree, &built, &expected, Some([0.0, 0.0]), "root", &mut failures,
-        &mut capture.then_some(&mut details.rectangles));
+    compare(&tree, &built, &expected, &expected, Some([0.0, 0.0]), "root", &mut failures,
+        &mut capture.then_some(&mut *details));
     let expected_warnings = native.map(|case| case.warnings.as_slice()).unwrap_or_default();
     if details.warnings != expected_warnings {
         failures.push(format!("expected warnings {expected_warnings:?}, got {:?}", details.warnings));
@@ -210,7 +236,7 @@ fn run(path: &Path, native: Option<&NativeCase>, details: &mut Details, capture:
     }
     if let Some(native) = native {
         let mut native_failures = Vec::new();
-        compare(&tree, &built, &native.expected, Some([0.0, 0.0]), "root", &mut native_failures, &mut None);
+        compare(&tree, &built, &native.expected, &expected, Some([0.0, 0.0]), "root", &mut native_failures, &mut None);
         if !native_failures.is_empty() {
             return Outcome::Fail(format!("{} {}", native.reason, native_failures.join("; ")));
         }
@@ -221,7 +247,43 @@ fn run(path: &Path, native: Option<&NativeCase>, details: &mut Details, capture:
     if failures.is_empty() { Outcome::Pass } else { Outcome::Fail(failures.join("; ")) }
 }
 
-fn compare(tree: &Tree, built: &Built, expected: &Expected, origin: Option<[f32; 2]>, path: &str, failures: &mut Vec<String>, rectangles: &mut Option<&mut Vec<String>>) {
+// Chrome serializes used CSS track sizes (without gutters or pixel snapping)
+// in logical track order. "none" is an assertion of zero tracks. An omitted
+// attribute opts out of that axis. Named line serialization requires a
+// representation in the adapter before that syntax can be admitted.
+fn track_sizes_match(expected: &str, actual: &[f32]) -> bool {
+    let expected = expected.trim();
+    if expected == "none" || expected.is_empty() { return actual.is_empty(); }
+    let mut tokens = expected.split_whitespace();
+    actual.iter().all(|size| {
+        tokens.next().and_then(|s| s.strip_suffix("px"))
+            .and_then(|s| s.parse::<f32>().ok())
+            .is_some_and(|v| (size - v).abs() < TOLERANCE)
+    }) && tokens.next().is_none()
+}
+
+// Very large grids can publish tens of thousands of identical lengths.
+// Compress only the human-readable trace. Comparison always sees every track.
+fn describe_tracks(sizes: &[f32]) -> String {
+    if sizes.len() < 32 { return format!("{sizes:?}"); }
+    use std::fmt::Write;
+    let mut description = String::from("[");
+    for run in sizes.chunk_by(|a, b| a.to_bits() == b.to_bits()) {
+        if description.len() > 1 { description.push_str(", "); }
+        if run.len() >= 4 {
+            write!(description, "{:?} × {}", run[0], run.len()).unwrap();
+        } else {
+            for (i, value) in run.iter().enumerate() {
+                if i > 0 { description.push_str(", "); }
+                write!(description, "{value:?}").unwrap();
+            }
+        }
+    }
+    description.push(']');
+    description
+}
+
+fn compare(tree: &Tree, built: &Built, expected: &Expected, browser: &Expected, origin: Option<[f32; 2]>, path: &str, failures: &mut Vec<String>, details: &mut Option<&mut Details>) {
     // A hidden subtree has zero boxes in the fixture and no published rectangles.
     let (actual, child_origin) = match (origin.filter(|_| !built.disabled), tree.layout(&built.node)) {
         (Some([x, y]), Ok(rect)) => (
@@ -238,21 +300,40 @@ fn compare(tree: &Tree, built: &Built, expected: &Expected, origin: Option<[f32;
             return;
         }
     };
-    if let Some(rectangles) = rectangles {
-        rectangles.push(format!("{path} {:?}", actual));
+    if let Some(details) = details {
+        details.rectangles.push(format!("{path} {:?}", actual));
     }
     if actual.iter().zip(expected.rect).any(|(a, e)| !((a - e).abs() < TOLERANCE)) {
         failures.push(format!("{path}: expected {:?}, got {:?}", expected.rect, actual));
     }
-    if expected.tracks {
-        failures.push(format!("{path}: resolved grid tracks are not reported"));
+    // A deliberate native rectangle difference does not waive a track
+    // assertion. It takes an explicit native track list to override one.
+    for (axis, label, wanted) in [
+        (browser.inline_axis, "columns", expected.columns.as_deref().or(browser.columns.as_deref())),
+        (browser.inline_axis.other(), "rows", expected.rows.as_deref().or(browser.rows.as_deref())),
+    ] {
+        if wanted.is_none() && details.is_none() { continue; }
+        match tree.resolved_grid_tracks(&built.node, axis) {
+            Ok(Some(edges)) => {
+                let sizes: Vec<f32> = edges.iter().map(|[low, high]| high - low).collect();
+                if let Some(details) = details {
+                    details.tracks.push(format!("{path}.{label} {}", describe_tracks(&sizes)));
+                }
+                if let Some(expected) = wanted && !track_sizes_match(expected, &sizes) {
+                    failures.push(format!("{path}: expected {label} {expected:?}, got {}", describe_tracks(&sizes)));
+                }
+            }
+            _ if wanted.is_some() => failures.push(format!("{path}: no published grid {label}")),
+            _ => {}
+        }
     }
-    if built.children.len() != expected.children.len() {
+    if built.children.len() != expected.children.len() || built.children.len() != browser.children.len() {
         failures.push(format!("{path}: child count {} != {}", built.children.len(), expected.children.len()));
         return;
     }
-    for (index, (child, expected)) in built.children.iter().zip(&expected.children).enumerate() {
-        compare(tree, child, expected, child_origin, &format!("{path}.{index}"), failures, rectangles);
+    for (index, child) in built.children.iter().enumerate() {
+        compare(tree, child, &expected.children[index], &browser.children[index], child_origin,
+            &format!("{path}.{index}"), failures, details);
     }
 }
 
@@ -324,7 +405,7 @@ fn main() {
     let mut report = args.iter().position(|arg| arg == "--case-report").map(|i| {
         let path = args.get(i + 1).expect("--case-report needs a TSV path");
         let mut out = BufWriter::new(std::fs::File::create(path).expect("create case report"));
-        writeln!(out, "fixture\toutcome\treason\twarnings\tnative_rectangles").expect("write case report");
+        writeln!(out, "fixture\toutcome\treason\twarnings\tnative_rectangles\tnative_tracks").expect("write case report");
         out
     });
     let mut passing = Vec::new();
@@ -349,8 +430,8 @@ fn main() {
                 Outcome::Fail(why) => ("mismatch", why.as_str()),
                 Outcome::Unsupported(why) => ("unsupported", why.as_str()),
             };
-            writeln!(out, "{name}\t{status}\t{}\t{}\t{}", reason.replace(['\t', '\n', '\r'], " "),
-                details.warnings.join("; "), details.rectangles.join("; ")).expect("write case report");
+            writeln!(out, "{name}\t{status}\t{}\t{}\t{}\t{}", reason.replace(['\t', '\n', '\r'], " "),
+                details.warnings.join("; "), details.rectangles.join("; "), details.tracks.join("; ")).expect("write case report");
         }
         match &outcome {
             Outcome::Pass => {

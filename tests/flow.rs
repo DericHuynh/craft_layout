@@ -719,3 +719,84 @@ fn empty_formatting_context_separates_margins_inside_an_auto_height_block() {
         assert!(tree.warnings().is_empty());
     }
 }
+
+#[test]
+fn empty_managed_formatting_context_separates_sibling_margins() {
+    use keru_layout::layout_rules::NodeRules;
+    use keru_layout::flex::FlexLayout;
+    use keru_layout::tracks::TrackGrid;
+
+    for batch in [false, true] {
+        let mut tree = LayoutTree::<()>::new();
+        let root = tree.root();
+        tree.update_node_params(&root, LayoutParams {
+            children_layout: ChildrenLayout::Block,
+            size: Xy::new(Size::Pixels(50.), Size::FitContent),
+            position: Xy::new_symm(Pos::Start),
+            ..LayoutParams::DEFAULT
+        }).unwrap();
+        let child = |height, before, after| LayoutParams {
+            size: Xy::new(Size::Auto, height),
+            margin: Xy::new([Margin::ZERO; 2], edges(before, after)),
+            children_layout: ChildrenLayout::Block,
+            ..LayoutParams::DEFAULT
+        };
+        tree.add_node(&root, child(Size::Pixels(10.), 0., 10.)).unwrap();
+        let middle = tree.add_node(&root, child(Size::Auto, 10., 10.)).unwrap();
+        let last = tree.add_node(&root, child(Size::Pixels(10.), 10., 0.)).unwrap();
+        for (rules, last_y) in [
+            (NodeRules { grid: Some(TrackGrid::default()), ..Default::default() }, 30.),
+            (NodeRules::default(), 20.),
+            (NodeRules { flex: Some(FlexLayout::default()), ..Default::default() }, 30.),
+        ] {
+            tree.set_rules(&middle, rules).unwrap();
+            let window = Xy::new_symm(100.);
+            if batch {
+                #[cfg(feature = "batch-pilot")]
+                tree.solve_layout_batch(window).unwrap();
+                #[cfg(not(feature = "batch-pilot"))]
+                continue;
+            } else {
+                tree.solve_layout(window);
+            }
+            assert_eq!(tree.layout(&middle).unwrap().y, [20., 20.]);
+            assert_eq!(tree.layout(&last).unwrap().y, [last_y, last_y + 10.]);
+            assert_eq!(tree.layout(&root).unwrap().y, [0., last_y + 10.]);
+            assert!(tree.warnings().is_empty(), "{:?}", tree.warnings());
+        }
+    }
+}
+
+#[test]
+fn authored_block_margin_boundary_keeps_child_margins_inside_the_container() {
+    let mut tree = LayoutTree::<()>::new();
+    let root = tree.root();
+    let block = LayoutParams {
+        children_layout: ChildrenLayout::Block,
+        size: Xy::new(Size::Auto, Size::FitContent),
+        position: Xy::new_symm(Pos::Start),
+        ..LayoutParams::DEFAULT
+    };
+    tree.update_node_params(&root, LayoutParams { size: Xy::new(Size::Fill, Size::FitContent), ..block }).unwrap();
+    let mut group = LayoutParams { margin: Xy::new([Margin::ZERO; 2], edges(3., 5.)), ..block };
+    let container = tree.add_node(&root, group).unwrap();
+    let child = tree.add_node(&container, LayoutParams {
+        margin: Xy::new([Margin::ZERO; 2], edges(7., 11.)),
+        size: Xy::new(Size::Auto, Size::Pixels(13.)),
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+    for (isolate, parent_y, child_y, height) in [
+        (false, [7., 20.], [7., 20.], 31.),
+        (true, [3., 34.], [10., 23.], 39.),
+        (false, [7., 20.], [7., 20.], 31.),
+    ] {
+        group.isolate_block_margins = isolate;
+        tree.update_node_params(&container, group).unwrap();
+        for width in [50., 75.] {
+            tree.solve_layout(Xy::new(width, 100.));
+            assert_eq!(tree.layout(&root).unwrap().y, [0., height]);
+            assert_eq!(tree.layout(&container).unwrap().y, parent_y);
+            assert_eq!(tree.layout(&child).unwrap().y, child_y);
+        }
+    }
+}

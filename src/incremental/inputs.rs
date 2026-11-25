@@ -96,11 +96,12 @@ impl SameInput for ChildrenLayout {
 
 impl SameInput for LayoutParams {
     fn same_input(&self, other: &Self) -> bool {
-        let Self { position, size, min_size, max_size, padding, margin, children_layout, free_placement,
+        let Self { position, size, min_size, max_size, padding, margin, children_layout, isolate_block_margins, free_placement,
             grid_span, text, content_measure, image, anchor, children_origin_flipped, window_overflow,
             fill_weight, disabled } = self;
         size.same_input(&other.size) && min_size.same_input(&other.min_size) && max_size.same_input(&other.max_size)
             && padding.same_input(&other.padding) && *margin == other.margin && children_layout.same_input(&other.children_layout)
+            && *isolate_block_margins == other.isolate_block_margins
             && *free_placement == other.free_placement && *grid_span == other.grid_span && *text == other.text
             && *content_measure == other.content_measure && image.same_input(&other.image)
             && position.same_input(&other.position) && anchor.same_input(&other.anchor)

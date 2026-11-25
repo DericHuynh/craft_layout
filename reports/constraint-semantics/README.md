@@ -1,8 +1,48 @@
 # Constraint resolution and authoring review
 
+## CSS Grid and native track resolution
+
+Compared with `4d20ad7`, **1,402 additional CSS fixtures execute and agree with the archived browser geometry**. The old 1,642 browser results and 110 native contracts retain their exact rectangles and diagnostics. Each row in the [current ledger](current-cases.tsv) uses that commit as its previous result. An untranslated row names the first blocking input and has no geometry verdict.
+
+| Result across all 6,604 fixtures | Before | Current |
+| --- | ---: | ---: |
+| Archived browser geometry | 1,642 | 3,044 |
+| Independently specified native difference | 110 | 110 |
+| Unresolved translated mismatch | 0 | 0 |
+| Untranslated | 4,852 | 3,450 |
+
+The added inputs contain 1,470 grid elements and 7,248 expected node rectangles. There are 1,336 grid roots and 66 grid-containing flex or block roots. In 1,354 inputs the archive additionally asserts both axes of every grid, giving 2,844 track-list assertions, including 24 empty axes. The remaining 48 inputs supply box geometry only. For a 15,000-column zero-width span, the recorded second item starts the next row at y = 20. Those rectangles alone cannot establish the number of zero-width columns.
+
+The track oracle reads the edges published by the owned tree. It compares individual track lengths before pixel snapping, in template order even when RTL reverses their physical positions. Rectangles use the fixture's snapping setting. Both comparisons use the upstream tolerance of strictly less than 0.1 px. In the ledger, long runs of identical track lengths use `value × count`. The checker compares every track individually. Managed diagnostics also participate in the verdict.
+
+For the 156 newly admitted grid content-alignment fixtures, a second calculation used rational arithmetic, authored tracks and gutters, available space, physical border and padding, direction and pixel snapping. It recovered all 1,608 source rectangles and 408 expected axis lists. The per-case ledger includes the resulting logical offsets and physical starts. In one space-between case, 152 px of usable height minus three 40 px rows leaves 32 px, producing row starts of 12, 68 and 124 px after the leading border and padding.
+
+The [family-by-family audit](grid-mismatch-families.tsv) covers all 468 inputs that disagreed on the first Grid translation. It records the authored sizing request, the first numeric discrepancy and the final outcome for each box-model and direction variant. The [review](grid-fixture-review.md) explains the distinct causes and a case where the published CSS guidance and the pinned browser give different answers.
+
+Two authors predicted their application layouts before execution. The asset browser exercised 40 nodes over eight states. Its 392-to-391 px transition lost a thumbnail column exactly where predicted. The scoreboard exercised 14 matches, a banner spanning unequal fractional tracks, filtering and a longer team name. Filtering restored the 2:1 club/score split. The longer name then required a 252 px panel in a 240 px viewport. The authored and host-computed versions agreed. [Asset browser trial](../../examples/asset_browser/README.md) · [Scoreboard trial](../../examples/scoreboard/README.md)
+
+### Verification
+
+The Cargo suites passed 317 tests and doctests with all features, 256 with defaults, and 58 without default features. The fixture executable separately checked all 6,604 source IDs. The asset browser, dispatch board and maintenance console passed six focused example tests. The scoreboard assertions passed with ordinary and Batch solving. The editor, kiosk, mixing studio and command-palette examples replayed successfully, as did all six release workload checks. Four Kani harnesses checked cache equality and edit classification against the actual Rust declaration structure. The separate native grid-intrinsics proof passed for the established uniform-grid code. Executable examples and tests cover the new heterogeneous-track arithmetic.
+
+### Adopting the declarations
+
+Code that builds `LayoutParams` or `NodeRules` with struct update syntax inherits the defaults. An exhaustive `LayoutParams` literal needs `isolate_block_margins: false` to retain the earlier setting. Exhaustive `NodeRules` literals also need the optional content-minimum and grid fit-limit fields. Exhaustive matches over `Track` or `TrackMax` need an `Auto` arm. Choose `Track::Content` when the column should stop at its content preference, and choose `Track::Auto` when it should also share leftover space.
+
+### Track sizing allocations
+
+The release benchmark prepares 4,096 item contributions on 64 content tracks before enabling the existing allocator counter. The mixed scene makes every eighth item span up to three tracks. Both versions use 3 px gaps and an 8,192 px available width. The counts below cover one call to the standalone track-sizing kernel. The immediate repeat gave the same counts.
+
+| Scene | Earlier allocation calls | Current calls | Earlier bytes requested | Current bytes requested | Hash of all edges, both revisions |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Single-span items | 15,154 | 17 | 224,528 | 69,664 | `56ac0cd971feed25` |
+| Mixed spans | 13,314 | 23 | 209,904 | 71,776 | `e7aece4efe382af6` |
+
+Single-track items fold into indexed maxima. For spanning items the solver reuses work buffers and plans competing increases from the same base sizes. The benchmark measures allocator calls and requested bytes. Run it with `cargo bench --locked --bench grid_tracks`. [Benchmark](../../benches/grid_tracks.rs)
+
 ## Writing modes, block margins and weighted flex bases
 
-The [current case ledger](current-cases.tsv) records the previous and current outcome for each of the 6,604 fixture IDs. For a supported input it includes physical parent-local rectangles and diagnostic expectations. For a pending input it identifies the first declaration the fixture translator cannot express. A pending row has no geometry verdict.
+The following table records the earlier logical, block and flexible layout milestone. Its final column totals precede the Grid extension above.
 
 | Earlier outcome | Current browser match | Current deliberate geometry difference | Current untranslated |
 | --- | ---: | ---: | ---: |

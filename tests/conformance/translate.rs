@@ -4,6 +4,9 @@
 //! Some declarations resolve differently under CSS flex or intrinsic sizing.
 //! The runner checks documented differences against hand-derived native rectangles.
 
+#[path = "grid_css.rs"]
+mod grid_css;
+
 use crate::ahem::AhemText;
 use crate::css::{Style, Value};
 use keru_layout::flex::{FlexAlign, FlexBasis, FlexItem, FlexLayout};
@@ -22,6 +25,7 @@ pub enum Parent {
     Viewport { size: Xy<Option<f32>> },
     Flex { main: Axis, align_items: Align, managed: bool },
     Block,
+    Grid(grid_css::GridContext),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -168,6 +172,27 @@ fn needs_weighted_lines(xml: roxmltree::Node) -> bool {
     weighted
 }
 
+// Return a minimum only when it is available from the fixture's content
+// declaration. Definite child lengths make an unwrapped container's native
+// intrinsic measurement independent of soft line breaks on this axis.
+fn content_minimum(xml: roxmltree::Node, text: Option<&str>, axis: Axis, writing: WritingContext,
+    params: &LayoutParams) -> Option<Size>
+{
+    if let Some(text) = text {
+        return Some(if axis == writing.axis(LogicalAxis::Inline) {
+            Size::Pixels(AhemText::new(text).min_content_width() + params.padding[axis].iter().sum::<f32>())
+        } else { Size::FitContent });
+    }
+    let length = if axis == Axis::X { "width" } else { "height" };
+    let children = xml.children().filter(|n| n.is_element() && n.attribute("display") != Some("none")
+        && n.attribute("position") != Some("absolute"));
+    if xml.attribute("flex-wrap").is_some_and(|v| v != "nowrap") { return None; }
+    let mut children = children.peekable();
+    (children.peek().is_some() && children.all(|n| {
+        matches!(n.attribute(length).map(Value::parse), Some(Value::Px(_)))
+    })).then_some(Size::FitContent)
+}
+
 fn static_alignment(parent: &LayoutParams, axis: Axis, align: Align) -> f32 {
     match parent.children_layout {
         ChildrenLayout::Stack { axis: main, arrange, .. } | ChildrenLayout::Wrap { axis: main, arrange, .. }
@@ -187,12 +212,18 @@ fn static_alignment(parent: &LayoutParams, axis: Axis, align: Align) -> f32 {
 }
 
 pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Parent) -> Result<Built> {
-    let vertical = xml.descendants().any(|n| matches!(n.attribute("writing-mode"), Some("vertical-lr" | "vertical-rl")));
-    build_in_context(tree, parent, xml, context, WritingContext::default(), LayoutParams::DEFAULT, vertical)
+    let features = FixtureFeatures {
+        vertical: xml.descendants().any(|n| matches!(n.attribute("writing-mode"), Some("vertical-lr" | "vertical-rl"))),
+        grid: xml.descendants().any(|n| n.attribute("display") == Some("grid")),
+    };
+    build_in_context(tree, parent, xml, context, WritingContext::default(), LayoutParams::DEFAULT, features)
 }
 
+#[derive(Clone, Copy)]
+struct FixtureFeatures { vertical: bool, grid: bool }
+
 fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Parent,
-    inherited: WritingContext, parent_params: LayoutParams, managed_writing: bool) -> Result<Built> {
+    inherited: WritingContext, parent_params: LayoutParams, features: FixtureFeatures) -> Result<Built> {
     let style = Style::new(xml);
     let mut params = LayoutParams::DEFAULT;
 
@@ -235,7 +266,7 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
     // Box edges. Borders lay out exactly like padding.
     let edges = |side: &str| -> Result<f32> { Ok(px(&style, &format!("padding-{side}"))? + px(&style, &format!("border-{side}"))?) };
     params.padding = Xy::new([edges("left")?, edges("right")?], [edges("top")?, edges("bottom")?]);
-    let block_item = matches!(context, Parent::Block) && style.keyword("position", "static") != "absolute";
+    let block_item = matches!(context, Parent::Block | Parent::Grid(..)) && style.keyword("position", "static") != "absolute";
     params.margin = Xy::new(
         [margin(&style, "margin-left", block_item)?, margin(&style, "margin-right", block_item)?],
         [margin(&style, "margin-top", block_item)?, margin(&style, "margin-bottom", block_item)?],
@@ -257,6 +288,7 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
     let text = xml.first_element_child().is_none().then(|| xml.text()).flatten().map(str::trim);
     let display = style.keyword("display", "flex");
     let mut rule = NodeRules::default();
+    let mut own_grid = None;
     let mut own_flex_main = None;
     let mut own_align = Align::Stretch;
     match display {
@@ -288,11 +320,20 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
                 }
                 other => return unsupported(format!("flex-wrap={other}")),
             };
-            if matches!(params.children_layout, ChildrenLayout::Stack { .. }) && needs_weighted_lines(xml) {
+            // A row/column taking part in a track layout may be assigned less
+            // than its intrinsic main size. Keep its preferred measurement
+            // and its CSS shrink permission separate through the managed line.
+            let mixed_grid = features.grid && xml.first_element_child().is_some();
+            if matches!(params.children_layout, ChildrenLayout::Stack { .. }) && (mixed_grid || needs_weighted_lines(xml)) {
                 rule.flex = Some(FlexLayout { axis: main, gap: main_gap, justify: arrange,
                     align_items: flex_align(own_align), ..Default::default() });
             }
             own_flex_main = Some(main);
+        }
+        "grid" => {
+            let (grid, child_context) = grid_css::container(&style, writing)?;
+            rule.grid = Some(grid);
+            own_grid = Some(child_context);
         }
         "block" => params.children_layout = ChildrenLayout::Block,
         other => return unsupported(format!("display={other}")),
@@ -325,7 +366,8 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
     // for validation; the scoreboard still compares against the Chrome result.
     let shrink = style.number("flex-shrink", 1.0)?;
     let basis = style.value("flex-basis");
-    let align_self = align(style.keyword("align-self", "auto"))?;
+    let align_self = if matches!(context, Parent::Grid(..)) { None }
+        else { align(style.keyword("align-self", "auto"))? };
     let aspect = style.value("aspect-ratio");
 
     let mut declared = Xy::new(width, height);
@@ -338,10 +380,22 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
                 // The XML supplies a concrete viewport on definite axes. Its margins
                 // and opposing insets consume space before the root box is sized.
                 let length = window[axis];
+                // The fixture viewport is a flex row with start-aligned items.
+                // An unbounded viewport shrink-wraps its only child. Resolving
+                // that child's 100% width then reproduces its intrinsic width.
+                if display == "grid" && axis == Axis::X && !absolute && length.is_none()
+                    && before == 0. && after == 0. && declared[axis] == Some(Size::Frac(1.)) {
+                    declared[axis] = Some(Size::FitContent);
+                }
                 if declared[axis].is_none() {
                     declared[axis] = Some(match (length, leading, trailing) {
                         (Some(w), Some((f, p)), Some((g, q))) if absolute =>
                             Size::Pixels((w - (f * w + p) - (g * w + q) - before - after).max(0.0)),
+                        (Some(w), _, _) if !absolute && axis == Axis::X && display == "grid" => {
+                            let padding: f32 = params.padding[axis].iter().sum();
+                            rule.grid_fit_limit[axis] = Some((w - before - after - padding).max(0.));
+                            Size::FitContent
+                        }
                         (Some(w), _, _) if !absolute && axis == Axis::X =>
                             Size::Pixels((w - before - after).max(0.0)),
                         _ => Size::FitContent,
@@ -357,6 +411,7 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
                 params.anchor[axis] = anchor;
             }
         }
+        Parent::Grid(..) if absolute => return unsupported("absolute placement in a grid area"),
         _ if absolute => {
             params.free_placement = true;
             let parent_params = &parent_params;
@@ -426,6 +481,9 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
                 }
             }
             if managed {
+                if declared[main].is_none() && params.min_size[main].is_none() {
+                    params.min_size[main] = content_minimum(xml, text, main, writing, &params);
+                }
                 let flex_basis = match explicit_basis {
                     None => FlexBasis::Preferred,
                     Some(Value::Px(n)) => FlexBasis::Pixels(n + extra(main)),
@@ -493,6 +551,15 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
             params.position[cross] = pos;
             params.anchor[cross] = anchor;
         }
+        Parent::Grid(grid) => {
+            rule.grid_item = grid_css::item(&style, grid, writing)?;
+            for axis in [Axis::X, Axis::Y] {
+                if params.min_size[axis].is_none() && declared[axis].is_none() {
+                    rule.grid_content_minimum[axis] = content_minimum(xml, text, axis, writing, &params);
+                }
+                declared[axis].get_or_insert(if aspect.is_some() { Size::FitContent } else { Size::Auto });
+            }
+        }
         Parent::Block => {
             let inline = inherited.axis(LogicalAxis::Inline);
             declared[inline].get_or_insert(Size::Auto);
@@ -508,6 +575,14 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
         }
     }
     params.size = Xy::new(declared.x.unwrap_or(Size::FitContent), declared.y.unwrap_or(Size::FitContent));
+
+    if matches!(context, Parent::Grid(..)) {
+        for axis in [Axis::X, Axis::Y] {
+            if matches!(params.size[axis], Size::AspectRatio(_)) && params.min_size[axis].is_none() {
+                rule.grid_content_minimum[axis] = Some(params.size[axis]);
+            }
+        }
+    }
 
     // CSS subtracts padding and borders from a border-box length and floors
     // the content box at zero. Native Pixels is an explicit outer extent;
@@ -536,7 +611,7 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
     }
 
     let child_params = params;
-    if managed_writing {
+    if features.vertical {
         let origin = writing.origins();
         params.children_origin_flipped.x ^= origin.x;
         params.children_origin_flipped.y ^= origin.y;
@@ -545,7 +620,7 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
         Some(text) => (*tree.add_node_with_context(parent, params, AhemText::new(text)).map_err(|e| e.to_string())?).clone(),
         None => (*tree.add_node(parent, params).map_err(|e| e.to_string())?).clone(),
     };
-    if managed_writing {
+    if features.vertical {
         rule.logical = logical;
     }
     let managed_line = rule.flex.is_some();
@@ -554,12 +629,12 @@ fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, cont
     }
     let child_context = match (own_flex_main, display) {
         (Some(main), _) => Parent::Flex { main, align_items: own_align, managed: managed_line },
-        (None, "block") => Parent::Block,
+        (None, "grid") => Parent::Grid(own_grid.expect("parsed grid container")),
         _ => Parent::Block,
     };
     let mut children = Vec::new();
     for child in xml.children().filter(|child| child.is_element()) {
-        children.push(build_in_context(tree, &node, child, child_context, writing, child_params, managed_writing)?);
+        children.push(build_in_context(tree, &node, child, child_context, writing, child_params, features)?);
     }
     Ok(Built { node, disabled: params.disabled, children })
 }

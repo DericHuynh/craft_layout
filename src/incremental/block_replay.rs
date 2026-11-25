@@ -207,8 +207,8 @@ pub(crate) open spec fn measured_flow<A: Storage + ?Sized>(tree: &A, node: A::Id
     rows: Seq<(A::Id, BlockItem<A::Block>)>,
 ) -> bool {
     let p = tree.layout_params(node);
-    let top = edge_adjoins(!root, A::Float::word(p.padding.y[0]) & 0x7fff_ffffu32 == 0);
-    let bottom = edge_adjoins(!root, A::Float::word(p.padding.y[1]) & 0x7fff_ffffu32 == 0)
+    let top = edge_adjoins(!root && p.block_margins_can_collapse(), A::Float::word(p.padding.y[0]) & 0x7fff_ffffu32 == 0);
+    let bottom = edge_adjoins(!root && p.block_margins_can_collapse(), A::Float::word(p.padding.y[1]) & 0x7fff_ffffu32 == 0)
         && (p.size.y is Auto || p.size.y is FitContent);
     &&& ready_flow_items(tree, node, rows, None)
     &&& tree.layout_record(node).values@[cycle_rules::slot_index(1, Kind::Flow) as int]
@@ -324,8 +324,8 @@ pub(crate) proof fn direct_edges_match_ordinary<F: FrameFloat>(params: LayoutPar
         params.text is None, params.image.is_none(), params.content_measure is None,
         root ==> flags.0 & crate::node_flags::NodeFlags::BLOCK_PARENT_AUTO_HEIGHT == 0,
     ensures crate::dependencies::sizing_finish::block::edge_words::<F>(params, flags) == (
-        edge_adjoins(!root, F::word(params.padding.y[0]) & 0x7fff_ffffu32 == 0),
-        edge_adjoins(!root, F::word(params.padding.y[1]) & 0x7fff_ffffu32 == 0)
+        edge_adjoins(!root && params.block_margins_can_collapse(), F::word(params.padding.y[0]) & 0x7fff_ffffu32 == 0),
+        edge_adjoins(!root && params.block_margins_can_collapse(), F::word(params.padding.y[1]) & 0x7fff_ffffu32 == 0)
             && (params.size.y is Auto || params.size.y is FitContent),
     ),
 {
@@ -727,6 +727,7 @@ fn measure<A: Access + ?Sized>(
     let width = width::<A::Float>(p, parent_width, root);
     let is_block = matches!(p.children_layout, ChildrenLayout::Block);
     let text = p.text;
+    let joins = p.block_margins_can_collapse();
     let y_size = p.size.y;
     let [before_pad, after_pad] = p.padding.y;
     let pad = padding_for::<A::Float>(p, Y);
@@ -736,8 +737,8 @@ fn measure<A: Access + ?Sized>(
     #[cfg(verus_keep_ghost)]
     let mut rows = empty_flow::<A::Id, A::Block>();
     let (height, nested) = if is_block {
-        let top = edge_adjoins(!root, A::Float::is_zero(before_pad));
-        let bottom = edge_adjoins(!root, A::Float::is_zero(after_pad)) && fit;
+        let top = edge_adjoins(!root && joins, A::Float::is_zero(before_pad));
+        let bottom = edge_adjoins(!root && joins, A::Float::is_zero(after_pad)) && fit;
         let mut flow = BlockFlow::from_edges(top, bottom);
         let mut next = tree.first(node);
         #[cfg(verus_keep_ghost)]
@@ -833,7 +834,7 @@ fn measure<A: Access + ?Sized>(
     *computed = computed.saturating_add(if width.maximum.is_some() { 5 } else { 4 });
     if is_block { *computed = computed.saturating_add(1); }
     let adjoining = item_adjoins(A::Float::is_zero(resolved),
-        [A::Float::is_zero(before_pad), A::Float::is_zero(after_pad)], matches!(text, TextContent::None), true);
+        [A::Float::is_zero(before_pad), A::Float::is_zero(after_pad)], joins, true);
     let item = BlockItem::from_edges(A::scalar(A::Float::margin(before)), A::scalar(A::Float::margin(after)),
         A::scalar(resolved), adjoining, children_empty, nested);
     #[cfg(verus_keep_ghost)]

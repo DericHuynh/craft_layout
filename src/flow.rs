@@ -11,11 +11,6 @@ pub(crate) fn margins(params: &LayoutParams, axis: Axis) -> [f32; 2] {
 
 pub(crate) use crate::place::stack_line::with_margin;
 
-pub(crate) fn block_can_collapse(params: &LayoutParams) -> bool {
-    matches!(params.children_layout, ChildrenLayout::Block | ChildrenLayout::Free)
-        && params.text == TextContent::None && params.image.is_none() && params.content_measure == ContentMeasure::None
-}
-
 pub(crate) fn zero_minimum(bound: Option<Size>) -> bool {
     matches!(bound, None | Some(Size::Pixels(0.0) | Size::Frac(0.0)))
 }

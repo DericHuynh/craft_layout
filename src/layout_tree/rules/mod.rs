@@ -30,6 +30,14 @@ pub struct NodeRules {
     pub flex: Option<FlexLayout>,
     /// Heterogeneous track grid for this node's children.
     pub grid: Option<crate::tracks::TrackGrid>,
+    /// Available content-box space for shrink-wrapping an intrinsic grid.
+    /// The used size stays between the grid's minimum and preferred track extents.
+    pub grid_fit_limit: Xy<Option<f32>>,
+    /// Optional content-based minimum for this grid item, distinct from its
+    /// hard bounds. It applies on auto-minimum tracks, except when spanning
+    /// multiple tracks including a fraction. Fixed track maxima can cap it.
+    /// Non-stretched Auto items also use this measure when fitting their area.
+    pub grid_content_minimum: Xy<Option<crate::Size>>,
     /// Placement within the parent's track grid.
     pub grid_item: crate::tracks::GridItem,
     /// Preferred basis, weights, order and alignment when inside a flexible line.
@@ -96,6 +104,7 @@ pub(super) struct State {
     pub(super) baseline_contexts: HashMap<NodeKey, BaselineContext>,
     offsets: HashMap<NodeKey, Xy<f32>>,
     outputs: HashMap<NodeKey, ViewGeometry>,
+    grid_tracks: HashMap<NodeKey, Xy<Vec<[f32; 2]>>>,
     positioned_styles: HashMap<NodeKey, LayoutParams>,
     issues: Vec<RuleIssue>,
     pub(super) dirty: bool,
@@ -172,6 +181,25 @@ impl<T> LayoutTree<T> {
         self.resolve_node(id)?;
         Ok(self.rules_state.styles.get(&id.key()))
     }
+    /// Track edges for a managed grid in the last published layout.
+    ///
+    /// Each pair is the physical low and high offset on `axis`, relative to
+    /// the grid's content box. Tracks follow declaration and placement order,
+    /// so their physical positions can decrease in RTL. Edges retain subpixel
+    /// precision even when output rectangles are snapped to pixels.
+    ///
+    /// A visible non-grid has no track list. An empty grid axis has a present,
+    /// empty slice. An unavailable rectangle or invalid handle returns the
+    /// same error as [`LayoutTree::layout`].
+    pub fn resolved_grid_tracks(
+        &self,
+        id: &NodeId,
+        axis: crate::Axis,
+    ) -> Result<Option<&[[f32; 2]]>, TreeError> {
+        self.layout(id)?;
+        Ok(self.rules_state.grid_tracks.get(&id.key()).map(|tracks| tracks[axis].as_slice()))
+    }
+
     /// Geometry diagnostics from the latest managed solve.
     pub fn rule_issues(&self) -> &[RuleIssue] {
         &self.rules_state.issues

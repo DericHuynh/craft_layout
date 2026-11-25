@@ -1,7 +1,10 @@
 //! Resolve shared tracks through descendants before positioning any grid item.
 use super::driver::{Frame, FrameNode};
 use super::flex::bound;
-use crate::tracks::{GridAlign, GridCell, GridItem, TrackAxis, TrackContribution, TrackGrid};
+use crate::tracks::{
+    GridAlign, GridCell, GridItem, Track, TrackAxis, TrackContribution, TrackGrid, TrackMax,
+    TrackMin,
+};
 use crate::{Axis, ChildrenLayout, Margin, Size, Xy};
 
 fn in_flow(n: &FrameNode) -> bool {
@@ -42,6 +45,71 @@ fn metrics(n: &FrameNode, a: Axis, inner: Xy<f32>) -> (f32, f32, f32) {
     };
     (low, pref.min(high).max(low), high)
 }
+// If this area has an automatic track minimum, the supplied content
+// minimum can protect an item from shrinking. A definite maximum on every
+// spanned track limits that protection. Unresolved percentages are intrinsic
+// during measurement and become definite again for final placement.
+fn content_floor(
+    n: &FrameNode,
+    a: Axis,
+    context: &TrackGrid,
+    tracks: &std::ops::Range<usize>,
+    extent: Option<f32>,
+    inner: Xy<f32>,
+) -> (f32, bool) {
+    let Some(measure) = n.rule.grid_content_minimum[a] else {
+        return (0., false);
+    };
+    let template = &context.tracks[a];
+    let gap = context.gap[a].max(0.);
+    let explicit = template.count(inner[a], gap, None);
+    let mut qualifies = false;
+    let mut cap = gap * tracks.len().saturating_sub(1) as f32;
+    let mut relative = false;
+    for i in tracks.clone() {
+        let track = template.at(i, explicit, context.implicit[a]);
+        let (min, max) = track.bounds();
+        if tracks.len() > 1 && matches!(max, TrackMax::Fr(_)) {
+            return (0., false);
+        }
+        qualifies |=
+            min == TrackMin::Content || matches!(min, TrackMin::Percent(_)) && extent.is_none();
+        let fixed_min = match min {
+            TrackMin::Pixels(v) => v.max(0.),
+            TrackMin::Percent(p) => extent.map_or(0., |w| p.max(0.) * w),
+            _ => 0.,
+        };
+        // fit-content() limits preferred growth. Its argument is not a
+        // fixed maximum for the automatic minimum of its occupants.
+        let fixed_max = match (track, max) {
+            (Track::FitContent(_), _) => f32::INFINITY,
+            (_, TrackMax::Pixels(v)) => v.max(0.),
+            (_, TrackMax::Percent(p)) => {
+                relative = true;
+                extent.map_or(f32::INFINITY, |w| p.max(0.) * w)
+            }
+            _ => f32::INFINITY,
+        };
+        relative |= matches!(min, TrackMin::Percent(_));
+        cap += fixed_max.max(fixed_min);
+    }
+    if !qualifies {
+        return (0., false);
+    }
+    let m = n.base.margin[a]
+        .iter()
+        .filter_map(|v| v.as_px())
+        .sum::<f32>();
+    let hard_max = n.base.max_size[a].map_or(f32::INFINITY, |s| {
+        bound(s, a, inner, n.natural, super::size(n.rect))
+    });
+    (
+        bound(measure, a, inner, n.natural, super::size(n.rect))
+            .min(cap - m)
+            .min(hard_max),
+        relative,
+    )
+}
 fn occupied_axis(n: &FrameNode, a: Axis) -> bool {
     n.rule
         .grid
@@ -60,12 +128,15 @@ fn item_edges(
     grid: &TrackGrid,
     a: Axis,
     area: [f32; 2],
+    tracks: &std::ops::Range<usize>,
 ) -> [f32; 2] {
     let n = &frame.nodes[i];
     let total = area[1] - area[0];
     let mut room = frame.content_size(parent);
+    let (floor, _) = content_floor(n, a, grid, tracks, Some(room[a]), room);
     room[a] = total;
-    let (min, pref, max) = metrics(n, a, room);
+    let (hard_min, pref, max) = metrics(n, a, room);
+    let min = hard_min.max(floor.min(max));
     let [m0, m1] = n.base.margin[a].map(Margin::as_px);
     let m = m0.unwrap_or(0.) + m1.unwrap_or(0.);
     let align = n.rule.grid_item.align[a].unwrap_or(grid.align_items[a]);
@@ -78,8 +149,13 @@ fn item_edges(
         (total - m).max(0.)
     } else if stretch {
         (total - m).min(max).max(min)
+    } else if n.base.size[a] == Size::Auto
+        && let Some(s) = n.rule.grid_content_minimum[a]
+    {
+        let content = bound(s, a, room, n.natural, super::size(n.rect));
+        pref.min((total - m).max(content)).max(min).min(max)
     } else {
-        pref
+        pref.max(min)
     };
     let spare = total - size - m;
     let flipped = frame.nodes[parent].base.children_origin_flipped[a];
@@ -101,6 +177,7 @@ struct ResolvedAxis {
     baselines: Baselines,
 }
 struct TrackMeasurements {
+    relative_floor: bool,
     items: Vec<TrackContribution>,
     // Offset from the track's first/last logical edge.
     baselines: Baselines,
@@ -128,9 +205,9 @@ fn inherited_tracks(frame: &Frame<'_>, id: usize, a: Axis) -> Option<ResolvedAxi
     let parent = frame.nodes[id].parent?;
     let pg = frame.nodes[parent].rule.grid.as_ref()?;
     let indices = &frame.grid_cells.get(&id)?[a];
-    let resolved = &frame.grid_tracks.get(&parent)?[a];
+    let resolved = &frame.grid_tracks.get(&frame.nodes[parent].id.key())?[a];
     let bounds = boundary(resolved, indices);
-    let rect = item_edges(frame, id, parent, pg, a, bounds);
+    let rect = item_edges(frame, id, parent, pg, a, bounds, indices);
     let node = &frame.nodes[id];
     let origin = rect[0] + node.effective.padding[a][0];
     let extent = frame.content_size(id)[a];
@@ -160,9 +237,13 @@ fn contributions(
     ids: &[usize],
     cells: &[GridCell],
     count: usize,
+    extent: Option<f32>,
 ) -> TrackMeasurements {
     let primary_flip = frame.nodes[parent].base.children_origin_flipped[a];
+    let root_grid = frame.nodes[parent].rule.grid.as_ref().unwrap();
+    let grid_space = frame.content_size(parent);
     let mut demands = Vec::new();
+    let mut relative_floor = false;
     let mut groups: Baselines = vec![[None; 2]; count];
     let mut participants = Vec::new();
     let mut todo: Vec<_> = ids
@@ -175,6 +256,10 @@ fn contributions(
         let n = &frame.nodes[id];
         let containing = n.parent.map_or(frame.window, |p| frame.content_size(p));
         let (mut min, mut pref, _) = metrics(n, a, containing);
+        let (floor, relative) = content_floor(n, a, root_grid, &cell[a], extent, grid_space);
+        min = min.max(floor);
+        pref = pref.max(min);
+        relative_floor |= relative;
         let shared = occupied_axis(n, a) && !n.children.is_empty();
         if matches!(n.base.size[a], Size::Frac(_)) {
             pref = min;
@@ -244,6 +329,7 @@ fn contributions(
         demands[index].preferred += shift;
     }
     TrackMeasurements {
+        relative_floor,
         items: demands,
         baselines: groups,
     }
@@ -260,18 +346,27 @@ pub(super) fn apply(frame: &mut Frame<'_>, parent: usize, grid: &TrackGrid) {
     let (ids, items) = children(frame, parent);
     let inner = frame.content_size(parent);
     let (counts, cells) = grid.place_cells(inner, &items, inherited_counts);
-    let demand = Xy::new(
-        contributions(frame, parent, Axis::X, &ids, &cells, counts.x),
-        contributions(frame, parent, Axis::Y, &ids, &cells, counts.y),
+    let mut demand = Xy::new(
+        contributions(frame, parent, Axis::X, &ids, &cells, counts.x, None),
+        contributions(frame, parent, Axis::Y, &ids, &cells, counts.y, None),
     );
     let mut natural = inner;
     for a in [Axis::X, Axis::Y] {
         if inherited[a].is_none() {
-            natural[a] = grid.resolve_axis(a, None, counts[a], &demand[a].items).1;
+            let (minimum, preferred) = grid.intrinsic_extents(a, counts[a], &demand[a].items);
+            natural[a] = match frame.nodes[parent].rule.grid_fit_limit[a] {
+                Some(limit) => preferred.min(limit).max(minimum),
+                None => preferred,
+            };
         }
     }
     frame.set_intrinsic(parent, natural);
     let inner = frame.content_size(parent);
+    for a in [Axis::X, Axis::Y] {
+        if demand[a].relative_floor && inherited[a].is_none() {
+            demand[a] = contributions(frame, parent, a, &ids, &cells, counts[a], Some(inner[a]));
+        }
+    }
     let resolve = |a: Axis, inherited: Option<ResolvedAxis>| {
         inherited.unwrap_or_else(|| {
             let mut edges = grid
@@ -310,6 +405,7 @@ pub(super) fn apply(frame: &mut Frame<'_>, parent: usize, grid: &TrackGrid) {
                 grid,
                 Axis::X,
                 boundary(&edges.x, &cell.x),
+                &cell.x,
             ),
             item_edges(
                 frame,
@@ -318,6 +414,7 @@ pub(super) fn apply(frame: &mut Frame<'_>, parent: usize, grid: &TrackGrid) {
                 grid,
                 Axis::Y,
                 boundary(&edges.y, &cell.y),
+                &cell.y,
             ),
         );
         let n = &frame.nodes[id];
@@ -334,6 +431,8 @@ pub(super) fn apply(frame: &mut Frame<'_>, parent: usize, grid: &TrackGrid) {
         frame.place(id, parent, rect);
         frame.grid_cells.insert(id, cell);
     }
-    frame.grid_tracks.insert(parent, edges);
+    frame
+        .grid_tracks
+        .insert(frame.nodes[parent].id.key(), edges);
     frame.grid_baselines.insert(parent, baselines);
 }

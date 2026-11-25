@@ -36,18 +36,27 @@ The owned tree retains the author’s declarations and projects the resolved rul
 
 `layout` publishes physical flow rectangles and `view_geometry` publishes the rectangles and clips used for drawing. A rejected managed Batch solve preserves the previous publication and a corrected subsequent edit can solve. Rich horizontal text measurement uses the ordinary owned solve entry point. The host supplies shaping and line breaks. Custom trees can invoke the logical, flex and track kernels directly. The built-in tree supplies the integrated responsive and visual publication APIs.
 
-The [case ledger](current-cases.tsv) includes every pinned CSS input. The native track API uses numeric lines, auto-placement, single-track auto-repeat patterns and shared subgrid gutters. The CSS harness still lacks broad grid declaration translation. The current proof suite verifies its established arithmetic, graph, and publication kernels. Executable geometry and state-transition tests cover the new managed orchestration.
+The [case ledger](current-cases.tsv) includes every pinned CSS input. The native track API uses numeric lines, auto-placement, single-track auto-repeat patterns and shared subgrid gutters. The Grid milestone below adds coverage for numeric CSS templates, placement, track sizes and alignment. The current proof suite verifies its established arithmetic, graph, and publication kernels. Executable geometry and state-transition tests cover the new managed orchestration.
 
 ### Reproducing the checks
 
-From the repository root, run the Cargo suites and the two new application trials.
+From the repository root, run the Cargo suites and the application trials.
 
 ```sh
 cargo test --locked
 cargo test --locked --all-features
 cargo test --locked --no-default-features
 cargo test --locked --all-features --example dispatch_board --example maintenance_console
+cargo test --locked --all-features --example asset_browser
+cargo run --locked --features batch-pilot --example scoreboard
+cargo bench --locked --bench grid_tracks
 cargo bench --locked --features batch-pilot --bench real_workloads -- --batch-pilot --verify-only
 ```
 
 The [case review](README.md) includes the fixture checkout and harness commands. The [proof instructions](../../proofs/README.md) describe the Verus toolchain. The example READMEs give the commands to replay all four earlier applications.
+
+## Grid fixture and authoring milestone
+
+A grid author should be able to describe a responsive thumbnail sheet and a content-sized live scoreboard using track declarations. The check for each author is to predict widths, cell addresses and the effect of edits before running the tree, then replay the same states with the retained solver, a fresh tree and Batch. An explicit placement or host-budgeted version supplies an independent comparison. [Asset browser](../../examples/asset_browser/README.md) · [Arena scoreboard](../../examples/scoreboard/README.md)
+
+The fixture harness must compare every provided numeric track list, in declaration order, as well as every published rectangle. A missing track assertion leaves that axis unverified by the source. Retain a per-input reason for everything the translator cannot express and measure the cost of handling many spanning contributions with the existing allocation counter. [Grid review and results](README.md) · [Application layout feature inventory](css-layout-scope.md)
