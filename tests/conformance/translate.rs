@@ -6,9 +6,11 @@
 
 use crate::ahem::AhemText;
 use crate::css::{Style, Value};
+use keru_layout::flex::{FlexAlign, FlexBasis, FlexItem, FlexLayout};
+use keru_layout::layout_rules::NodeRules;
 use keru_layout::{
     Anchor, Arrange, Axis, ChildrenLayout, LayoutParams, LayoutTree, Margin, NodeId, Pos, Size,
-    TextContent, Xy,
+    Direction, LogicalAxis, LogicalStyle, TextContent, WritingContext, WritingMode, Xy,
 };
 
 pub type Tree = LayoutTree<AhemText>;
@@ -18,7 +20,7 @@ pub type Tree = LayoutTree<AhemText>;
 pub enum Parent {
     /// The fixture root, placed in the window's top-left corner.
     Viewport { size: Xy<Option<f32>> },
-    Flex { main: Axis, align_items: Align },
+    Flex { main: Axis, align_items: Align, managed: bool },
     Block,
 }
 
@@ -28,6 +30,8 @@ pub enum Align {
     Start,
     Center,
     End,
+    SelfStart,
+    SelfEnd,
 }
 
 pub struct Built {
@@ -45,9 +49,11 @@ fn unsupported<T>(what: impl Into<String>) -> Result<T> {
 fn align(raw: &str) -> Result<Option<Align>> {
     Ok(Some(match raw {
         "normal" | "stretch" => Align::Stretch,
-        "flex-start" | "start" | "self-start" => Align::Start,
+        "flex-start" | "start" => Align::Start,
+        "self-start" => Align::SelfStart,
         "center" => Align::Center,
-        "flex-end" | "end" | "self-end" => Align::End,
+        "flex-end" | "end" => Align::End,
+        "self-end" => Align::SelfEnd,
         "auto" => return Ok(None),
         other => return unsupported(format!("align={other}")),
     }))
@@ -76,9 +82,10 @@ fn px(style: &Style, name: &str) -> Result<f32> {
     }
 }
 
-fn margin(style: &Style, name: &str) -> Result<Margin> {
+fn margin(style: &Style, name: &str, block_item: bool) -> Result<Margin> {
     match style.value(name) {
         None => Ok(Margin::ZERO),
+        Some(Value::Auto) if block_item => Ok(Margin::AUTO),
         Some(Value::Px(v)) => Margin::px(v).ok_or_else(|| format!("{name}={v}")),
         Some(other) => unsupported(format!("{name}={other:?}")),
     }
@@ -123,6 +130,44 @@ fn inset(value: Option<Value>) -> Result<Option<(f32, f32)>> {
     })
 }
 
+fn item_alignment(value: Align, item: WritingContext, parent: &LayoutParams, cross: Axis) -> Align {
+    let reversed = item.origins()[cross] != parent.children_origin_flipped[cross];
+    match value {
+        Align::SelfStart => if reversed { Align::End } else { Align::Start },
+        Align::SelfEnd => if reversed { Align::Start } else { Align::End },
+        value => value,
+    }
+}
+
+fn flex_align(align: Align) -> FlexAlign {
+    match align {
+        Align::Stretch => FlexAlign::Stretch,
+        Align::SelfStart | Align::Start => FlexAlign::Start,
+        Align::SelfEnd | Align::End => FlexAlign::End,
+        Align::Center => FlexAlign::Center,
+    }
+}
+
+// Explicit positive flex bases need separate preferred, basis and shrink
+// inputs. An empty leaf has a known min-content contribution even when CSS
+// omits its automatic minimum. Intrinsic containers and text need a richer
+// transfer of the item's min-content contribution to the formatting context.
+fn needs_weighted_lines(xml: roxmltree::Node) -> bool {
+    if !["width", "height"].iter().all(|name| matches!(xml.attribute(*name).map(Value::parse), Some(Value::Px(_)))) {
+        return false;
+    }
+    let mut weighted = false;
+    for child in xml.children().filter(|node| node.is_element()) {
+        if child.first_element_child().is_some() || child.text().is_some_and(|s| !s.trim().is_empty())
+            || matches!(child.attribute("position"), Some("absolute" | "fixed"))
+        { return false; }
+        let grows = child.attribute("flex-grow").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.) > 0.;
+        let basis = child.attribute("flex-basis").map(Value::parse);
+        weighted |= grows && matches!(basis, Some(Value::Px(n) | Value::Percent(n)) if n > 0.);
+    }
+    weighted
+}
+
 fn static_alignment(parent: &LayoutParams, axis: Axis, align: Align) -> f32 {
     match parent.children_layout {
         ChildrenLayout::Stack { axis: main, arrange, .. } | ChildrenLayout::Wrap { axis: main, arrange, .. }
@@ -134,23 +179,48 @@ fn static_alignment(parent: &LayoutParams, axis: Axis, align: Align) -> f32 {
                 };
                 if parent.children_origin_flipped[axis] { 1.0 - logical } else { logical }
             }
-        _ => match align { Align::Start | Align::Stretch => 0.0, Align::Center => 0.5, Align::End => 1.0 },
+        _ => {
+            let logical = match align { Align::Start | Align::SelfStart | Align::Stretch => 0.0, Align::Center => 0.5, Align::End | Align::SelfEnd => 1.0 };
+            if parent.children_origin_flipped[axis] { 1.0 - logical } else { logical }
+        }
     }
 }
 
 pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Parent) -> Result<Built> {
+    let vertical = xml.descendants().any(|n| matches!(n.attribute("writing-mode"), Some("vertical-lr" | "vertical-rl")));
+    build_in_context(tree, parent, xml, context, WritingContext::default(), LayoutParams::DEFAULT, vertical)
+}
+
+fn build_in_context(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Parent,
+    inherited: WritingContext, parent_params: LayoutParams, managed_writing: bool) -> Result<Built> {
     let style = Style::new(xml);
     let mut params = LayoutParams::DEFAULT;
 
+    let logical = LogicalStyle {
+        direction: match style.get("direction") {
+            None => None,
+            Some("ltr") => Some(Direction::Ltr),
+            Some("rtl") => Some(Direction::Rtl),
+            Some(value) => return unsupported(format!("direction={value}")),
+        },
+        writing_mode: match style.get("writing-mode") {
+            None => None,
+            Some("horizontal-tb") => Some(WritingMode::HorizontalTb),
+            Some("vertical-lr") => Some(WritingMode::VerticalLr),
+            Some("vertical-rl") => Some(WritingMode::VerticalRl),
+            Some(value) => return unsupported(format!("writing-mode={value}")),
+        },
+        ..LogicalStyle::default()
+    };
+    let writing = logical.context(inherited);
+    params.children_origin_flipped = writing.origins();
     // Properties keru has no counterpart for yet.
     for (name, initial) in [
-        ("direction", "ltr"),
         ("float", "none"),
         ("clear", "none"),
         ("overflow-x", "visible"),
         ("overflow-y", "visible"),
         ("contain", "none"),
-        ("writing-mode", "horizontal-tb"),
         ("text-align", "auto"),
     ] {
         let value = style.keyword(name, initial);
@@ -165,9 +235,10 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
     // Box edges. Borders lay out exactly like padding.
     let edges = |side: &str| -> Result<f32> { Ok(px(&style, &format!("padding-{side}"))? + px(&style, &format!("border-{side}"))?) };
     params.padding = Xy::new([edges("left")?, edges("right")?], [edges("top")?, edges("bottom")?]);
+    let block_item = matches!(context, Parent::Block) && style.keyword("position", "static") != "absolute";
     params.margin = Xy::new(
-        [margin(&style, "margin-left")?, margin(&style, "margin-right")?],
-        [margin(&style, "margin-top")?, margin(&style, "margin-bottom")?],
+        [margin(&style, "margin-left", block_item)?, margin(&style, "margin-right", block_item)?],
+        [margin(&style, "margin-top", block_item)?, margin(&style, "margin-bottom", block_item)?],
     );
     let content_box = match style.keyword("box-sizing", "border-box") {
         "border-box" => false,
@@ -185,6 +256,7 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
     // The node's own container behavior.
     let text = xml.first_element_child().is_none().then(|| xml.text()).flatten().map(str::trim);
     let display = style.keyword("display", "flex");
+    let mut rule = NodeRules::default();
     let mut own_flex_main = None;
     let mut own_align = Align::Stretch;
     match display {
@@ -192,17 +264,17 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
         "flex" => {
             let direction = style.keyword("flex-direction", "row");
             let (main, reverse) = match direction {
-                "row" => (Axis::X, false),
-                "row-reverse" => (Axis::X, true),
-                "column" => (Axis::Y, false),
-                "column-reverse" => (Axis::Y, true),
+                "row" => (writing.axis(LogicalAxis::Inline), false),
+                "row-reverse" => (writing.axis(LogicalAxis::Inline), true),
+                "column" => (writing.axis(LogicalAxis::Block), false),
+                "column-reverse" => (writing.axis(LogicalAxis::Block), true),
                 other => return unsupported(format!("flex-direction={other}")),
             };
-            params.children_origin_flipped[main] = reverse;
+            params.children_origin_flipped[main] ^= reverse;
             let gap = |name| px(&style, name);
-            let (main_gap, cross_gap) = match main {
-                Axis::X => (gap("column-gap")?, gap("row-gap")?),
-                Axis::Y => (gap("row-gap")?, gap("column-gap")?),
+            let (main_gap, cross_gap) = if main == writing.axis(LogicalAxis::Inline) { (gap("column-gap")?, gap("row-gap")?)
+            } else {
+                (gap("row-gap")?, gap("column-gap")?)
             };
             let arrange = arrange(style.keyword("justify-content", "normal"), reverse)?;
             own_align = align(style.keyword("align-items", "normal"))?.unwrap_or(Align::Stretch);
@@ -216,13 +288,21 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
                 }
                 other => return unsupported(format!("flex-wrap={other}")),
             };
+            if matches!(params.children_layout, ChildrenLayout::Stack { .. }) && needs_weighted_lines(xml) {
+                rule.flex = Some(FlexLayout { axis: main, gap: main_gap, justify: arrange,
+                    align_items: flex_align(own_align), ..Default::default() });
+            }
             own_flex_main = Some(main);
         }
         "block" => params.children_layout = ChildrenLayout::Block,
         other => return unsupported(format!("display={other}")),
     }
     if let Some(text) = text {
-        params.text = TextContent::Wrapping;
+        if writing.writing_mode == WritingMode::HorizontalTb {
+            params.text = TextContent::Wrapping;
+        } else {
+            params.content_measure = keru_layout::ContentMeasure::WidthForHeight;
+        }
         let _ = text;
     }
 
@@ -270,6 +350,7 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
                 let (pos, anchor) = match (leading, trailing) {
                     (Some((fraction, offset)), _) => at(fraction, offset + before, 0.0, false),
                     (_, Some((fraction, offset))) => at(1.0 - fraction, -offset - after, 1.0, false),
+                    _ if length.is_some() && writing.origins()[axis] => at(1.0, -after, 1.0, false),
                     _ => at(0.0, before, 0.0, false),
                 };
                 params.position[axis] = pos;
@@ -278,7 +359,7 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
         }
         _ if absolute => {
             params.free_placement = true;
-            let parent_params = tree.params(parent).map_err(|e| e.to_string())?;
+            let parent_params = &parent_params;
             let parent_element = xml.parent_element().expect("fixture parent");
             let parent_style = Style::new(parent_element);
             // Native free placement is relative to the immediate parent. A CSS
@@ -296,7 +377,7 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
                 return unsupported("absolute coordinates relative to a non-parent containing block");
             }
             let alignment = match context {
-                Parent::Flex { align_items, .. } => align_self.unwrap_or(align_items),
+                Parent::Flex { main, align_items, .. } => item_alignment(align_self.unwrap_or(align_items), writing, parent_params, main.other()),
                 _ => Align::Start,
             };
             for (axis, start, end) in [(Axis::X, "left", "right"), (Axis::Y, "top", "bottom")] {
@@ -326,9 +407,9 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
                 declared[axis].get_or_insert(Size::FitContent);
             }
         }
-        Parent::Flex { main, align_items } => {
+        Parent::Flex { main, align_items, managed } => {
             let cross = main.other();
-            let parent_params = tree.params(parent).map_err(|e| e.to_string())?;
+            let parent_params = &parent_params;
             let explicit_basis = basis.filter(|basis| !matches!(basis, Value::Auto));
             // A numeric basis is the starting flex size. A leaf's unbreakable text or
             // fixed-size children still supply its automatic minimum on the main axis.
@@ -344,7 +425,15 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
                     params.min_size[main] = Some(Size::FitContent);
                 }
             }
-            if grow > 0.0 {
+            if managed {
+                let flex_basis = match explicit_basis {
+                    None => FlexBasis::Preferred,
+                    Some(Value::Px(n)) => FlexBasis::Pixels(n + extra(main)),
+                    Some(Value::Percent(f)) if extra(main) == 0. => FlexBasis::Fraction(f),
+                    value => return unsupported(format!("flex-basis={value:?}")),
+                };
+                rule.flex_item = FlexItem { grow, shrink, basis: flex_basis, ..FlexItem::css() };
+            } else if grow > 0.0 {
                 if !matches!(basis, Some(Value::Px(v)) if v == 0.0) && !matches!(basis, Some(Value::Percent(p)) if p == 0.0) {
                     return unsupported("flex-grow with a non-zero basis");
                 }
@@ -381,7 +470,8 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
             if declared[main].is_none() {
                 declared[main] = Some(Size::FitContent);
             }
-            let alignment = align_self.unwrap_or(align_items);
+            let alignment = item_alignment(align_self.unwrap_or(align_items), writing, parent_params, cross);
+            if managed { rule.flex_item.align_self = Some(flex_align(alignment)); }
             if declared[cross].is_none() {
                 let stretch = alignment == Align::Stretch && aspect.is_none();
                 declared[cross] = Some(if stretch { Size::Fill } else { Size::FitContent });
@@ -396,20 +486,17 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
                 }
             }
             let (pos, anchor) = match alignment {
-                Align::Stretch | Align::Start => (Pos::Start, Anchor::Start),
+                Align::Stretch | Align::Start | Align::SelfStart => (Pos::Start, Anchor::Start),
                 Align::Center => (Pos::Center, Anchor::Center),
-                Align::End => (Pos::End, Anchor::End),
+                Align::End | Align::SelfEnd => (Pos::End, Anchor::End),
             };
             params.position[cross] = pos;
             params.anchor[cross] = anchor;
         }
         Parent::Block => {
-            if declared[Axis::X].is_none() {
-                declared[Axis::X] = Some(Size::Auto);
-            }
-            if declared[Axis::Y].is_none() {
-                declared[Axis::Y] = Some(Size::FitContent);
-            }
+            let inline = inherited.axis(LogicalAxis::Inline);
+            declared[inline].get_or_insert(Size::Auto);
+            declared[inline.other()].get_or_insert(Size::FitContent);
         }
     }
     if let Some(aspect) = aspect {
@@ -448,18 +535,31 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
         return unsupported(unread.join(" "));
     }
 
+    let child_params = params;
+    if managed_writing {
+        let origin = writing.origins();
+        params.children_origin_flipped.x ^= origin.x;
+        params.children_origin_flipped.y ^= origin.y;
+    }
     let node: NodeId = match text {
         Some(text) => (*tree.add_node_with_context(parent, params, AhemText::new(text)).map_err(|e| e.to_string())?).clone(),
         None => (*tree.add_node(parent, params).map_err(|e| e.to_string())?).clone(),
     };
+    if managed_writing {
+        rule.logical = logical;
+    }
+    let managed_line = rule.flex.is_some();
+    if rule != NodeRules::default() {
+        tree.set_rules(&node, rule).map_err(|error| error.to_string())?;
+    }
     let child_context = match (own_flex_main, display) {
-        (Some(main), _) => Parent::Flex { main, align_items: own_align },
+        (Some(main), _) => Parent::Flex { main, align_items: own_align, managed: managed_line },
         (None, "block") => Parent::Block,
         _ => Parent::Block,
     };
     let mut children = Vec::new();
     for child in xml.children().filter(|child| child.is_element()) {
-        children.push(build(tree, &node, child, child_context)?);
+        children.push(build_in_context(tree, &node, child, child_context, writing, child_params, managed_writing)?);
     }
     Ok(Built { node, disabled: params.disabled, children })
 }

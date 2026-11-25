@@ -1,9 +1,11 @@
 mod svg;
+pub mod rules;
 mod stack_tail;
 pub(crate) mod solve_frame;
 mod removal;
 mod links;
 mod text_scan;
+pub(crate) mod typography;
 mod text_measure_cache;
 mod id;
 mod structural_guard;
@@ -88,6 +90,8 @@ struct BatchSnapshot {
 /// first solve refreshes measurements in the new handle namespace.
 #[derive(Debug)]
 pub struct LayoutTree<T = ()> {
+    rules_state: rules::State,
+    typography: Option<Box<typography::TypographyState>>,
     pub(crate) nodes: SlotMap<NodeKey, LayoutNode>,
     contexts: Option<SlotMap<DefaultKey, T>>,
     text_heights: text_measure_cache::Cache,
@@ -118,6 +122,8 @@ impl<T: Clone> Clone for LayoutTree<T> {
         // Measurement callbacks may use the full public ID as an input.
         layout_data.request_full_solve(IncrementalRelayoutOutcome::FallbackInvalidated);
         Self {
+            rules_state: self.rules_state.cloned(&owner),
+            typography: self.typography.as_deref().map(|state| Box::new(state.for_clone())),
             nodes: self.nodes.clone(),
             contexts: self.contexts.clone(),
             text_heights: text_measure_cache::Cache::new::<crate::vec_memory::RustVec>(),
@@ -165,6 +171,8 @@ impl<T> LayoutTree<T> {
         // All mutations pass through this tree's localized registration methods.
         let layout_data = LayoutData { topology: None, ..LayoutData::new() };
         LayoutTree {
+            rules_state: rules::State::default(),
+            typography: None,
             nodes, contexts: None, text_heights: text_measure_cache::Cache::new::<crate::vec_memory::RustVec>(),
             dormant_grid_epoch: 1,
             root, owner: Arc::new(TreeIdentity { root }),
@@ -292,6 +300,7 @@ impl<T> LayoutTree<T> {
         })();
         let live = self.nodes.len();
         let result = links::relocate::move_handles(self, node, destination, live);
+        if result.is_ok() { self.rules_state.dirty = true; }
         #[cfg(feature = "batch-pilot")]
         if result.is_ok() && let Some((parent, old_previous, layout)) = retained_reorder
             && let Some(batch) = self.batch.first_mut()
@@ -341,6 +350,15 @@ impl<T> LayoutTree<T> {
 
     /// Changes the params of a node. If the parent is disabled, the node stays disabled. A change of `disabled` also applies to all the descendants. Equal params cause no relayout.
     pub fn update_node_params(&mut self, node: &NodeId, mut params: LayoutParams) -> Result<(), TreeError> {
+        let record = self.resolve_node(node)?;
+        if let Some(parent) = record.parent { params.disabled |= self.nodes[parent].params.disabled; }
+        if self.params(node)?.same_input(&params) { return Ok(()); }
+        self.rules_state.authored.remove(&node.key());
+        self.rules_state.dirty = true;
+        self.update_effective(node, params)
+    }
+
+    fn update_effective(&mut self, node: &NodeId, mut params: LayoutParams) -> Result<(), TreeError> {
         let i = node.key();
         let parent = self.resolve_node(node)?.parent;
         if let Some(parent) = parent {
@@ -412,6 +430,7 @@ impl<T> LayoutTree<T> {
         let retired_leaf = if self.contexts.is_some() && record.first_child.is_none() { record.context } else { None };
         #[cfg(feature = "batch-pilot")]
         let local_tail = self.batch.first().and_then(|batch| batch.removable_tail(i));
+        self.rules_state.dirty = true;
         self.record_tail_edit(i, parent, false);
         self.unlink(i, parent)?;
         if let Some(key) = retired_leaf {
@@ -436,7 +455,8 @@ impl<T> LayoutTree<T> {
 
     /// Read the node's `LayoutParams`.
     pub fn params(&self, node: &NodeId) -> Result<&LayoutParams, TreeError> {
-        Ok(&self.resolve_node(node)?.params)
+        let record = self.resolve_node(node)?;
+        Ok(self.rules_state.authored.get(&node.key()).unwrap_or(&record.params))
     }
 
     /// Updates the context of a node and invalidates its intrinsic content measurement.
@@ -484,6 +504,8 @@ impl<T> LayoutTree<T> {
     }
 
     fn mark_content_dirty(&mut self, i: NodeKey) {
+        self.rules_state.dirty = true;
+        if let Some(state) = &mut self.typography { state.invalidate_node(i); }
         self.invalidate_hidden_grid_edit(i);
         self.tail_edits = TailEdits::Other;
         if let Some(node) = self.nodes.get_mut(i) {
@@ -499,6 +521,8 @@ impl<T> LayoutTree<T> {
 
     /// Makes the next `solve_layout` a full solve. Use it when the measure function changes, for example after a font change.
     pub fn invalidate(&mut self) {
+        self.rules_state.dirty = true;
+        if let Some(state) = &mut self.typography { state.invalidate(); }
         #[cfg(feature = "batch-pilot")]
         {
             self.batch_start.changed();
@@ -512,6 +536,7 @@ impl<T> LayoutTree<T> {
     /// Enable pixel-grid rounding for output, or disable it with `None`.
     /// The scale is the number of physical pixels per logical pixel.
     pub fn set_pixel_scale(&mut self, pixels_per_logical_pixel: Option<PixelScale>) {
+        self.rules_state.dirty = true;
         self.layout_data.set_pixel_scale(pixels_per_logical_pixel);
     }
 
@@ -620,6 +645,64 @@ impl<T> LayoutTree<T> {
     fn solve_batch_owned(
         &mut self,
         window: Xy<f32>,
+        mut text: impl FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32>,
+        mut content: impl FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32>,
+        cache_text: bool,
+    ) -> Result<BatchLayoutStats, BatchLayoutError> {
+        if !self.rules_state.active() || self.rules_state.clean(window) {
+            return self.solve_batch_core(window, text, content, cache_text);
+        }
+        self.solve_batch_rules(window, &mut text, &mut content, cache_text)
+    }
+
+    // A managed pass can measure several times. Erase the callback types at
+    // this boundary so applications with many different closures share the
+    // scheduler and its graph-building code.
+    #[cfg(feature = "batch-pilot")]
+    fn solve_batch_rules(
+        &mut self,
+        window: Xy<f32>,
+        text: &mut TextCallback<'_, T>,
+        content: &mut ContentCallback<'_, T>,
+        cache_text: bool,
+    ) -> Result<BatchLayoutStats, BatchLayoutError> {
+        let saved_rects = self.nodes.iter()
+            .map(|(key, node)| (key, node.rect, node.identity))
+            .collect::<Vec<_>>();
+        let saved = BatchSnapshot {
+            window: self.published_window(),
+            sizes: self.nodes.iter().map(|(key, node)| (key, self.published_size(key, node))).collect(),
+        };
+        let warnings = self.warnings.clone();
+        let mut stats = BatchLayoutStats::default();
+        let result = self.run_rules(window, &mut |tree| {
+            let r = tree.solve_batch_core(window, &mut *text, &mut *content, cache_text)?;
+            stats.computed += r.computed;
+            stats.repaired_intervals += r.repaired_intervals;
+            stats.rebuilt_graph |= r.rebuilt_graph;
+            stats.slots = r.slots;
+            stats.edges = r.edges;
+            Ok(())
+        });
+        if let Err(error) = result {
+            for (key, rect, identity) in saved_rects {
+                self.nodes[key].rect = rect;
+                self.nodes[key].identity = identity;
+            }
+            self.published = Published::Snapshot(Arc::new(saved));
+            self.warnings = warnings;
+            self.batch.clear();
+            self.batch_start = BatchStart::First;
+            self.layout_data.request_full_solve(IncrementalRelayoutOutcome::FallbackInvalidated);
+            return Err(error);
+        }
+        Ok(stats)
+    }
+
+    #[cfg(feature = "batch-pilot")]
+    fn solve_batch_core(
+        &mut self,
+        window: Xy<f32>,
         text: impl FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32>,
         content: impl FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32>,
         cache_text: bool,
@@ -687,6 +770,40 @@ impl<T> LayoutTree<T> {
     fn solve_owned(
         &mut self,
         window: Xy<f32>,
+        mut text: impl FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32>,
+        mut content: impl FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32>,
+        cache_text: bool,
+    ) -> IncrementalRelayoutOutcome {
+        if !self.rules_state.active() || self.rules_state.clean(window) {
+            return self.solve_core(window, text, content, cache_text);
+        }
+        self.solve_rules_measured(window, &mut text, &mut content, cache_text)
+    }
+
+    fn solve_rules_measured(
+        &mut self,
+        window: Xy<f32>,
+        text: &mut TextCallback<'_, T>,
+        content: &mut ContentCallback<'_, T>,
+        cache_text: bool,
+    ) -> IncrementalRelayoutOutcome {
+        let mut outcome = None;
+        let Ok(()) = self.run_rules(window, &mut |tree| {
+            let result = tree.solve_core(window, &mut *text, &mut *content, cache_text);
+            use IncrementalRelayoutOutcome::Success;
+            outcome = Some(match (outcome, result) {
+                (Some(Success { computed: previous }), Success { computed }) => Success { computed: previous.saturating_add(computed) },
+                (Some(first), _) if !matches!(first, Success { .. }) => first,
+                (_, next) => next,
+            });
+            Ok::<_, std::convert::Infallible>(())
+        });
+        outcome.expect("a managed frame always executes a solve")
+    }
+
+    fn solve_core(
+        &mut self,
+        window: Xy<f32>,
         text: impl FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32>,
         content: impl FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32>,
         cache_text: bool,
@@ -727,6 +844,7 @@ impl<T> LayoutTree<T> {
     }
 
     fn record_attachment(&mut self, i: NodeKey, parent: NodeKey) {
+        self.rules_state.dirty = true;
         if self.layout_data.tracks_structure() {
             if let Some(parent) = self.nodes.get_mut(parent) {
                 self.layout_data.record_children_change(&mut parent.layout);
@@ -785,6 +903,7 @@ impl<T> links::VisibilityWalk for LayoutTree<T> {
 
     fn change_visibility(&mut self, root: NodeKey, id: NodeKey, disabled: bool, epoch: u32) -> Option<NodeKey> {
         let node = self.nodes.get_mut(id)?;
+        if let Some(authored) = self.rules_state.authored.get_mut(&id) { authored.disabled = disabled; }
         links::apply_visibility(&mut node.params.disabled, &mut node.identity, &mut node.layout, root == id, disabled, epoch);
         self.next_in_subtree(root, id, true)
     }
@@ -920,6 +1039,9 @@ impl LayoutNode {
         Self::initialized(params, identity, NodeLayoutData::new())
     }
 }
+
+type TextCallback<'a, T> = dyn FnMut(NodeId, Option<&mut T>, Option<f32>) -> Xy<f32> + 'a;
+type ContentCallback<'a, T> = dyn FnMut(NodeId, Option<&mut T>, ContentMeasureInput) -> Xy<f32> + 'a;
 
 fn zero_text<T>(_: NodeId, _: Option<&mut T>, _: Option<f32>) -> Xy<f32> {
     Xy::new_symm(0.0)

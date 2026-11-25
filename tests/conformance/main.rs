@@ -52,6 +52,16 @@ fn expectation(node: roxmltree::Node) -> Expected {
     }
 }
 
+// A fixture can opt into this transformation only when its physical inputs
+// are symmetric. Absolute physical insets and asymmetric margins have their
+// own independently specified RTL rectangles.
+fn reflect_children(parent: &mut Expected) {
+    for child in &mut parent.children {
+        child.rect[0] = parent.rect[2] - child.rect[0] - child.rect[2];
+        reflect_children(child);
+    }
+}
+
 struct NativeCase<'a> {
     reason: &'a str,
     expected: Expected,
@@ -69,9 +79,16 @@ fn native_cases<'a>(document: &'a roxmltree::Document) -> BTreeMap<&'a str, Nati
         }).collect();
         warnings.sort();
         let reason = case.attribute("reason").expect("native sizing rule");
-        for name in case.attribute("fixtures").expect("fixture names").split_whitespace() {
-            let previous = cases.insert(name, NativeCase { reason, expected: expectation(root), warnings: warnings.clone() });
-            assert!(previous.is_none(), "duplicate native expectation for {name}");
+        for (names, reflect) in [
+            (case.attribute("fixtures").expect("fixture names"), false),
+            (case.attribute("mirrored-fixtures").unwrap_or_default(), true),
+        ] {
+            for name in names.split_whitespace() {
+                let mut expected = expectation(root);
+                if reflect { reflect_children(&mut expected); }
+                let previous = cases.insert(name, NativeCase { reason, expected, warnings: warnings.clone() });
+                assert!(previous.is_none(), "duplicate native expectation for {name}");
+            }
         }
     }
     cases
@@ -170,7 +187,13 @@ fn run(path: &Path, native: Option<&NativeCase>, details: &mut Details, capture:
         tree.set_pixel_scale(Some(PixelScale::ONE));
     }
     let window = Xy::new(window.x.unwrap_or(UNBOUNDED), window.y.unwrap_or(UNBOUNDED));
-    tree.solve_layout_with_measure(window, measure);
+    tree.solve_layout_with_measurers(window, measure, |_, text, input| {
+        let Some(text) = text else { return Xy::new_symm(0.); };
+        // Vertical Ahem lines wrap against physical height and accumulate width.
+        let inline = input.known_dimensions.y.or(input.max_size.y).unwrap_or(f32::INFINITY);
+        let (height, width) = text.wrap(inline);
+        Xy::new(width, height)
+    });
     details.warnings = tree.warnings().iter().map(|w| diagnostic(w, &built)).collect();
     details.warnings.sort();
     let Some(mut expected) = expectations.first_element_child().map(expectation) else {

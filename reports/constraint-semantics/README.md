@@ -1,5 +1,22 @@
 # Constraint resolution and authoring review
 
+## Writing modes, block margins and weighted flex bases
+
+The [current case ledger](current-cases.tsv) records the previous and current outcome for each of the 6,604 fixture IDs. For a supported input it includes physical parent-local rectangles and diagnostic expectations. For a pending input it identifies the first declaration the fixture translator cannot express. A pending row has no geometry verdict.
+
+| Earlier outcome | Current browser match | Current deliberate geometry difference | Current untranslated |
+| --- | ---: | ---: | ---: |
+| Browser match | 715 | 0 | 0 |
+| Deliberate native difference | 0 | 55 | 0 |
+| Untranslated | 927 | 55 | 4,852 |
+| **Total** | **1,642** | **110** | **4,852** |
+
+The first 906 newly translatable inputs cover inherited direction, nested overrides, self-alignment, physical insets, block auto margins and vertical Ahem measurement. Whole-tree RTL native contracts independently reflect each parent-local rectangle when the input has symmetric physical edges. Three fixture families need explicit treatment for physical margins or insets. The 100 px left margin on a centered child, for example, still places the child at x = 80 in both directions. The browser agreement count includes 44 cases that additionally require exact native diagnostics. All 1,752 supported fixtures have either a browser match or a deliberate whole-tree geometry contract.
+
+A further 76 fixtures exercise single-line flex rows and columns with definite dimensions and empty leaf items. At least one growing item declares a positive pixel or percentage basis. The translator preserves every item’s preferred size and lowers its separate basis, grow factor, shrink factor and bounds into the managed flexible formatting context. For all 76 inputs, the ledger records a separate arithmetic derivation from the fixture declarations. Computing a shared growth multiplier, applying each item’s bounds, and rounding physical edges reproduced every child rectangle. In a 200 px row, for example, 50% and 25% bases give 100 and 50 px. Equal growth divides the remaining 50 px into two 25 px additions, yielding 125 and 75 px.
+
+## Earlier constraint review
+
 The review compares Craft at commit `146f57e` and the revised solver using Taffy revision `4e59968eda29ceeb0bbaeb3993c8cd38baa3d0a6`. It covers 6,604 individual XML inputs. Some pairs exercise identical declarations under different box-sizing defaults. Each variant has its own row.
 
 - [Reviewed cases](reviewed-cases.tsv) contains all 772 fixtures that translated on either revision. Each row gives the original and revised outcome, the judgment about the declarations, expected warnings, and the revised Craft tree where a native translation exists. For deliberate geometric differences it includes Taffy’s coordinates at each differing node.

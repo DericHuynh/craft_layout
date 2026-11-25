@@ -42,8 +42,60 @@ Each sample runs a sequence of edits, checks expected geometry, and compares the
 | [Check-in kiosk](examples/checkin_kiosk) | Translated booking text, validation, a compact summary and the one-pixel threshold at which appointment controls wrap. |
 | [Command palette](examples/command_palette) | Fitted, variable-width menus, a nested coordinate frame and the choice of edge when a popup cannot fit on either side of the pointer. |
 | [Mixing studio](examples/mixing_studio) | Track insertion, a removable send rack, selection overlays and two meters per channel. |
+| [Dispatch board](examples/dispatch_board) | Twenty-four localized ticket rows, independently shrinkable fields, a protected action and embedded LTR content. |
+| [Maintenance console](examples/maintenance_console) | Shared label and field columns, a panel-local breakpoint, a sticky heading and help anchored to a scrolling control. |
 
 For a free-positioned popup that should remain eight pixels inside the far edge as its parent resizes, use `Pos::Offset { fraction: 1.0, pixels: -8.0 }` with `Anchor::End` on that axis. Downstream code that exhaustively matches `Pos` must handle the new variant.
+
+## Native layout rules
+
+Use `LayoutTree::set_rules` for an application that needs inherited writing direction, flexible lines, heterogeneous grid tracks, scrollports, or size queries. Rules attach to stable node handles. Edit the original `LayoutParams` or rules and solve again after an edit. Reading `params` returns the authored physical declarations. Passing `NodeRules::default()` to `set_rules` removes the optional declarations on that node.
+
+```rust
+# #[cfg(feature = "incremental")]
+# fn main() -> Result<(), keru_layout::TreeError> {
+use keru_layout::{LayoutParams, LayoutTree, Size, Xy};
+use keru_layout::flex::{FlexItem, FlexLayout};
+use keru_layout::layout_rules::NodeRules;
+
+let mut tree = LayoutTree::<()>::new();
+let row = tree.root();
+tree.set_rules(&row, NodeRules {
+    flex: Some(FlexLayout { gap: 10.0, ..Default::default() }),
+    ..Default::default()
+})?;
+let mut fields = Vec::new();
+for width in [160.0, 120.0] {
+    let field = tree.add_node(&row, LayoutParams {
+        size: Xy::new(Size::Pixels(width), Size::Pixels(24.0)),
+        ..LayoutParams::DEFAULT
+    })?;
+    tree.set_rules(&field, NodeRules {
+        flex_item: FlexItem { shrink: 1.0, ..Default::default() },
+        ..Default::default()
+    })?;
+    fields.push(field);
+}
+tree.solve_layout(Xy::new(220.0, 40.0));
+assert_eq!(tree.layout(&fields[0])?.x, [0.0, 120.0]);
+assert_eq!(tree.layout(&fields[1])?.x, [130.0, 220.0]);
+# Ok(())
+# }
+# #[cfg(not(feature = "incremental"))]
+# fn main() {}
+```
+
+| When authoring | Contract |
+| --- | --- |
+| Localized UI | `LogicalStyle` inherits direction and writing mode independently. Logical start/end padding and margins map to physical edges. Set the direction of an embedded editor on the editor itself. |
+| Text and controls | Implement `InlineMeasurer` for horizontal line metrics, then use `solve_layout_with_typography`. A bounded fit-content width stays between the measured minimum and maximum. The host supplies line breaking, shaping, and the baseline offsets. |
+| Flexible rows and columns | Fixed preferred sizes keep their size by default. Set `grow` or `shrink` on the items permitted to change. A binding lower or upper bound redistributes the rest among eligible items. Native `Fill` retains its weighted share when an item has no explicit flexibility. |
+| Track grids | Use `TrackGrid` and `GridItem` for explicit and implicit tracks. Track indices are zero-based. In a nested form row, `TrackAxis::Subgrid` inherits the tracks spanned by that row, including their gaps. Descendant labels can contribute to the parent’s content track. |
+| Scrolling and overlays | Read `layout` for unscrolled flow geometry. Read `view_geometry` for window-space drawing, clip, scrollport, and applied offset. `set_scroll_offset` accepts a request, which the next solve clamps. Anchor fallback checks the authored sides in order. |
+| Responsive components | Put size containment on the ancestor axis used for a breakpoint. A child query reads the nearest eligible ancestor’s content-box size, optionally by name. A fitted contained axis uses its intrinsic placeholder and padding. |
+| Diagnostics | Read `warnings` for the underlying solver and `rule_issues` for missing dependencies, incompatible declarations, and unresolved geometry. |
+
+The owned tree integrates these rules with its existing measurement, placement, invalidation, and publication paths. Trees authored entirely with native `LayoutParams` go directly to the existing solver. Custom `TreeAdapter` implementations can use the public logical projection, flexible-line, and grid-track functions when integrating their own node store. The [implementation goal and acceptance checks](reports/constraint-semantics/implementation-goal.md) describe the tested scope.
 
 ## Usage
 

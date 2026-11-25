@@ -45,3 +45,11 @@ required-features = ["incremental"]
 [[example]]
 name = "example"
 required-features = ["incremental"]
+
+[[example]]
+name = "dispatch_board"
+required-features = ["incremental"]
+
+[[example]]
+name = "maintenance_console"
+required-features = ["incremental"]
