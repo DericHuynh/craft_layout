@@ -66,6 +66,7 @@ pub(crate) fn same_axis_declarations(old: &LayoutParams, current: &LayoutParams,
 #[cfg_attr(verus_keep_ghost, verus_spec(returns sizing_structure_changed(old, current), no_unwind))]
 pub(crate) fn sizing_structure_changed(old: &LayoutParams, current: &LayoutParams) -> bool {
     old.disabled != current.disabled
+        || old.isolate_block_margins != current.isolate_block_margins
         || old.free_placement != current.free_placement
         || old.grid_span.x != current.grid_span.x || old.grid_span.y != current.grid_span.y
         || old.text as u8 != current.text as u8

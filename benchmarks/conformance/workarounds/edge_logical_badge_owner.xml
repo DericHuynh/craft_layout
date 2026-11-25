@@ -1,0 +1,77 @@
+<test name="edge_logical_badge_owner" use-rounding="false">
+  <viewport width="200px" height="720px" />
+  <input>
+    <div display="block" width="200px" height="720px">
+      <!--grid ltr outer-->
+      <div display="block" position="relative" direction="ltr" width="200px" height="120px">
+        <div display="grid" grid-template-columns="200px" grid-template-rows="64px" position="static" direction="rtl" width="200px" height="64px">
+          <div display="block" position="absolute" left="10px" right="24px" top="5px" width="40px" height="12px" />
+        </div>
+      </div>
+      <!--grid rtl outer-->
+      <div display="block" position="relative" direction="rtl" width="200px" height="120px">
+        <div display="grid" grid-template-columns="200px" grid-template-rows="64px" position="static" direction="ltr" width="200px" height="64px">
+          <div display="block" position="absolute" left="10px" right="24px" top="5px" width="40px" height="12px" />
+        </div>
+      </div>
+      <!--ltr outer-->
+      <div display="block" position="relative" direction="ltr" width="200px" height="120px">
+        <div display="block" position="static" direction="rtl" width="200px" height="64px">
+          <div display="block" position="absolute" left="10px" right="24px" top="5px" width="40px" height="12px" />
+        </div>
+      </div>
+      <!--ltr wrapper-->
+      <div display="block" position="relative" direction="rtl" width="200px" height="120px">
+        <div display="block" position="relative" direction="ltr" width="200px" height="64px">
+          <div display="block" position="absolute" left="10px" right="24px" top="5px" width="40px" height="12px" />
+        </div>
+      </div>
+      <!--rtl outer-->
+      <div display="block" position="relative" direction="rtl" width="200px" height="120px">
+        <div display="block" position="static" direction="ltr" width="200px" height="64px">
+          <div display="block" position="absolute" left="10px" right="24px" top="5px" width="40px" height="12px" />
+        </div>
+      </div>
+      <!--rtl wrapper-->
+      <div display="block" position="relative" direction="ltr" width="200px" height="120px">
+        <div display="block" position="relative" direction="rtl" width="200px" height="64px">
+          <div display="block" position="absolute" left="10px" right="24px" top="5px" width="40px" height="12px" />
+        </div>
+      </div>
+    </div>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="200" height="720">
+      <node x="0" y="0" width="200" height="120">
+        <node x="0" y="0" width="200" height="64">
+          <node x="10" y="5" width="40" height="12" />
+        </node>
+      </node>
+      <node x="0" y="120" width="200" height="120">
+        <node x="0" y="0" width="200" height="64">
+          <node x="136" y="5" width="40" height="12" />
+        </node>
+      </node>
+      <node x="0" y="240" width="200" height="120">
+        <node x="0" y="0" width="200" height="64">
+          <node x="10" y="5" width="40" height="12" />
+        </node>
+      </node>
+      <node x="0" y="360" width="200" height="120">
+        <node x="0" y="0" width="200" height="64">
+          <node x="10" y="5" width="40" height="12" />
+        </node>
+      </node>
+      <node x="0" y="480" width="200" height="120">
+        <node x="0" y="0" width="200" height="64">
+          <node x="136" y="5" width="40" height="12" />
+        </node>
+      </node>
+      <node x="0" y="600" width="200" height="120">
+        <node x="0" y="0" width="200" height="64">
+          <node x="136" y="5" width="40" height="12" />
+        </node>
+      </node>
+    </node>
+  </expectations>
+</test>

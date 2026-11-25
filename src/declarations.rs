@@ -258,9 +258,21 @@ impl Margin {
     #[cfg_attr(verus_keep_ghost, verus_spec(returns self.is_zero(), no_unwind))]
     pub(crate) fn is_zero(self) -> bool { self.0 == 0 }
 
-    /// Share the unused inline space in block flow. On other edges it is zero.
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    const AUTO_WORD: u32 = 0x7fc0_0000;
+
+    #[inline(always)]
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+    pub(crate) const fn is_auto(self) -> bool { self.0 == Self::AUTO_WORD }
+
+    /// Share spare inline space in block flow. In a stack, wrap or managed flex layout,
+    /// main-axis automatic edges divide the line's positive spare space equally after
+    /// sizing, fixed margins and gaps, and before arrangement. A leading automatic
+    /// margin can push a trailing action to the far edge of its line.
+    /// In a simple stack or wrap, automatic margins on the cross axis resolve to zero.
     #[cfg(not(verus_keep_ghost))]
-    pub const AUTO: Self = Self(f32::NAN.to_bits());
+    pub const AUTO: Self = Self(Self::AUTO_WORD);
 
     /// A finite margin in logical pixels. Negative values are allowed.
     ///
@@ -338,12 +350,21 @@ pub struct LayoutParams {
     /// The maximum size of a layout node on its two axes.
     pub max_size: Xy<Option<Size>>,
     /// The space that this node keeps for itself as padding before giving space to its children.
+    /// Each pair is physical (left/right or top/bottom). If the box is too small for both
+    /// sides, left/top consumes its share first and the content extent falls to zero inside the box.
     pub padding: Xy<[f32; 2]>,
     /// Space outside the node's box in a stack, wrap, grid, or block. Each pair uses physical
     /// start/end order (left/right or top/bottom). Free placement ignores margins.
     pub margin: Xy<[Margin; 2]>,
     /// How this node positions its children.
     pub children_layout: ChildrenLayout,
+    /// Keep child block margins inside this box and separate its own before and after
+    /// margins when empty. Its outer margins can still collapse with adjacent siblings.
+    /// Managed flex and track grids establish this boundary automatically.
+    /// In an owned tree's horizontal block flow, an isolated block avoids adjacent
+    /// floats and includes its own floats in its intrinsic height. Overflow stays visible
+    /// by default.
+    pub isolate_block_margins: bool,
     /// Place this node freely within the parent, outside the parent's in-flow layout.
     pub free_placement: bool,
     /// Whether this node should occupy more than one cell if this node is a child of a grid.
@@ -369,6 +390,33 @@ pub struct LayoutParams {
 
 impl LayoutParams {
     #[inline(always)]
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+    pub(crate) fn auto_margins(&self, axis: Axis) -> [bool; 2] {
+        let [start, end] = *self.margin.component(axis);
+        [start.is_auto(), end.is_auto()]
+    }
+
+    #[cfg(any(feature = "incremental", verus_keep_ghost))]
+    #[inline(always)]
+    #[cfg_attr(verus_keep_ghost, verus_verify)]
+    #[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+    pub(crate) fn has_auto_margin(&self, axis: Axis) -> bool {
+        let [start, end] = self.auto_margins(axis);
+        start || end
+    }
+
+    #[inline]
+    #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
+    #[cfg_attr(verus_keep_ghost, verus_spec(returns self.block_margins_can_collapse(), no_unwind))]
+    pub(crate) fn block_margins_can_collapse(&self) -> bool {
+        !self.isolate_block_margins
+            && matches!(self.children_layout, ChildrenLayout::Block | ChildrenLayout::Free)
+            && matches!(self.text, TextContent::None) && self.image.is_none()
+            && matches!(self.content_measure, ContentMeasure::None)
+    }
+
+    #[inline(always)]
     #[cfg_attr(verus_keep_ghost, verus_verify(dual_spec, open))]
     #[cfg_attr(verus_keep_ghost, verus_spec(returns self.text_wraps_on(axis), no_unwind))]
     pub(crate) fn text_wraps_on(&self, axis: Axis) -> bool {
@@ -391,6 +439,7 @@ impl LayoutParams {
         padding: Xy { x: [0.0, 0.0], y: [0.0, 0.0] },
         margin: Xy::new_symm([Margin::ZERO; 2]),
         children_layout: ChildrenLayout::Free,
+        isolate_block_margins: false,
         free_placement: false,
         grid_span: Xy { x: 1, y: 1 },
         text: TextContent::None,

@@ -1,0 +1,14 @@
+<test name="grid_responsive_pixels_first" use-rounding="false">
+  <viewport width="90px" height="20px"/>
+  <input>
+    <div display="grid" width="90px" height="20px" column-gap="10px"
+         grid-template-columns="repeat(auto-fit, minmax(min(120px, 100%), 1fr))">
+      <div height="20px"/>
+    </div>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="90" height="20" resolved-columns="90px" resolved-rows="20px">
+      <node x="0" y="0" width="90" height="20"/>
+    </node>
+  </expectations>
+</test>

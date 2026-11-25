@@ -15,7 +15,7 @@ use crate::prepare_frame::FrameFloat;
 ///
 /// For example, an element with `Size::Pixels(10.0)` and `Pos::Pixels(0.0)` on an axis will be placed at `[0.0, 10.0]`, `[-5.0, 5.0]` or `[-10.0, 0.0]` if its `Anchor` is `Start`, `Center` or `End` respectively.
 ///
-/// Has no effect in a stack's main axis, or for `Pos` values other than `Pixels` and `Frac`.
+/// Has no effect in a stack's main axis, or with the edge and center alignment positions.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 pub enum Anchor {
     /// The left or top edge of the element's rectangle.
@@ -47,6 +47,16 @@ pub enum Pos {
     Pixels(f32),
     /// A fraction of the parent's size starting from its left or top side.
     Frac(f32),
+    /// Anchor at a fraction of the parent's inner extent plus a logical pixel offset.
+    /// Both components are measured from the same origin, including when that origin is flipped.
+    /// For example, `Offset { fraction: 1.0, pixels: -8.0 }` places the anchor eight pixels
+    /// before the far edge as the parent resizes.
+    Offset {
+        /// Fraction of the available range along this axis.
+        fraction: f32,
+        /// Additional distance from the origin, in logical pixels.
+        pixels: f32,
+    },
 }
 
 /// What to do if a freely placed node would extend past the edges of the window. It has no effect on the children of a `Stack` or a `Grid`, unless they are `free_placement`.
@@ -58,7 +68,10 @@ pub enum WindowOverflow {
     Ignore,
     /// Push the node back inside the window.
     Clamp,
-    /// Mirror the node to the other side of its anchor point, as a right-click context menu does. If the mirrored node also doesn't fit, push it back inside the window.
+    /// Keep the requested placement if it fits on this axis. On overflow, try the
+    /// opposite side of the anchor, as a context menu would. When neither side
+    /// fits, clamp the originally requested placement into the window. If the
+    /// node is as large as the window or larger, place its near edge at zero.
     Flip,
 }
 
@@ -120,10 +133,15 @@ impl FloatBounds for RustFloat {
 
 #[cfg(verus_keep_ghost)]
 verus! {
+pub(crate) open spec fn padded_start<F: FrameFloat>(edges: [f32; 2], padding: f32) -> f32 {
+    let start = F::sum(edges[0], padding);
+    if strict::<F>(0.0, padding) && strict::<F>(edges[1], start) { edges[1] } else { start }
+}
+
 pub(crate) open spec fn padded_range<F: FrameFloat>(edges: [f32; 2], padding: [f32; 2]) -> [f32; 2] {
-    let [start, end] = edges;
-    let [pad_start, pad_end] = padding;
-    [F::sum(start, pad_start), F::difference(end, pad_end)]
+    let start = padded_start::<F>(edges, padding[0]);
+    let end = F::difference(edges[1], padding[1]);
+    [start, if strict::<F>(end, start) { start } else { end }]
 }
 
 pub(crate) open spec fn centered<F: FrameFloat>(start: f32, end: f32, size: f32) -> [f32; 2] {
@@ -133,13 +151,22 @@ pub(crate) open spec fn centered<F: FrameFloat>(start: f32, end: f32, size: f32)
 }
 }
 
+/// The physical left/top inset consumes at most the width/height of the box.
+#[inline(always)]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(returns padded_start::<F>(edges, padding), no_unwind))]
+pub(crate) fn inner_start<F: FrameFloat>(edges: [f32; 2], padding: f32) -> f32 {
+    let start = F::add(edges[0], padding);
+    if F::less_than(0.0, padding) && F::less_than(edges[1], start) { edges[1] } else { start }
+}
+
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(returns padded_range::<F>(edges, padding), no_unwind))]
 pub(crate) fn inner_range<F: FrameFloat>(edges: [f32; 2], padding: [f32; 2]) -> [f32; 2] {
-    let [start, end] = edges;
-    let [pad_start, pad_end] = padding;
-    [F::add(start, pad_start), F::subtract(end, pad_end)]
+    let start = inner_start::<F>(edges, padding[0]);
+    let end = F::subtract(edges[1], padding[1]);
+    [start, if F::less_than(end, start) { start } else { end }]
 }
 
 #[inline(always)]
@@ -149,6 +176,14 @@ pub(crate) fn centered_range<F: FrameFloat>(start: f32, end: f32, size: f32) -> 
     let center = F::divide(F::add(start, end), 2.0);
     let half = F::divide(size, 2.0);
     [F::subtract(center, half), F::add(center, half)]
+}
+
+/// Each automatic edge receives the same positive remainder from its resolved line.
+#[inline]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+pub(crate) fn auto_margin_share(remaining: f32, edges: usize) -> f32 {
+    if remaining > 0.0 && edges > 0 { remaining / edges as f32 } else { 0.0 }
 }
 
 /// Restart a stack or wrap line at the chosen alignment.
@@ -205,6 +240,11 @@ pub(crate) open spec fn positioned<F: FrameFloat>(range: [f32; 2], position: Pos
             else { F::difference(origin, pixels) }, anchor, flipped, size),
         Pos::Frac(frac) => {
             let offset = F::product(frac, F::difference(inner_end, inner_start));
+            anchored::<F>(if !flipped { F::sum(origin, offset) }
+                else { F::difference(origin, offset) }, anchor, flipped, size)
+        },
+        Pos::Offset { fraction, pixels } => {
+            let offset = F::sum(F::product(fraction, F::difference(inner_end, inner_start)), pixels);
             anchored::<F>(if !flipped { F::sum(origin, offset) }
                 else { F::difference(origin, offset) }, anchor, flipped, size)
         },
@@ -296,6 +336,11 @@ pub(crate) fn resolve_position<F: FrameFloat>(range: [f32; 2], position: Pos, an
             let reference = if !flipped { F::add(origin_edge, static_pos) } else { F::subtract(origin_edge, static_pos) };
             position_at::<F>(reference, anchor, flipped, child_size)
         }
+        Pos::Offset { fraction, pixels } => {
+            let offset = F::add(F::multiply(fraction, F::subtract(inner_end, inner_start)), pixels);
+            let reference = if !flipped { F::add(origin_edge, offset) } else { F::subtract(origin_edge, offset) };
+            position_at::<F>(reference, anchor, flipped, child_size)
+        }
         Pos::Center => centered_range::<F>(inner_start, inner_end, child_size),
     }
 }
@@ -372,18 +417,19 @@ pub(crate) fn grid_track_size<F: FloatBounds>(size: f32, [pad_start, pad_end]: [
 #[inline]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
-pub(crate) fn grid_cell_edges<F: FloatBounds>([start, end]: [f32; 2], [pad_start, pad_end]: [f32; 2],
+pub(crate) fn grid_cell_edges<F: FrameFloat>(edges: [f32; 2], padding: [f32; 2],
     flipped: bool, index: f32, cell: f32, spacing: f32, span: u16, lines: f32,
 ) -> [f32; 2] {
     let span = if span == 0 { 1 } else { span };
     let span = F::min(span as f32, F::max(lines, 1.0));
     let offset = index * (cell + spacing);
     let length = span * cell + (span - 1.0) * spacing;
+    let [start, end] = inner_range::<F>(edges, padding);
     if !flipped {
-        let start = start + pad_start + offset;
+        let start = start + offset;
         [start, start + length]
     } else {
-        let end = end - pad_end - offset;
+        let end = end - offset;
         [end - length, end]
     }
 }

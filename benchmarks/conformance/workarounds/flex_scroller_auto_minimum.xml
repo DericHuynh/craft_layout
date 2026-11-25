@@ -1,0 +1,38 @@
+<test name="flex_scroller_auto_minimum" use-rounding="false">
+  <!-- Craft allocates 124px to the nested viewport and leaves 116px of vertical scroll. Chromium 83 measured the pane at y=36, height 240 with no room to scroll. -->
+  <viewport width="400px" height="400px"/>
+  <input>
+    <div display="flex" direction="ltr" position="absolute" width="224px" height="160px" flex-direction="column">
+      <div display="flex" direction="ltr" position="relative" height="36px" flex-shrink="0"/>
+      <div display="flex" direction="ltr" position="relative" flex-basis="0%" flex-grow="1" flex-shrink="1" flex-direction="column">
+        <div display="flex" direction="ltr" position="relative" flex-basis="0%" flex-grow="1" flex-shrink="1" flex-direction="column" overflow-y="auto" overflow-x="hidden">
+          <div display="flex" direction="ltr" position="relative" height="30px" flex-shrink="0"/>
+          <div display="flex" direction="ltr" position="relative" height="30px" flex-shrink="0"/>
+          <div display="flex" direction="ltr" position="relative" height="30px" flex-shrink="0"/>
+          <div display="flex" direction="ltr" position="relative" height="30px" flex-shrink="0"/>
+          <div display="flex" direction="ltr" position="relative" height="30px" flex-shrink="0"/>
+          <div display="flex" direction="ltr" position="relative" height="30px" flex-shrink="0"/>
+          <div display="flex" direction="ltr" position="relative" height="30px" flex-shrink="0"/>
+          <div display="flex" direction="ltr" position="relative" height="30px" flex-shrink="0"/>
+        </div>
+      </div>
+    </div>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="224" height="160">
+      <node x="0" y="0" width="224" height="36"/>
+      <node x="0" y="36" width="224" height="124">
+        <node x="0" y="0" width="224" height="124" scroll_width="0" scroll_height="116">
+          <node x="0" y="0" width="224" height="30"/>
+          <node x="0" y="30" width="224" height="30"/>
+          <node x="0" y="60" width="224" height="30"/>
+          <node x="0" y="90" width="224" height="30"/>
+          <node x="0" y="120" width="224" height="30"/>
+          <node x="0" y="150" width="224" height="30"/>
+          <node x="0" y="180" width="224" height="30"/>
+          <node x="0" y="210" width="224" height="30"/>
+        </node>
+      </node>
+    </node>
+  </expectations>
+</test>

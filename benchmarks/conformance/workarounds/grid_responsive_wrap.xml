@@ -1,0 +1,18 @@
+<test name="grid_responsive_wrap" use-rounding="false">
+  <viewport width="250px" height="40px"/>
+  <input>
+    <div display="grid" width="250px" height="40px" column-gap="10px"
+         grid-template-columns="repeat(auto-fit, minmax(min(100%, 120px), 1fr))">
+      <div height="20px"/>
+      <div height="20px"/>
+      <div height="20px"/>
+    </div>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="250" height="40" resolved-columns="120px 120px" resolved-rows="20px 20px">
+      <node x="0" y="0" width="120" height="20"/>
+      <node x="130" y="0" width="120" height="20"/>
+      <node x="0" y="20" width="120" height="20"/>
+    </node>
+  </expectations>
+</test>

@@ -15,6 +15,146 @@ fn edges(start: f32, end: f32) -> [Margin; 2] {
 }
 
 #[test]
+fn fit_stack_resolves_a_fraction_just_below_one_and_its_aspect_dependent() {
+    let mut tree = LayoutTree::<()>::new();
+    let start = Xy::new_symm(Pos::Start);
+    let row = tree.add_node(&tree.root(), LayoutParams {
+        position: start,
+        size: Xy::new(Size::FitContent, Size::AspectRatio(2.0)),
+        children_layout: ChildrenLayout::Stack { axis: Axis::X, arrange: Arrange::Start, spacing: 2.0 },
+        padding: Xy::new([3.0, 5.0], [0.0; 2]),
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+    let mut fixed = LayoutParams { position: start, size: px(1.0, 1.0), ..LayoutParams::DEFAULT };
+    let first = tree.add_node(&row, fixed).unwrap();
+    let last = tree.add_node(&row, LayoutParams {
+        position: start, size: Xy::new(Size::Frac(1023.0 / 1024.0), Size::Pixels(1.0)),
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+
+    // Make the edited row a small enough share of the tree to use the retained solve.
+    for _ in 0..32 {
+        tree.add_node(&tree.root(), LayoutParams { size: px(1.0, 1.0), ..LayoutParams::DEFAULT }).unwrap();
+    }
+    for fixed_width in [1.0, 2.0] {
+        fixed.size.x = Size::Pixels(fixed_width);
+        tree.update_node_params(&first, fixed).unwrap();
+        let outcome = tree.solve_layout(Xy::new_symm(3000.0));
+        if fixed_width == 2.0 {
+            assert!(matches!(outcome, IncrementalRelayoutOutcome::Success { .. }), "{outcome:?}");
+        }
+        // After padding and the gap, W = fixed_width + (1023/1024) * W.
+        let width = fixed_width * 1024.0 + 10.0;
+        assert_eq!(tree.layout(&row).unwrap(), rect([0.0, width], [0.0, width / 2.0]));
+        assert_eq!(tree.layout(&last).unwrap().x, [5.0 + fixed_width, width - 5.0]);
+        assert!(tree.warnings().is_empty(), "{:?}", tree.warnings());
+    }
+}
+
+fn horizontal_fit_stack() -> (LayoutTree<()>, NodeId) {
+    let mut tree = LayoutTree::<()>::new();
+    let row = tree.root();
+    tree.update_node_params(&row, LayoutParams {
+        position: Xy::new_symm(Pos::Start), size: Xy::new(Size::FitContent, Size::Pixels(1.0)),
+        children_layout: ChildrenLayout::Stack { axis: Axis::X, arrange: Arrange::Start, spacing: 0.0 },
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+    (tree, row)
+}
+
+#[test]
+fn fit_stack_resolves_overcommitted_fractions_when_a_child_maximum_binds() {
+    let (mut tree, row) = horizontal_fit_stack();
+    tree.add_node(&row, LayoutParams { size: px(1.0, 4.0), ..LayoutParams::DEFAULT }).unwrap();
+    let style = LayoutParams {
+        size: Xy::new(Size::Frac(0.75), Size::Pixels(4.0)), ..LayoutParams::DEFAULT
+    };
+    let mut capped = style;
+    capped.max_size.x = Some(Size::Pixels(12.0));
+    let first = tree.add_node(&row, capped).unwrap();
+    let second = tree.add_node(&row, style).unwrap();
+    let viewport = Xy::new_symm(300.0);
+
+    for cap in [12.0, 15.0] {
+        capped.max_size.x = Some(Size::Pixels(cap));
+        tree.update_node_params(&first, capped).unwrap();
+        tree.solve_layout(viewport);
+        // W = 1 + cap + 3/4 W once the first item reaches its limit.
+        let width = (1.0 + cap) * 4.0;
+        assert_eq!(tree.layout(&row).unwrap().x, [0.0, width]);
+        assert_eq!(tree.layout(&first).unwrap().x, [1.0, 1.0 + cap]);
+        assert_eq!(tree.layout(&second).unwrap().x, [1.0 + cap, width]);
+        assert!(tree.warnings().is_empty(), "{:?}", tree.warnings());
+    }
+
+    tree.update_node_params(&first, style).unwrap();
+    tree.solve_layout(viewport);
+    assert!(tree.warnings().iter().any(|warning| matches!(warning,
+        LayoutWarning::ImpossibleFracChildren { node, axis: Axis::X } if *node == row)));
+}
+
+#[test]
+fn fit_stack_honors_the_minimum_that_supplies_its_intrinsic_size() {
+    let (mut tree, row) = horizontal_fit_stack();
+    let mut style = LayoutParams {
+        size: Xy::new(Size::Frac(1.0), Size::Pixels(1.0)),
+        min_size: Xy::new(Some(Size::Pixels(10.0)), None),
+        max_size: Xy::new(Some(Size::Pixels(30.0)), None),
+        ..LayoutParams::DEFAULT
+    };
+    let child = tree.add_node(&row, style).unwrap();
+    for (fraction, width) in [(1.0, 10.0), (1.5, 30.0)] {
+        style.size.x = Size::Frac(fraction);
+        tree.update_node_params(&child, style).unwrap();
+        tree.solve_layout(Xy::new_symm(100.0));
+        assert_eq!(tree.layout(&row).unwrap().x, [0.0, width]);
+        assert_eq!(tree.layout(&child).unwrap().x, [0.0, width]);
+        assert!(tree.warnings().is_empty(), "{:?}", tree.warnings());
+    }
+}
+
+#[test]
+fn fit_stack_crosses_many_caps_without_truncating_the_solution() {
+    let (mut tree, row) = horizontal_fit_stack();
+    tree.add_node(&row, LayoutParams { size: px(1.0, 1.0), ..LayoutParams::DEFAULT }).unwrap();
+    let mut items = Vec::new();
+    for cap in 1..=100 {
+        let item = tree.add_node(&row, LayoutParams {
+            size: Xy::new(Size::Frac(1.0), Size::Pixels(1.0)),
+            max_size: Xy::new(Some(Size::Pixels(cap as f32)), None),
+            ..LayoutParams::DEFAULT
+        }).unwrap();
+        items.push(item);
+    }
+    tree.solve_layout(Xy::new_symm(6000.0));
+    let mut x = 1.0;
+    for (index, item) in items.iter().enumerate() {
+        let end = x + (index + 1) as f32;
+        assert_eq!(tree.layout(item).unwrap().x, [x, end]);
+        x = end;
+    }
+    assert_eq!(tree.layout(&row).unwrap().x, [0.0, 5051.0]);
+    assert!(tree.warnings().is_empty(), "{:?}", tree.warnings());
+}
+
+#[test]
+fn fit_stack_caps_a_fraction_before_its_uncapped_extrapolation_overflows() {
+    let (mut tree, row) = horizontal_fit_stack();
+    let fixed = 2f32.powi(120);
+    let cap = fixed / 4.0;
+    tree.add_node(&row, LayoutParams { size: px(fixed, 1.0), ..LayoutParams::DEFAULT }).unwrap();
+    let child = tree.add_node(&row, LayoutParams {
+        size: Xy::new(Size::Frac(1023.0 / 1024.0), Size::Pixels(1.0)),
+        max_size: Xy::new(Some(Size::Pixels(cap)), None),
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+    tree.solve_layout(Xy::new_symm(1.0));
+    assert_eq!(tree.layout(&row).unwrap().x, [0.0, fixed + cap]);
+    assert_eq!(tree.layout(&child).unwrap().x, [fixed, fixed + cap]);
+    assert!(tree.warnings().is_empty(), "{:?}", tree.warnings());
+}
+
+#[test]
 fn width_grid_with_zero_track_step_uses_one_column() {
     for (width, spacing) in [(0.0, 0.0), (8.0, -8.0)] {
         let mut tree = LayoutTree::<()>::new();
@@ -484,5 +624,179 @@ fn ordinary_block_root_replay_matches_a_fresh_reflow() {
         assert_eq!(view(&tree), view(&fresh));
         assert!(tree.warnings().is_empty());
         assert!(fresh.warnings().is_empty());
+    }
+}
+
+#[test]
+fn intrinsic_block_width_includes_the_childs_padding_floor() {
+    let window = Xy::new_symm(200.0);
+    check_block_padding_floor(|tree| { tree.solve_layout(window); });
+    #[cfg(feature = "batch-pilot")]
+    check_block_padding_floor(|tree| { tree.solve_layout_batch(window).unwrap(); });
+}
+
+fn check_block_padding_floor(mut solve: impl FnMut(&mut LayoutTree<()>)) {
+    let mut tree = LayoutTree::<()>::new();
+    let outer = tree.add_node(&tree.root(), LayoutParams {
+        size: Xy::new(Size::FitContent, Size::FitContent),
+        position: Xy::new_symm(Pos::Start),
+        children_layout: ChildrenLayout::Block,
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+    let mut params = LayoutParams {
+        size: Xy::new(Size::Auto, Size::Pixels(10.0)),
+        max_size: Xy::new(Some(Size::Pixels(12.0)), None),
+        padding: Xy::new([15.0, 7.0], [0.0; 2]),
+        margin: Xy::new(edges(2.0, 3.0), [Margin::ZERO; 2]),
+        ..LayoutParams::DEFAULT
+    };
+    let item = tree.add_node(&outer, params).unwrap();
+    for right in [7.0, 11.0, 3.0] {
+        params.padding.x[1] = right;
+        tree.update_node_params(&item, params).unwrap();
+        solve(&mut tree);
+        assert_eq!(tree.layout(&item).unwrap().x, [2.0, 17.0 + right]);
+        assert_eq!(tree.layout(&outer).unwrap().x, [0.0, 20.0 + right]);
+        assert!(tree.warnings().is_empty());
+    }
+}
+
+#[test]
+fn block_minimum_only_keeps_a_childs_bottom_margin_inside_when_it_binds() {
+    let mut tree = LayoutTree::<()>::new();
+    let root = tree.root();
+    let block = LayoutParams {
+        children_layout: ChildrenLayout::Block,
+        size: Xy::new(Size::Auto, Size::FitContent),
+        position: Xy::new_symm(Pos::Start),
+        ..LayoutParams::DEFAULT
+    };
+    tree.update_node_params(&root, LayoutParams {
+        size: Xy::new(Size::Pixels(50.0), Size::FitContent), ..block
+    }).unwrap();
+    let mut section = LayoutParams { margin: Xy::new([Margin::ZERO; 2], edges(0.0, 10.0)), ..block };
+    let parent = tree.add_node(&root, section).unwrap();
+    tree.add_node(&parent, LayoutParams {
+        size: px(50.0, 20.0), margin: Xy::new([Margin::ZERO; 2], edges(0.0, 30.0)), ..block
+    }).unwrap();
+    let next = tree.add_node(&root, LayoutParams { size: px(50.0, 10.0), ..block }).unwrap();
+    for (minimum, height, next_y) in [(10.0, 20.0, 50.0), (60.0, 60.0, 70.0), (20.0, 20.0, 50.0)] {
+        section.min_size.y = Some(Size::Pixels(minimum));
+        tree.update_node_params(&parent, section).unwrap();
+        tree.solve_layout(Xy::new_symm(100.0));
+        assert_eq!(tree.layout(&parent).unwrap().y, [0.0, height]);
+        assert_eq!(tree.layout(&next).unwrap().y, [next_y, next_y + 10.0]);
+        assert!(tree.warnings().is_empty());
+    }
+}
+
+#[test]
+fn empty_formatting_context_separates_margins_inside_an_auto_height_block() {
+    let mut tree = LayoutTree::<()>::new();
+    let root = tree.root();
+    let block = LayoutParams {
+        children_layout: ChildrenLayout::Block,
+        position: Xy::new_symm(Pos::Start),
+        size: Xy::new(Size::Pixels(50.0), Size::FitContent),
+        ..LayoutParams::DEFAULT
+    };
+    tree.update_node_params(&root, block).unwrap();
+    let fixed = LayoutParams { size: px(50.0, 10.0), ..block };
+    tree.add_node(&root, LayoutParams { margin: Xy::new([Margin::ZERO; 2], edges(0.0, 10.0)), ..fixed }).unwrap();
+    let mut spacer = LayoutParams {
+        min_size: Xy::new(None, Some(Size::Frac(0.1))),
+        margin: Xy::new([Margin::ZERO; 2], edges(10.0, 10.0)), ..block
+    };
+    let divider = tree.add_node(&root, spacer).unwrap();
+    let next = tree.add_node(&root, LayoutParams { margin: Xy::new([Margin::ZERO; 2], edges(10.0, 0.0)), ..fixed }).unwrap();
+    let stack = ChildrenLayout::Stack { axis: Axis::X, spacing: 0.0, arrange: Arrange::Start };
+    for (mode, next_y) in [(ChildrenLayout::Block, 20.0), (stack, 30.0), (ChildrenLayout::Block, 20.0)] {
+        spacer.children_layout = mode;
+        tree.update_node_params(&divider, spacer).unwrap();
+        tree.solve_layout(Xy::new_symm(100.0));
+        assert_eq!(tree.layout(&divider).unwrap().y, [20.0; 2]);
+        assert_eq!(tree.layout(&next).unwrap().y, [next_y, next_y + 10.0]);
+        assert!(tree.warnings().is_empty());
+    }
+}
+
+#[test]
+fn empty_managed_formatting_context_separates_sibling_margins() {
+    use keru_layout::layout_rules::NodeRules;
+    use keru_layout::flex::FlexLayout;
+    use keru_layout::tracks::TrackGrid;
+
+    for batch in [false, true] {
+        let mut tree = LayoutTree::<()>::new();
+        let root = tree.root();
+        tree.update_node_params(&root, LayoutParams {
+            children_layout: ChildrenLayout::Block,
+            size: Xy::new(Size::Pixels(50.), Size::FitContent),
+            position: Xy::new_symm(Pos::Start),
+            ..LayoutParams::DEFAULT
+        }).unwrap();
+        let child = |height, before, after| LayoutParams {
+            size: Xy::new(Size::Auto, height),
+            margin: Xy::new([Margin::ZERO; 2], edges(before, after)),
+            children_layout: ChildrenLayout::Block,
+            ..LayoutParams::DEFAULT
+        };
+        tree.add_node(&root, child(Size::Pixels(10.), 0., 10.)).unwrap();
+        let middle = tree.add_node(&root, child(Size::Auto, 10., 10.)).unwrap();
+        let last = tree.add_node(&root, child(Size::Pixels(10.), 10., 0.)).unwrap();
+        for (rules, last_y) in [
+            (NodeRules { grid: Some(TrackGrid::default()), ..Default::default() }, 30.),
+            (NodeRules::default(), 20.),
+            (NodeRules { flex: Some(FlexLayout::default()), ..Default::default() }, 30.),
+        ] {
+            tree.set_rules(&middle, rules).unwrap();
+            let window = Xy::new_symm(100.);
+            if batch {
+                #[cfg(feature = "batch-pilot")]
+                tree.solve_layout_batch(window).unwrap();
+                #[cfg(not(feature = "batch-pilot"))]
+                continue;
+            } else {
+                tree.solve_layout(window);
+            }
+            assert_eq!(tree.layout(&middle).unwrap().y, [20., 20.]);
+            assert_eq!(tree.layout(&last).unwrap().y, [last_y, last_y + 10.]);
+            assert_eq!(tree.layout(&root).unwrap().y, [0., last_y + 10.]);
+            assert!(tree.warnings().is_empty(), "{:?}", tree.warnings());
+        }
+    }
+}
+
+#[test]
+fn authored_block_margin_boundary_keeps_child_margins_inside_the_container() {
+    let mut tree = LayoutTree::<()>::new();
+    let root = tree.root();
+    let block = LayoutParams {
+        children_layout: ChildrenLayout::Block,
+        size: Xy::new(Size::Auto, Size::FitContent),
+        position: Xy::new_symm(Pos::Start),
+        ..LayoutParams::DEFAULT
+    };
+    tree.update_node_params(&root, LayoutParams { size: Xy::new(Size::Fill, Size::FitContent), ..block }).unwrap();
+    let mut group = LayoutParams { margin: Xy::new([Margin::ZERO; 2], edges(3., 5.)), ..block };
+    let container = tree.add_node(&root, group).unwrap();
+    let child = tree.add_node(&container, LayoutParams {
+        margin: Xy::new([Margin::ZERO; 2], edges(7., 11.)),
+        size: Xy::new(Size::Auto, Size::Pixels(13.)),
+        ..LayoutParams::DEFAULT
+    }).unwrap();
+    for (isolate, parent_y, child_y, height) in [
+        (false, [7., 20.], [7., 20.], 31.),
+        (true, [3., 34.], [10., 23.], 39.),
+        (false, [7., 20.], [7., 20.], 31.),
+    ] {
+        group.isolate_block_margins = isolate;
+        tree.update_node_params(&container, group).unwrap();
+        for width in [50., 75.] {
+            tree.solve_layout(Xy::new(width, 100.));
+            assert_eq!(tree.layout(&root).unwrap().y, [0., height]);
+            assert_eq!(tree.layout(&container).unwrap().y, parent_y);
+            assert_eq!(tree.layout(&child).unwrap().y, child_y);
+        }
     }
 }

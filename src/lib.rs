@@ -8,10 +8,13 @@ mod child_walk;
 #[macro_use]
 mod solve;
 mod declarations;
+mod logical;
 #[cfg(feature = "batch-pilot")]
 #[allow(dead_code)] // The standalone experiment also uses the slice-based kernel API.
 mod batch_order;
 mod fill_budget;
+pub mod flex;
+pub mod tracks;
 mod flow;
 mod full_layout;
 mod input_words;
@@ -49,6 +52,7 @@ mod layout_tree;
 
 use std::fmt::Debug;
 
+pub use logical::{Direction, Logical, LogicalAxis, LogicalError, LogicalStyle, WritingContext, WritingMode};
 pub use declarations::{Axis, ChildrenLayout, ContentMeasure, LayoutParams, MainAxisCellSize, Margin, Size, TextContent, Xy, XyRect};
 pub(crate) use declarations::{X, Y};
 pub use placement_geometry::{Anchor, Arrange, Pos, WindowOverflow};
@@ -63,6 +67,10 @@ pub(crate) use place::Place;
 pub use place::FreePlacementError;
 #[cfg(feature = "incremental")]
 pub use incremental::IncrementalRelayoutOutcome;
+#[cfg(feature = "incremental")]
+pub use layout_tree::rules as layout_rules;
+#[cfg(feature = "incremental")]
+pub use layout_tree::typography::{Baseline, InlineMeasurer, InlineMetrics, IntrinsicWidths, IntrinsicWidth, IntrinsicSizing, TypographyError};
 #[cfg(feature = "incremental")]
 pub use layout_tree::{ChildId, Destination, LayoutTree, NodeId, TreeError, measure_monospace_text};
 #[cfg(feature = "batch-pilot")]
@@ -302,7 +310,7 @@ pub enum LayoutWarning<Id> {
         /// Which of the node's dimensions the problem was found in.
         axis: Axis
     },
-    /// A `FitContent` node couldn't determine consistent sizes for its `Frac` children, because they add up to more than 100%.
+    /// A `FitContent` stack could not resolve its extent because its unconstrained fractions total 100% or more.
     ImpossibleFracChildren {
         /// The id of the problematic node.
         node: Id,
@@ -348,7 +356,7 @@ impl<Id: Debug> std::fmt::Display for LayoutWarning<Id> {
                 "On the {axis:?} axis, the '{node:?}' node's min size is bigger than its max size. "
             ),
             LayoutWarning::ImpossibleFracChildren { node, axis } => write!(f,
-                "On the {axis:?} axis, the '{node:?}' `FitContent` node couldn't determine consistent sizes for its `Frac` children, because they add up to more than 100%."
+                "The {axis:?} extent of `FitContent` node '{node:?}' is unresolved. Its active `Frac` children claim at least 100% of the available space."
             ),
             LayoutWarning::NotFinite { node, axis } => write!(f,
                 "The {axis:?} size of node '{node:?}' is infinite or NaN."

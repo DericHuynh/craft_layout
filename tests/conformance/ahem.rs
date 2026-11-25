@@ -12,6 +12,10 @@ pub struct AhemText {
 }
 
 impl AhemText {
+    pub fn can_wrap(text: &str) -> bool {
+        text.contains(ZWS)
+    }
+
     pub fn new(text: &str) -> Self {
         Self { runs: text.split(ZWS).map(str::len).collect() }
     }

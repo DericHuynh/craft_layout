@@ -934,12 +934,15 @@ fn seed_additional_edits<S: Access + ?Sized>(
         let input = old(source).inputs();
         assert(parent == edited_parent(input, node));
         assert(grid == width_grid_main((input.parameters)(node).children_layout));
+        assert(stack == stack_axis((input.parameters)(node).children_layout));
+        assert(x == axis_edit_seeds(input, node, X, change, horizontal, parent, stack, grid));
+        assert(y == axis_edit_seeds(input, node, Y, change, vertical, parent, stack, grid));
         let local = edit_axis_requests(input, node, X, x, parent) + edit_axis_requests(input, node, Y, y, parent);
         let additional = if x.child_available || y.child_available {
             local + available_requests(input, node, stack, x.child_available, y.child_available,
                 input.links.children[node].len())
         } else { local };
-        assert(additional =~= extra_edit_requests(input, node, change, horizontal, vertical)) by {
+        assert(additional == extra_edit_requests(input, node, change, horizontal, vertical)) by {
             reveal(extra_edit_requests);
         };
         assert(source.seeded() =~= old(source).seeded() + additional);

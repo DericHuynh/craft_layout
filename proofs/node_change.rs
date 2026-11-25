@@ -38,6 +38,7 @@ fn size_rules(p: &LayoutParams, axis: Axis) -> [Option<std::mem::Discriminant<Si
 
 fn same_rules(a: &LayoutParams, b: &LayoutParams) -> bool {
     a.disabled == b.disabled
+        && a.isolate_block_margins == b.isolate_block_margins
         && a.free_placement == b.free_placement
         && a.grid_span == b.grid_span
         && a.text == b.text

@@ -5,7 +5,7 @@ use grid_search::find_grid_cell;
 #[path = "grid_words.rs"]
 mod grid_words;
 #[path = "grid_sparse.rs"]
-mod grid_sparse;
+pub(crate) mod grid_sparse;
 #[path = "grid_state.rs"]
 pub(crate) mod grid_state;
 #[cfg(feature = "incremental")]

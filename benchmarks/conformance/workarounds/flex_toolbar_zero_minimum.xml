@@ -1,0 +1,20 @@
+<test name="flex_toolbar_zero_minimum" use-rounding="false">
+  <!-- The only style change from flex_toolbar_auto_minimum is min-width: 0. Chromium 83 and the importer give the slot 176px; the action begins at x=184. -->
+  <viewport width="400px" height="400px"/>
+  <input>
+    <div display="flex" direction="ltr" position="absolute" width="224px" height="32px">
+      <div display="flex" direction="ltr" position="relative" flex-basis="0%" flex-grow="1" flex-shrink="1" min-width="0px">
+        <div display="flex" direction="ltr" position="relative" width="288px" height="16px" flex-shrink="0"/>
+      </div>
+      <div display="flex" direction="ltr" position="relative" width="40px" flex-shrink="0" margin-left="8px"/>
+    </div>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="224" height="32">
+      <node x="0" y="0" width="176" height="32">
+        <node x="0" y="0" width="288" height="16"/>
+      </node>
+      <node x="184" y="0" width="40" height="32"/>
+    </node>
+  </expectations>
+</test>

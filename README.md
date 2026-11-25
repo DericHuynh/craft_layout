@@ -32,6 +32,71 @@ Run `cargo bench --bench real_workloads` for browser, Linux compositor, and CAD 
 
 The benchmark handoff covers first solves, peer engines, application edits, and topological-order experiments. [Benchmark runners and adapters](benchmarks/README.md)
 
+## Application layouts
+
+Each sample runs a sequence of edits, checks expected geometry, and compares the retained tree with a fresh build. The authors recorded their first layout declarations before running the samples. The paired runs replay the same inputs with an alternative declaration.
+
+| Project | Geometry under test |
+| --- | --- |
+| [Editor workbench](examples/editor_workbench) | Weighted panes, measured tabs, wrapped source lines and a draggable terminal. |
+| [Check-in kiosk](examples/checkin_kiosk) | Translated booking text, validation, a compact summary and the one-pixel threshold at which appointment controls wrap. |
+| [Command palette](examples/command_palette) | Fitted, variable-width menus, a nested coordinate frame and the choice of edge when a popup cannot fit on either side of the pointer. |
+| [Mixing studio](examples/mixing_studio) | Track insertion, a removable send rack, selection overlays and two meters per channel. |
+| [Dispatch board](examples/dispatch_board) | Twenty-four localized ticket rows, independently shrinkable fields, a protected action and embedded LTR content. |
+| [Maintenance console](examples/maintenance_console) | Shared label and field columns, a panel-local breakpoint, a sticky heading and help anchored to a scrolling control. |
+
+For a free-positioned popup that should remain eight pixels inside the far edge as its parent resizes, use `Pos::Offset { fraction: 1.0, pixels: -8.0 }` with `Anchor::End` on that axis. Downstream code that exhaustively matches `Pos` must handle the new variant.
+
+## Native layout rules
+
+Use `LayoutTree::set_rules` for an application that needs inherited writing direction, flexible lines, heterogeneous grid tracks, scrollports, or size queries. Rules attach to stable node handles. Edit the original `LayoutParams` or rules and solve again after an edit. Reading `params` returns the authored physical declarations. Passing `NodeRules::default()` to `set_rules` removes the optional declarations on that node.
+
+```rust
+# #[cfg(feature = "incremental")]
+# fn main() -> Result<(), keru_layout::TreeError> {
+use keru_layout::{LayoutParams, LayoutTree, Size, Xy};
+use keru_layout::flex::{FlexItem, FlexLayout};
+use keru_layout::layout_rules::NodeRules;
+
+let mut tree = LayoutTree::<()>::new();
+let row = tree.root();
+tree.set_rules(&row, NodeRules {
+    flex: Some(FlexLayout { gap: 10.0, ..Default::default() }),
+    ..Default::default()
+})?;
+let mut fields = Vec::new();
+for width in [160.0, 120.0] {
+    let field = tree.add_node(&row, LayoutParams {
+        size: Xy::new(Size::Pixels(width), Size::Pixels(24.0)),
+        ..LayoutParams::DEFAULT
+    })?;
+    tree.set_rules(&field, NodeRules {
+        flex_item: FlexItem { shrink: 1.0, ..Default::default() },
+        ..Default::default()
+    })?;
+    fields.push(field);
+}
+tree.solve_layout(Xy::new(220.0, 40.0));
+assert_eq!(tree.layout(&fields[0])?.x, [0.0, 120.0]);
+assert_eq!(tree.layout(&fields[1])?.x, [130.0, 220.0]);
+# Ok(())
+# }
+# #[cfg(not(feature = "incremental"))]
+# fn main() {}
+```
+
+| When authoring | Contract |
+| --- | --- |
+| Localized UI | `LogicalStyle` inherits direction and writing mode independently. Logical start/end padding and margins map to physical edges. Set the direction of an embedded editor on the editor itself. |
+| Text and controls | Implement `InlineMeasurer` for horizontal line metrics, then use `solve_layout_with_typography`. A bounded fit-content width stays between the measured minimum and maximum. The host supplies line breaking, shaping, and the baseline offsets. |
+| Flexible rows and columns | Fixed preferred sizes keep their size by default. Set `grow` or `shrink` on the items permitted to change. A binding lower or upper bound redistributes the rest among eligible items. Native `Fill` retains its weighted share when an item has no explicit flexibility. |
+| Track grids | Use `TrackGrid` and `GridItem` for explicit and implicit tracks. Track indices are zero-based. In a nested form row, `TrackAxis::Subgrid` inherits the tracks spanned by that row, including their gaps. Descendant labels can contribute to the parent’s content track. |
+| Scrolling and overlays | Read `layout` for unscrolled flow geometry. Read `view_geometry` for window-space drawing, clip, scrollport, and applied offset. `set_scroll_offset` accepts a request, which the next solve clamps. Anchor fallback checks the authored sides in order. |
+| Responsive components | Put size containment on the ancestor axis used for a breakpoint. A child query reads the nearest eligible ancestor’s content-box size, optionally by name. A fitted contained axis uses its intrinsic placeholder and padding. |
+| Diagnostics | Read `warnings` for the underlying solver and `rule_issues` for missing dependencies, incompatible declarations, and unresolved geometry. |
+
+The owned tree integrates these rules with its existing measurement, placement, invalidation, and publication paths. Trees authored entirely with native `LayoutParams` go directly to the existing solver. Custom `TreeAdapter` implementations can use the public logical projection, flexible-line, and grid-track functions when integrating their own node store. The [implementation goal and acceptance checks](reports/constraint-semantics/implementation-goal.md) describe the tested scope.
+
 ## Usage
 
 `keru_layout` has a trait-based API similar to Taffy's low-level API.
@@ -90,11 +155,32 @@ std::fs::write("example.svg", tree.to_svg())?;
 # }
 ```
 
+### Choosing which dimension drives layout
+
+Declare the dimension you know and put `Size::AspectRatio(width / height)` on the dimension you want derived. In a 100 × 100 row, a child with `size: Xy::new(Size::Pixels(40.0), Size::AspectRatio(2.0))` is 40 × 20. To make height drive width, use `Xy::new(Size::AspectRatio(2.0), Size::Fill)`. The solver resolves the height before computing the width. The [giraffe layout test](tests/article_layout.rs) uses this ordering to size an image from a neighboring column of wrapped text.
+
+A stack also preserves explicit pixel and fractional sizes when its children overflow. For children that should share the available space, use `Size::Fill` and `fill_weight`. A `FitContent` stack can derive its own size from fractional children. For example, in a row with no gaps, margins, or padding, a 1 px child beside a child requesting `Size::Frac(1023.0 / 1024.0)` gives a 1,024 px row. The fractional child occupies the remaining 1,023 px.
+
+When equally sized cards become narrower than their padding, their outer widths stay equal. A child filling the content box can shrink to zero. Physical left/top padding consumes the available span first, so even an empty content box has its origin inside or on the edge of the card.
+
+A maximum can make a row fit even when the requested fractions add up to more than one. Put a 1 px item beside two 75% items and cap the first 75% item at 12 px. The row is 52 px wide, with children occupying 1, 12, and 39 px. Removing the cap makes the same declarations impossible to satisfy and produces an `ImpossibleFracChildren` warning on the row.
+
 ### Wrapping, margins, and block flow
 
 - `ChildrenLayout::Wrap` lays out successive rows or columns. Choose an axis, per-line arrangement, item spacing, and line spacing. Line breaks use item sizes before distributing the remaining main-axis space to weighted `Fill` children. The tallest or widest intrinsic item sets the cross-axis extent of its line. Cross-axis `Fill` children stretch inside that extent.
+- In a stack or wrap, put `Margin::AUTO` on the leading main-axis edge of a trailing action to push it to the end of its line. Two automatic edges share the space equally. Item sizes and authored gaps are allocated first. Use the child's cross-axis position for start, center or end alignment.
 - `LayoutParams::margin` takes pairs of physical left/right and top/bottom edges. `Margin::px` accepts finite pixel values, including negative margins. Margins affect the space a child occupies in a stack, wrap, grid, or block, and the output rectangle is the child's box inside those margins.
-- `ChildrenLayout::Block` implements CSS normal flow for block boxes. `Size::Auto` fills the containing width for an in-flow block and fits the content on the height axis. `Margin::AUTO` distributes spare inline space, so two auto inline margins center a fixed-width block. Adjoining vertical margins collapse between siblings, through empty blocks, and across eligible parent-child edges. Box dimensions include padding. This mode lays out block boxes in a UI tree. Floats, clearance, and inline CSS formatting are outside its scope.
+- `ChildrenLayout::Block` implements CSS normal flow for block boxes. `Size::Auto` fills the containing width for an in-flow block and fits the content on the height axis. `Margin::AUTO` distributes spare inline space, so two auto inline margins center a fixed-width block. Adjoining vertical margins collapse between siblings, through empty blocks, and across eligible parent-child edges. Box dimensions include padding. In an owned tree, `NodeRules::block_flow` adds physical left and right floats, side-specific clearance, group alignment and inline self-alignment in horizontal block flow. Set `isolate_block_margins` to give a block an independent formatting context that avoids adjacent floats and encloses its own. The [news digest](examples/news_digest) demonstrates these behaviors through resizes and filter changes. The host still measures text lines.
+
+### Grid tracks and intrinsic sizes
+
+For a responsive card grid, `TrackAxis::auto_fit_within(120.)` uses 120 px per column plus gaps to decide how many fit, then shares the available width equally among occupied columns. If the container shrinks to 90 px, a single card can use those 90 px. Choose `TrackAxis::AutoFit { minimum: 120., track: Track::Fr(1.) }` when a card must retain at least 120 px, including in a narrower container. [CSS workaround comparisons](reports/constraint-semantics/css-workarounds.md)
+
+A sticky grid child can keep its normal slot and stop at the end of its own cell or span using `Placement::StickyInGridArea(insets)`. Use `Placement::Sticky(insets)` for a heading that should travel across the parent grid. [Measured examples across layout engines](reports/constraint-semantics/author-intent.md)
+
+Use `Track::Content` for a column that stops at its preferred content width and `Track::Auto` for one that can also take leftover room. In a 300 px grid with two such auto columns, content preferences of 70 and 30 px and a 10 px gutter leave 190 px. Each column gets another 95 px, producing 165 and 125 px. A fractional track takes its share before this stretching step.
+
+`Track::Fr(weight)` starts with a zero floor. Use `Track::MinMax(TrackMin::Content, TrackMax::Fr(weight))` when content should establish the floor. A 100 px spanning minimum shared by two such tracks with weights 1 and 3 gives them 25 and 75 px. On an owned tree the item supplies its content floor through `NodeRules::grid_content_minimum`. For example, the [scoreboard](examples/scoreboard/README.md) supplies `Some(Size::FitContent)` for each single-line club name. Its club column can then protect the longest visible name, while the score column can yield space. `intrinsic_extents` returns both the minimum and preferred extent of an axis, including its gaps. On an owned tree, `resolved_grid_tracks` returns the published, unsnapped edges in template order, including zero-width collapsed slots. [Grid example](examples/asset_browser/README.md) · [CSS layout feature inventory](reports/constraint-semantics/css-layout-scope.md) · [Fixture results](reports/constraint-semantics/README.md)
 
 ### Custom content and pixel rounding
 

@@ -170,7 +170,7 @@ impl State {
                         self.order.positions(),
                         &mut self.tail_capture,
                     )
-                    .and_then(|()| {
+                    .and_then(|prefix_stays| {
                         let repair = self.order.repair_with_appended(
                             &frame.graph,
                             &self.tail_capture.backward,
@@ -178,24 +178,14 @@ impl State {
                         )?;
                         let base = frame.graph.base_vertex_count();
                         frame.install_tail(self.order.suffix(base), &self.tail_capture, tail);
-                        Ok(repair.regions)
+                        Ok((repair.regions, prefix_stays))
                     });
                 (result, tail, true)
             }
-            TailEdit::Remove(tail) => (frame.remove_tail(source, tail).map(|()| 0), tail, false),
+            TailEdit::Remove(tail) => (frame.remove_tail(source, tail).map(|prefix_stays| (0, prefix_stays)), tail, false),
         };
         match result {
-            Ok(regions) => {
-                let style = source.node_layout_params(tail.parent);
-                let prefix_stays = match style.children_layout {
-                    ChildrenLayout::Free => true,
-                    ChildrenLayout::Stack {
-                        axis,
-                        arrange: crate::Arrange::Start,
-                        ..
-                    } => !style.children_origin_flipped[axis],
-                    _ => false,
-                };
+            Ok((regions, prefix_stays)) => {
                 let mark = if prefix_stays {
                     if appended {
                         frame.initial_tail_from = Some(frame.graph.base_vertex_count() / N_SLOTS);
@@ -226,7 +216,7 @@ impl Frame {
         &mut self,
         source: &A,
         tail: Tail,
-    ) -> Result<(usize, Option<usize>), BatchLayoutError> {
+    ) -> Result<(usize, Option<usize>, bool), BatchLayoutError> {
         let parent = self
             .indices
             .get(&tail.parent)
@@ -244,11 +234,22 @@ impl Frame {
             ChildrenLayout::Stack { axis, .. } => Some(axis),
             _ => return Err(BatchLayoutError::InvalidGraph),
         };
+        let mut prefix_stays = match style.children_layout {
+            ChildrenLayout::Free => true,
+            ChildrenLayout::Stack { axis, arrange: crate::Arrange::Start, .. } => !style.children_origin_flipped[axis],
+            _ => false,
+        };
         let mut child_count = 0;
         let mut child_flags = 0;
         let mut child = source.first_child(tail.parent);
         while let Some(key) = child {
             let style = source.node_layout_params(key);
+            // Growth or removal at the tail changes the share of any automatic
+            // margin in the surviving prefix, even for a start-aligned stack.
+            if !style.disabled && !style.free_placement && key != tail.root
+                && stack_axis.is_some_and(|axis| style.has_auto_margin(axis)) {
+                prefix_stays = false;
+            }
             // Stack Frac reads the gap count, and Fill adds a share
             // producer that folds the complete sibling list.
             if !style.free_placement
@@ -281,7 +282,7 @@ impl Frame {
                     .ok_or(BatchLayoutError::InvalidGraph)
             })
             .transpose()?;
-        Ok((parent, previous))
+        Ok((parent, previous, prefix_stays))
     }
 
     fn append_tail<A: TreeAdapter<NodeId = NodeKey>>(
@@ -291,8 +292,8 @@ impl Frame {
         tail: Tail,
         positions: &[usize],
         capture: &mut TailCapture,
-    ) -> Result<(), BatchLayoutError> {
-        let (parent, previous) = self.anchor(source, tail)?;
+    ) -> Result<bool, BatchLayoutError> {
+        let (parent, previous, prefix_stays) = self.anchor(source, tail)?;
         if source.parent(tail.root) != Some(tail.parent)
             || source.next_sibling(tail.root).is_some()
             || tail.previous.map_or_else(
@@ -398,7 +399,7 @@ impl Frame {
         self.dirty
             .try_reserve(words.saturating_sub(self.dirty.len()))?;
         self.dirty.resize(words, 0);
-        Ok(())
+        Ok(prefix_stays)
     }
 
     fn extend_tail_storage(
@@ -484,8 +485,8 @@ impl Frame {
         &mut self,
         source: &A,
         tail: Tail,
-    ) -> Result<(), BatchLayoutError> {
-        let (parent, previous) = self.anchor(source, tail)?;
+    ) -> Result<bool, BatchLayoutError> {
+        let (parent, previous, prefix_stays) = self.anchor(source, tail)?;
         let root = self
             .indices
             .get(&tail.root)
@@ -527,7 +528,7 @@ impl Frame {
         self.graph.tail.remove();
         self.tail = None;
         self.stack_placement.invalidate();
-        Ok(())
+        Ok(prefix_stays)
     }
 }
 

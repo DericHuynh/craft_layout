@@ -1,0 +1,20 @@
+<test name="flow_grid_blowout_zero_minimum" use-rounding="false">
+  <!-- https://css-tricks.com/preventing-a-grid-blowout/ | A single 320px descendant sets the automatic minimum; a zero minimum lets the descendant overflow its track. -->
+  <viewport width="400px" height="400px" />
+  <input>
+    <div display="grid" width="240px" height="40px" grid-template-columns="minmax(0, 1fr) 40px" grid-template-rows="40px">
+      <div display="block">
+        <div display="block" width="320px" height="12px" />
+      </div>
+      <div display="block" />
+    </div>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="240" height="40" resolved-columns="200px 40px" resolved-rows="40px">
+      <node x="0" y="0" width="200" height="40">
+        <node x="0" y="0" width="320" height="12" />
+      </node>
+      <node x="200" y="0" width="40" height="40" />
+    </node>
+  </expectations>
+</test>

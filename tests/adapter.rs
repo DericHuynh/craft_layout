@@ -117,8 +117,8 @@ fn rounded_stack_and_grid_keep_preorder_and_parent_local_bits() {
         assert!(rounded.output[4].is_none());
         if matches!(mode, ChildrenLayout::Stack { .. }) {
             let mut general = tree.clone();
-            // This resolves to zero after bypassing the plain Start prefix.
-            general.params[1].margin.x[1] = Margin::AUTO;
+            // A cross-axis automatic margin bypasses the plain Start prefix and resolves to zero.
+            general.params[1].margin.y[1] = Margin::AUTO;
             general.solve_layout(window);
             assert_eq!(general.write_order, expected_order);
             for &node in &expected_order {
@@ -1893,5 +1893,62 @@ fn width_grid_updates_a_fixed_cross_stack_around_ready_intrinsic_leaves() {
         let outcome = tree.solve_layout_incremental_checked(Xy::new(width, 100.0));
         assert!(matches!(outcome, IncrementalRelayoutOutcome::Success { computed: 1.. }), "{outcome:?}");
         assert_ne!(tree.output[2].unwrap().0, before);
+    }
+}
+
+#[test]
+fn automatic_edges_share_the_stack_after_sizes_margins_and_gaps() {
+    let px = |n| Margin::px(n).unwrap();
+    for axis in [Axis::X, Axis::Y] {
+        for flipped in [false, true] {
+            for arrange in [Arrange::Start, Arrange::SpaceBetween] {
+                let mut tree = Adapter::default();
+                tree.parent = [None, Some(0), Some(0), Some(0)];
+                tree.first = [Some(1), None, None, None];
+                tree.next = [None, Some(2), Some(3), None];
+                tree.params[0].children_layout = ChildrenLayout::Stack { axis, arrange, spacing: 3. };
+                tree.params[0].children_origin_flipped[axis] = flipped;
+                tree.params[0].padding[axis] = [8., 12.];
+                for (id, size, margins) in [
+                    (1, 10., [px(2.), Margin::AUTO]),
+                    (2, 20., [Margin::AUTO, Margin::AUTO]),
+                    (3, 10., [Margin::ZERO, px(4.)]),
+                ] {
+                    tree.params[id].size = Xy::new_symm(Size::Pixels(size));
+                    tree.params[id].margin[axis] = margins;
+                }
+                for available in [120., 65., 120.] {
+                    tree.solve_layout(Xy::new_symm(available));
+                    let occupied = [1, 2, 3].map(|id| tree.output[id].unwrap().0[axis]);
+                    let expected = match (flipped, available == 120.) {
+                        (false, true) => [[10., 20.], [55., 75.], [94., 104.]],
+                        (true, true) => [[82., 92.], [41., 61.], [8., 18.]],
+                        (false, false) => [[10., 20.], [23., 43.], [46., 56.]],
+                        (true, false) => [[43., 53.], [18., 38.], [1., 11.]],
+                    };
+                    assert_eq!(occupied, expected, "{axis:?}, {flipped}, {arrange:?}, {available}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_preceding_fractional_item_does_not_change_the_auto_share_between_arrangements() {
+    let mut tree = Adapter::default();
+    tree.parent = [None, Some(0), Some(0), Some(0)];
+    tree.first = [Some(1), None, None, None];
+    tree.next = [None, Some(2), Some(3), None];
+    for (id, width) in [(1, 10.39), (2, 4.21), (3, 6.78)] {
+        tree.params[id].size.x = Size::Pixels(width);
+    }
+    tree.params[2].margin.x[0] = Margin::AUTO;
+    let mut expected = None;
+    for arrange in [Arrange::Start, Arrange::Center, Arrange::End, Arrange::SpaceBetween] {
+        tree.params[0].children_layout = ChildrenLayout::Stack { axis: Axis::X, arrange, spacing: 0.17 };
+        tree.solve_layout(Xy::new(80.49, 20.));
+        let edges = tree.output[2].unwrap().0.x;
+        assert!((edges[0] - 69.33).abs() < 0.00001);
+        assert_eq!(edges, *expected.get_or_insert(edges));
     }
 }

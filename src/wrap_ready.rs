@@ -228,6 +228,8 @@ pub(crate) fn try_prepare<T: Records + ?Sized>(tree: &mut T, parent: T::Id, data
     #[cfg(any(feature = "incremental", verus_keep_ghost))]
     let mut direct_start = true;
     #[cfg(any(feature = "incremental", verus_keep_ghost))]
+    let mut has_auto_margin = false;
+    #[cfg(any(feature = "incremental", verus_keep_ghost))]
     let mut share_level = dependency_rules::next_level(data.levels[main_final]);
     #[cfg(any(feature = "incremental", verus_keep_ghost))]
     let mut cross_level = 0;
@@ -270,7 +272,10 @@ pub(crate) fn try_prepare<T: Records + ?Sized>(tree: &mut T, parent: T::Id, data
         { return; }
         has_fills |= fill;
         #[cfg(any(feature = "incremental", verus_keep_ghost))]
-        { direct_start &= starts_on_cross(params, cross); }
+        {
+            direct_start &= starts_on_cross(params, cross);
+            has_auto_margin |= params.has_auto_margin(axis);
+        }
         let base = with_margin(record.values[main_final], margin::<T::Float>(params, axis));
         let preferred = if fill { 0.0 } else { record.values[cross_regular] };
         let rise = with_margin(preferred, margin::<T::Float>(params, cross));
@@ -345,7 +350,9 @@ pub(crate) fn try_prepare<T: Records + ?Sized>(tree: &mut T, parent: T::Id, data
         data.flags.0 &= !NodeFlags::DESCENDANTS_NEED_SOLVE;
         #[cfg(any(feature = "incremental", verus_keep_ghost))]
         {
-            data.prepared_placement |= NodeLayoutData::PREPARED_WRAP;
+            // Line heights alone cannot place automatic margins. Their shares
+            // also need the resolved sizes and automatic edge count on each line.
+            if !has_auto_margin { data.prepared_placement |= NodeLayoutData::PREPARED_WRAP; }
             if direct_start { data.prepared_placement |= NodeLayoutData::PREPARED_WRAP_START; }
         }
     }
@@ -602,6 +609,8 @@ fn prepare_leaf_wrap<T: StartActions + ?Sized, const HORIZONTAL: bool>(
     let mut line_zero_margins = true;
     #[cfg(any(feature = "incremental", verus_keep_ghost))]
     let mut direct_start = true;
+    #[cfg(any(feature = "incremental", verus_keep_ghost))]
+    let mut has_auto_margin = false;
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant tree.order() == old(tree).order(), tree.order().ordered(),
             tree.packed_state() == old(tree).packed_state(),
@@ -650,6 +659,7 @@ fn prepare_leaf_wrap<T: StartActions + ?Sized, const HORIZONTAL: bool>(
         let admitted_rows = save_run(run);
         #[cfg(any(feature = "incremental", verus_keep_ghost))]
         {
+            has_auto_margin |= p.has_auto_margin(axis);
             direct_start = direct_start && zero_margins && matches!(p.position.component(cross), Pos::Start);
             if !direct_start {
                 if let Some(run) = run { run.recording = false; }
@@ -745,7 +755,7 @@ fn prepare_leaf_wrap<T: StartActions + ?Sized, const HORIZONTAL: bool>(
     }
     #[cfg(any(feature = "incremental", verus_keep_ghost))]
     {
-        parent_data.prepared_placement |= NodeLayoutData::PREPARED_WRAP;
+        if !has_auto_margin { parent_data.prepared_placement |= NodeLayoutData::PREPARED_WRAP; }
         if direct_start { parent_data.prepared_placement |= NodeLayoutData::PREPARED_WRAP_START; }
     }
     *tree.edit(parent) = parent_data;

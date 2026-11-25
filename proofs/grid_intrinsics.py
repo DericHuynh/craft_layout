@@ -125,6 +125,7 @@ def start_edges(ir, route, inputs=8):
     address = {'%input': ('input', 0), '%output': ('output', 0)}
     values, output = {}, [None] * 4
     lane_type = r'(?:<\d+ x float>|float)'
+    bool_type = r'(?:<\d+ x i1>|i1)'
     value = r'(?:%[\w.]+|zeroinitializer|0\.000000e\+00|poison|<float [^>]+>)'
 
     def lanes(operand, count):
@@ -141,7 +142,7 @@ def start_edges(ir, route, inputs=8):
         return result
 
     def width(kind):
-        return 1 if kind == 'float' else int(kind.split()[0][1:])
+        return int(kind.split()[0][1:]) if kind.startswith('<') else 1
 
     lines = tuple(map(str.strip, body.splitlines()))
     if not re.fullmatch(r'[\w.]+:', lines[0]) or lines[-1] != 'ret void':
@@ -166,6 +167,21 @@ def start_edges(ir, route, inputs=8):
             # The host sink supplies a fixed word for all NaN results.
             values[name] = tuple((op, *sorted([x, y], key=repr)) for x, y in
                                  zip(lanes(left, width(kind)), lanes(right, width(kind)), strict=True))
+        elif m := re.fullmatch(rf'(%\S+) = fcmp (ogt|olt) ({lane_type}) ({value}), ({value})', line):
+            name, order, kind, left, right = m.groups()
+            if order == 'ogt':
+                left, right = right, left
+            values[name] = tuple(('olt', x, y) for x, y in
+                                 zip(lanes(left, width(kind)), lanes(right, width(kind)), strict=True))
+        elif m := re.fullmatch(rf'(%\S+) = and ({bool_type}) ({value}), ({value})', line):
+            name, kind, left, right = m.groups()
+            values[name] = tuple(('and', *sorted([x, y], key=repr)) for x, y in
+                                 zip(lanes(left, width(kind)), lanes(right, width(kind)), strict=True))
+        elif m := re.fullmatch(rf'(%\S+) = select ({bool_type}) ({value}), ({lane_type}) ({value}), \4 ({value})', line):
+            name, flags, condition, kind, yes, no = m.groups()
+            values[name] = tuple(('select', c, x, y) for c, x, y in
+                                 zip(lanes(condition, width(flags)), lanes(yes, width(kind)),
+                                     lanes(no, width(kind)), strict=True))
         elif m := re.fullmatch(rf'(%\S+) = insertelement ({lane_type}) ({value}), float ({value}), i(?:32|64) (\d+)', line):
             name, kind, original, item, index = m.groups()
             output_lanes = list(lanes(original, width(kind)))
@@ -284,7 +300,7 @@ struct LayoutParams {{
 }}
 mod prepare_frame {{
     use super::{{Margin, RustFloat}};
-    pub trait FrameFloat {{
+    pub trait FrameFloat: super::geometry::FloatBounds {{
 {chr(10).join(float_traits)}
     }}
     impl FrameFloat for RustFloat {{

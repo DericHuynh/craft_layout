@@ -395,3 +395,35 @@ fn flow_replay_publishes_the_same_nan_edges_as_full_layout() {
     assert_eq!(incremental, view(&full));
     assert!(incremental.iter().flatten().flatten().any(|&word| word == 0x7fc0_0000));
 }
+
+#[test]
+fn fractional_anchor_with_pixel_offset_tracks_resizes_and_flipped_origins() {
+    use keru_layout::{Anchor, Pos};
+
+    let mut tree = LayoutTree::<()>::new();
+    let root = tree.root();
+    let mut parent = LayoutParams { padding: Xy::new([10.0, 20.0], [0.0; 2]), ..LayoutParams::DEFAULT };
+    tree.update_node_params(&root, parent).unwrap();
+    let mut style = LayoutParams {
+        size: Xy::new(Size::Pixels(12.0), Size::Pixels(4.0)),
+        position: Xy::new(Pos::Offset { fraction: 0.5, pixels: 3.0 }, Pos::Start),
+        anchor: Xy::new(Anchor::End, Anchor::Start),
+        ..LayoutParams::DEFAULT
+    };
+    let child = tree.add_node(&root, style).unwrap();
+    let solve = |tree: &mut LayoutTree, width, expected| {
+        tree.solve_layout(Xy::new(width, 40.0));
+        assert_eq!(tree.layout(&child).unwrap().x, expected);
+    };
+    solve(&mut tree, 130.0, [51.0, 63.0]);
+    solve(&mut tree, 230.0, [101.0, 113.0]);
+    style.position.x = Pos::Offset { fraction: 0.25, pixels: 3.0 };
+    tree.update_node_params(&child, style).unwrap();
+    solve(&mut tree, 230.0, [51.0, 63.0]);
+    style.position.x = Pos::Offset { fraction: 0.25, pixels: -5.0 };
+    tree.update_node_params(&child, style).unwrap();
+    solve(&mut tree, 230.0, [43.0, 55.0]);
+    parent.children_origin_flipped.x = true;
+    tree.update_node_params(&root, parent).unwrap();
+    solve(&mut tree, 230.0, [165.0, 177.0]);
+}

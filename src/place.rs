@@ -268,7 +268,7 @@ impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placeme
         let layout = self.tree.node_layout_data(id);
         placement_modes::BlockItemInputs {
             bounds: placement_modes::BlockEdges {
-                padding: params.padding.y, collapse: block_can_collapse(params), zero_minimum: zero_minimum(params),
+                padding: params.padding.y, collapse: params.block_margins_can_collapse(), zero_minimum: zero_minimum(self.tree.read_size(id, Y, Kind::Min)),
             },
             height: layout.size().y, margins: margins(params, Y), children_empty: !layout.has_in_flow_children(),
         }
@@ -287,8 +287,8 @@ impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placeme
         let params = self.tree.node_layout_params(id);
         placement_modes::BlockEdges {
             padding: params.padding.y,
-            collapse: self.tree.node_layout_data(id).flags.is_block_item() && block_can_collapse(params),
-            zero_minimum: zero_minimum(params),
+            collapse: self.tree.node_layout_data(id).flags.is_block_item() && params.block_margins_can_collapse(),
+            zero_minimum: zero_minimum(self.tree.read_size(id, Y, Kind::Min)),
         }
     }
 
@@ -396,9 +396,6 @@ impl<T: TreeAdapter + ?Sized, S: Borrow<Snapper>, const UNSNAPPED: bool> placeme
     fn parent_style(&self, id: T::NodeId) -> placement_modes::ParentStyle {
         crate::placement_adapter::parent_style(self.tree.node_layout_params(id))
     }
-
-    #[inline(always)]
-    fn free_placement(&self, id: T::NodeId) -> bool { self.tree.node_layout_params(id).free_placement }
 
     #[inline(always)]
     fn prefers_batch(&self) -> bool { self.snapper().is_some_and(Snapper::prefers_batch) }

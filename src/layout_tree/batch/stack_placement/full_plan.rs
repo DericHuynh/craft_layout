@@ -7,6 +7,7 @@ use super::{
 };
 use crate::flow::margins;
 use crate::place::stack_line::{after_item, with_margin};
+use crate::placement_geometry::inner_start;
 use crate::{Arrange, WindowOverflow};
 
 #[derive(Clone, Copy, Debug)]
@@ -64,7 +65,10 @@ impl Cursor {
         let origin = [edges[0][0], edges[1][0]];
         Self {
             flow: style.flow,
-            start: [origin[0] + style.padding[0], origin[1] + style.padding[1]],
+            start: [
+                inner_start::<RustFloat>(edges[0], style.padding[0]),
+                inner_start::<RustFloat>(edges[1], style.padding[1]),
+            ],
             origin,
             spacing: style.spacing,
         }
@@ -353,8 +357,8 @@ impl FullPlan {
                     (WindowOverflow::Ignore, WindowOverflow::Ignore)
                 )
             }
-            Flow::X => matches!(params.position.y, Pos::Start),
-            Flow::Y => matches!(params.position.x, Pos::Start),
+            Flow::X => matches!(params.position.y, Pos::Start) && !params.has_auto_margin(Axis::X),
+            Flow::Y => matches!(params.position.x, Pos::Start) && !params.has_auto_margin(Axis::Y),
         };
         if params.free_placement || !usable {
             return None;

@@ -818,7 +818,7 @@ fn prepare_cross_fill_line_axis<T: StartActions + ?Sized, const VERTICAL: bool>(
             (margins, if margin == 0.0 { pixels } else { pixels + margin })
         };
         #[cfg(any(feature = "incremental", verus_keep_ghost))]
-        let packed_style = matches!(*params.position.component(cross), Pos::Start) && count < expected;
+        let packed_style = matches!(*params.position.component(cross), Pos::Start) && count < expected && !params.has_auto_margin(main);
         #[cfg(not(any(feature = "incremental", verus_keep_ghost)))]
         let _ = (cross_start, main_margins);
 

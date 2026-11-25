@@ -231,6 +231,7 @@ pub(crate) struct WrapCursor<I> {
     pub cross_position: f32,
     pub cross_edges: [f32; 2],
     pub main_position: f32,
+    pub auto_share: f32,
     pub gap: f32,
 }
 
@@ -240,6 +241,7 @@ pub(crate) struct PlacedLine<I> {
     pub main: f32,
     pub cross: f32,
     pub count: u32,
+    pub auto_edges: u32,
 }
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
@@ -455,9 +457,6 @@ pub(crate) trait ParentTarget<I>: StackTarget<I> + WrapTarget<I> + BlockTarget<I
     fn parent_style(&self, id: I) -> ParentStyle;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
-    fn free_placement(&self, id: I) -> bool;
-
-    #[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
     fn prefers_batch(&self) -> bool;
 
     #[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
@@ -501,7 +500,7 @@ pub(crate) trait RootTarget<I>: SiblingTarget<I> {
 #[cfg_attr(verus_keep_ghost, verifier::allow(autoderive_clone_without_spec))]
 enum Mode<I, F> {
     Free,
-    Stack { x: bool, position: f32, gap: f32, batch: bool, paired_leaves: bool },
+    Stack { head: I, x: bool, position: f32, gap: f32, auto_share: Option<f32>, batch: bool, paired_leaves: bool },
     Wrap(WrapCursor<I>),
     Block(F),
     Grid { parent: I, spacing: [f32; 2] },
@@ -583,7 +582,7 @@ pub(crate) closed spec fn paired_start_rects<I, T: node::NodeModel<I>, M: StackM
     source: &T, ids: Seq<I>, cursor: f32, frame: &Frame, x: bool, gap: f32,
 ) -> (Map<I, (Edges, Edges)>, f32) {
     let cross = if x { 1int } else { 0int };
-    let start = M::sum(frame.edges[cross][0], frame.padding[cross][0]);
+    let start = geometry::padded_start::<M>(frame.edges[cross], frame.padding[cross][0]);
     draw_rows::<I, T, _, _>(source.rectangles(), ids, cursor, frame.origin,
         solved_start_step::<I, T, M>(source, start, x, gap))
 }
@@ -600,7 +599,7 @@ proof fn paired_rect_push<I, T: node::NodeModel<I>, M: StackMath>(
     ensures ({
         let (prior, position) = paired_start_rects::<I, T, M>(source, ids, cursor, frame, x, gap);
         let cross = if x { 1int } else { 0int };
-        let start = M::sum(frame.edges[cross][0], frame.padding[cross][0]);
+        let start = geometry::padded_start::<M>(frame.edges[cross], frame.padding[cross][0]);
         let (raw, next) = start_step::<M>(position, start, x, source.solved_size(id), gap);
         paired_start_rects::<I, T, M>(source, ids.push(id), cursor, frame, x, gap)
             == (put_rect::<I, T>(prior, id, (source.rounding())(raw), frame.origin), next)
@@ -710,15 +709,15 @@ spec fn packed_rects<I, T: ParentTarget<I>, M: StackMath>(
         ChildrenLayout::Stack { axis, arrange: Arrange::Start, .. } => {
             let x = axis is X;
             let (main, cross): (int, int) = if x { (0, 1) } else { (1, 0) };
-            let position = M::sum(branch.rect[main][0], style.padding[main][0]);
-            let cross_start = M::sum(branch.rect[cross][0], style.padding[cross][0]);
+            let position = geometry::padded_start::<M>(branch.rect[main], style.padding[main][0]);
+            let cross_start = geometry::padded_start::<M>(branch.rect[cross], style.padding[cross][0]);
             draw_rows::<I, T, _, _>(tree.rectangles(), rows, position, branch.origin, packed_stack_step::<I, M>(cross_start, x)).0
         },
         ChildrenLayout::Wrap { axis, arrange: Arrange::Start, line_spacing, .. } => {
             let x = axis is X;
             let (main, cross): (int, int) = if x { (0, 1) } else { (1, 0) };
-            let position = M::sum(branch.rect[main][0], style.padding[main][0]);
-            let cross_start = M::sum(branch.rect[cross][0], style.padding[cross][0]);
+            let position = geometry::padded_start::<M>(branch.rect[main], style.padding[main][0]);
+            let cross_start = geometry::padded_start::<M>(branch.rect[cross], style.padding[cross][0]);
             draw_rows::<I, T, _, _>(tree.rectangles(), rows, (position, cross_start, 0.0), branch.origin,
                 packed_wrap_step::<I, M>(position, line_spacing, x)).0
         },
@@ -733,8 +732,8 @@ pub(crate) closed spec fn uniform_rects<I, T: ParentTarget<I>, M: StackMath>(
     if let ChildrenLayout::Stack { axis, arrange: Arrange::Start, spacing } = style.layout {
         let x = axis is X;
         let (main, cross): (int, int) = if x { (0, 1) } else { (1, 0) };
-        let position = M::sum(branch.rect[main][0], style.padding[main][0]);
-        let cross_start = M::sum(branch.rect[cross][0], style.padding[cross][0]);
+        let position = geometry::padded_start::<M>(branch.rect[main], style.padding[main][0]);
+        let cross_start = geometry::padded_start::<M>(branch.rect[cross], style.padding[cross][0]);
         draw_rows::<I, T, _, _>(tree.rectangles(), ids, position, branch.origin, uniform_step::<I, M>(cross_start, x, size, spacing)).0
     } else { tree.rectangles() }
 }
@@ -750,7 +749,7 @@ proof fn uniform_fold_uses_solved_sizes<I, T: node::NodeModel<I>, M: StackMath>(
         forall|edges: Edges| #[trigger] (source.rounding())(edges) == edges,
     ensures ({
         let cross = if x { 1int } else { 0int };
-        let start = M::sum(frame.edges[cross][0], frame.padding[cross][0]);
+        let start = geometry::padded_start::<M>(frame.edges[cross], frame.padding[cross][0]);
         paired_start_rects::<I, T, M>(source, ids, cursor, frame, x, gap)
             == draw_rows::<I, T, _, _>(source.rectangles(), ids, cursor, frame.origin,
                 uniform_step::<I, M>(start, x, size, gap))
@@ -792,7 +791,7 @@ pub(crate) proof fn uniform_matches_paired_recipe<I, T: ParentTarget<I>, M: Stac
         let style = source.parent_layout(branch.parent);
         let frame = Frame { edges: branch.rect, origin: branch.origin, padding: style.padding, flipped: style.flipped };
         let main = if x { 0int } else { 1int };
-        let cursor = M::sum(frame.edges[main][0], frame.padding[main][0]);
+        let cursor = geometry::padded_start::<M>(frame.edges[main], frame.padding[main][0]);
         uniform_rects::<I, T, M>(source, branch, size, ids)
             == paired_start_rects::<I, T, M>(source, ids, cursor, &frame, x, spacing).0
     }),
@@ -800,7 +799,7 @@ pub(crate) proof fn uniform_matches_paired_recipe<I, T: ParentTarget<I>, M: Stac
     let style = source.parent_layout(branch.parent);
     let frame = Frame { edges: branch.rect, origin: branch.origin, padding: style.padding, flipped: style.flipped };
     let main = if x { 0int } else { 1int };
-    let cursor = M::sum(frame.edges[main][0], frame.padding[main][0]);
+    let cursor = geometry::padded_start::<M>(frame.edges[main], frame.padding[main][0]);
     uniform_fold_uses_solved_sizes::<I, T, M>(source, &frame, ids, cursor, x, size, spacing);
 }
 
@@ -976,7 +975,8 @@ pub(crate) closed spec fn wrap_admitted<I, F>(links: node::PlacementLinks<I>, hi
 }
 
 pub(crate) closed spec fn cursor_admitted<I, F>(links: node::PlacementLinks<I>, hidden: spec_fn(I) -> bool, cursor: Siblings<I, F>) -> bool {
-    ordinary_siblings(cursor, cursor.partial) || wrap_admitted(links, hidden, cursor)
+    &&& ordinary_siblings(cursor, cursor.partial) || wrap_admitted(links, hidden, cursor)
+    &&& match cursor.mode { Mode::Stack { head, .. } => links.cost(Some(head)) > 0, _ => true }
 }
 
 pub(crate) closed spec fn ordinary_siblings<I, F>(cursor: Siblings<I, F>, partial: bool) -> bool {
@@ -2240,7 +2240,8 @@ fn batch_leaf<I: Copy, T: StackTarget<I>>(
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(branch =>
-    requires old(tree).links().finite(), consistent_cursor(old(tree).links(), *old(next)), !BATCH || !PARTIAL,
+    requires old(tree).links().finite(), consistent_cursor(old(tree).links(), *old(next)),
+        old(tree).links().cost(Some(head)) > 0, !BATCH || !PARTIAL,
     ensures final(tree).links() == old(tree).links(), final(tree).hidden() == old(tree).hidden(),
         final(tree).plain() == old(tree).plain(),
         sibling_progress(old(tree).links(), *old(next), *final(next), branch),
@@ -2248,9 +2249,11 @@ fn batch_leaf<I: Copy, T: StackTarget<I>>(
     no_unwind
 ))]
 pub(crate) fn stack<I: Copy, T: StackTarget<I>, M: StackMath, const PARTIAL: bool, const BATCH: bool>(
-    tree: &mut T, next: &mut Option<I>, frame: &Frame, x: bool, position: &mut f32, gap: f32,
+    tree: &mut T, head: I, next: &mut Option<I>, frame: &Frame, x: bool,
+    position: &mut f32, gap: f32, auto_share: &mut Option<f32>,
 ) -> Option<Branch<I>> {
-    let (_, cross) = axes(x);
+    let (main, cross) = axes(x);
+    let axis = if x { Axis::X } else { Axis::Y };
     let [cross_start, _] = geometry::inner_range::<M>(frame.edges[cross], frame.padding[cross]);
     let [flip_x, flip_y] = frame.flipped;
     let forward = !flip_x && !flip_y;
@@ -2265,7 +2268,8 @@ pub(crate) fn stack<I: Copy, T: StackTarget<I>, M: StackMath, const PARTIAL: boo
     let mut batch = if BATCH && tree.snapping() { Some(batch::empty_buffer(first, [0.0, 0.0, 0.0, 0.0])) } else { None };
     let use_prepared_styles = !PARTIAL && forward && tree.prepared_styles();
     positioned_siblings!(tree, next, id, PARTIAL;
-        [true, batch.is_none() || (BATCH && !PARTIAL),
+        [true, main < 2, cross < 2, tree.links().cost(Some(head)) > 0,
+            batch.is_none() || (BATCH && !PARTIAL),
             batch.is_none() || batch.unwrap().pending.len < batch::CAPACITY && clean_tail(batch.unwrap().pending)]
         [staged_writes(batch), saved_staged_writes(&batch)] {
         let child = tree.stack_data(id);
@@ -2293,11 +2297,31 @@ pub(crate) fn stack<I: Copy, T: StackTarget<I>, M: StackMath, const PARTIAL: boo
                 }
                 _ => {
                     let rect = match style {
-                        Some(style) if !forward
-                            || !matches!(if x { style.position.y } else { style.position.x }, Pos::Start) =>
-                            stack_item::<M>(frame, T::stack_align(style), size, x, position, gap),
-                        Some(style) if !zero_margins(style) =>
-                            stack_start_with_margin::<M>(cross_start, T::stack_align(style).margin, size, x, position, gap),
+                        Some(params) if !forward || !matches!(if x { params.position.y } else { params.position.x }, Pos::Start)
+                            || !zero_margins(params) => {
+                            let mut style = T::stack_align(params);
+                            let auto = params.auto_margins(axis);
+                            if auto[0] || auto[1] {
+                                let share = match *auto_share {
+                                    Some(share) => share,
+                                    None => {
+                                        // Start-aligned stacks need a sibling scan only if an
+                                        // in-flow item actually asks for an automatic margin.
+                                        let [start, end] = geometry::inner_range::<M>(frame.edges[main], frame.padding[main]);
+                                        let (used, _, edges) = stack_line_totals::<_, _, M>(tree, head, x, gap);
+                                        let share = geometry::auto_margin_share((end - start) - used, edges as usize);
+                                        *auto_share = Some(share);
+                                        share
+                                    }
+                                };
+                                style.margin[main] = resolved_margins(style.margin[main], auto, share);
+                            }
+                            if forward && matches!(style.pos[cross], Pos::Start) {
+                                stack_start_with_margin::<M>(cross_start, style.margin, size, x, position, gap)
+                            } else {
+                                stack_item::<M>(frame, style, size, x, position, gap)
+                            }
+                        }
                         _ => M::place_start(position, cross_start, x, size, gap),
                     };
                     if let Some(buffer) = &mut batch {
@@ -2390,13 +2414,14 @@ fn wrap_cross<I: Copy, T: WrapTarget<I>, M: StackMath + FloatBounds>(tree: &T, i
     requires tree.links().finite(), consistent_cursor(tree.links(), start),
     no_unwind
 ))]
-fn scan_placed_line<I: Copy, T: WrapTarget<I>, M: StackMath + FloatBounds>(
+fn scan_placed_line<I: Copy, T: WrapTarget<I> + StackTarget<I>, M: StackMath + FloatBounds>(
     tree: &T, start: Option<I>, x: bool, spacing: f32,
 ) -> PlacedLine<I> {
     let mut next = start;
     let mut count = 0u32;
     let mut main = 0.0;
     let mut cross = 0.0;
+    let mut auto_edges = 0u32;
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant tree.links().finite(), consistent_cursor(tree.links(), next),
         decreases tree.links().cost(next),
@@ -2408,6 +2433,8 @@ fn scan_placed_line<I: Copy, T: WrapTarget<I>, M: StackMath + FloatBounds>(
             if count != 0 && tree.wrap_marked(id) { break; }
             let size = tree.wrap_slot(id, x, Kind::Final);
             let [start, end] = tree.margins(id, x);
+            let [auto_start, auto_end] = tree.stack_params(id).auto_margins(if x { Axis::X } else { Axis::Y });
+            auto_edges = auto_edges.saturating_add(auto_start as u32 + auto_end as u32);
             let extent = M::with_margin(size, start + end);
             main = if count == 0 { extent } else { main + spacing + extent };
             cross = M::max(cross, wrap_cross::<_, _, M>(tree, id, !x));
@@ -2415,7 +2442,7 @@ fn scan_placed_line<I: Copy, T: WrapTarget<I>, M: StackMath + FloatBounds>(
         }
         next = tree.next_sibling(id);
     }
-    PlacedLine { next, main, cross, count }
+    PlacedLine { next, main, cross, count, auto_edges }
 }
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
@@ -2430,7 +2457,7 @@ fn scan_placed_line<I: Copy, T: WrapTarget<I>, M: StackMath + FloatBounds>(
         executed_sibling_plan(old(tree), final(tree), *old(next), *final(next), branch, PARTIAL),
     no_unwind
 ))]
-pub(crate) fn wrap<I: Copy, T: WrapTarget<I>, M: StackMath + FloatBounds, const PARTIAL: bool>(
+pub(crate) fn wrap<I: Copy, T: WrapTarget<I> + StackTarget<I>, M: StackMath + FloatBounds, const PARTIAL: bool>(
     tree: &mut T, next: &mut Option<I>, frame: &Frame, cursor: &mut WrapCursor<I>,
 ) -> Option<Branch<I>> {
     let (main, cross) = axes(cursor.x);
@@ -2452,7 +2479,8 @@ pub(crate) fn wrap<I: Copy, T: WrapTarget<I>, M: StackMath + FloatBounds, const 
             cursor.next_line = None;
         } else if !cursor.ready_cross && tree.same_cursor(cursor.next_line, id) {
             let line = scan_placed_line::<_, _, M>(tree, *next, cursor.x, cursor.spacing);
-            let (position, gap) = geometry::line_start_and_gap::<M>(cursor.arrange, main_range, line.main, line.count, cursor.spacing);
+            let (position, gap, share) = arranged_line::<M>(cursor.arrange, main_range, line.main, line.count, cursor.spacing, line.auto_edges);
+            cursor.auto_share = share;
             cursor.main_position = position;
             cursor.gap = gap;
             cursor.cross_edges = M::place(
@@ -2478,8 +2506,13 @@ pub(crate) fn wrap<I: Copy, T: WrapTarget<I>, M: StackMath + FloatBounds, const 
                     let mut line_frame = *frame;
                     line_frame.edges[cross] = cursor.cross_edges;
                     line_frame.padding[cross] = [0.0, 0.0];
+                    let mut margins = style.margin[main];
+                    if cursor.auto_share > 0.0 && !style.zero_margins {
+                        let axis = if cursor.x { Axis::X } else { Axis::Y };
+                        margins = resolved_margins(margins, tree.stack_params(id).auto_margins(axis), cursor.auto_share);
+                    }
                     let along = M::place(
-                        &mut cursor.main_position, frame.flipped[main], main_range, size[main], style.margin[main], cursor.gap,
+                        &mut cursor.main_position, frame.flipped[main], main_range, size[main], margins, cursor.gap,
                     );
                     let other = aligned_axis::<M>(&line_frame, cross, size[cross], style.pos[cross], style.anchor[cross], style.margin[cross]);
                     if cursor.x { [along, other] } else { [other, along] }
@@ -2609,43 +2642,57 @@ pub(crate) fn grid<I: Copy, T: GridTarget<I>, M: StackMath + FloatBounds, const 
     })
 }
 
+#[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
-#[cfg_attr(verus_keep_ghost, verus_spec(start =>
+#[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+fn resolved_margins(margins: [f32; 2], auto: [bool; 2], share: f32) -> [f32; 2] {
+    [if auto[0] { share } else { margins[0] }, if auto[1] { share } else { margins[1] }]
+}
+
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(
     requires tree.links().finite(), tree.links().cost(Some(first)) > 0,
-    ensures arrange is Start ==> {
-        let main = if x { 0int } else { 1int };
-        start == (M::sum(frame.edges[main][0], frame.padding[main][0]), spacing)
-    },
     no_unwind
 ))]
-fn stack_start<I: Copy, T: ParentTarget<I>, M: StackMath + FloatBounds>(
-    tree: &T, first: I, frame: &Frame, x: bool, arrange: Arrange, spacing: f32,
-) -> (f32, f32) {
+fn stack_line_totals<I: Copy, T: StackTarget<I>, M: StackMath>(
+    tree: &T, first: I, x: bool, spacing: f32,
+) -> (f32, u32, u32) {
     let (main, _) = axes(x);
-    let (total, count) = if matches!(arrange, Arrange::Start) {
-        (0.0, 0)
-    } else {
-        let mut count = 0u32;
-        let mut widths = 0.0;
-        let mut next = Some(first);
-        #[cfg_attr(verus_keep_ghost, verus_spec(
-            invariant tree.links().finite(), consistent_cursor(tree.links(), next), main < 2,
-            decreases tree.links().cost(next),
-        ))]
-        while let Some(id) = next {
-            #[cfg(verus_keep_ghost)]
-            proof! { assert(tree.links().covers(id)); }
-            next = tree.next_sibling(id);
-            if !tree.disabled(id) && !tree.free_placement(id) {
-                let [start, end] = tree.margins(id, x);
-                widths += M::with_margin(tree.size(id)[main], start + end);
-                count = count.saturating_add(1);
-            }
+    let mut count = 0u32;
+    let mut auto_edges = 0u32;
+    let mut widths = 0.0;
+    let mut next = Some(first);
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant tree.links().finite(), consistent_cursor(tree.links(), next), main < 2,
+        decreases tree.links().cost(next),
+    ))]
+    while let Some(id) = next {
+        #[cfg(verus_keep_ghost)]
+        proof! { assert(tree.links().covers(id)); }
+        next = tree.next_sibling(id);
+        let params = tree.stack_params(id);
+        if !params.disabled && !params.free_placement {
+            let [start, end] = tree.margins(id, x);
+            widths += M::with_margin(tree.size(id)[main], start + end);
+            let [auto_start, auto_end] = params.auto_margins(if x { Axis::X } else { Axis::Y });
+            auto_edges = auto_edges.saturating_add(auto_start as u32 + auto_end as u32);
+            count = count.saturating_add(1);
         }
-        let total = if count > 0 { widths + spacing * between_gaps(count) as f32 } else { widths };
-        (total, count)
-    };
-    geometry::line_start_and_gap::<M>(arrange, geometry::inner_range::<M>(frame.edges[main], frame.padding[main]), total, count, spacing)
+    }
+    let total = if count > 0 { widths + spacing * between_gaps(count) as f32 } else { widths };
+    (total, count, auto_edges)
+}
+
+#[inline]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(no_unwind))]
+fn arranged_line<M: FloatBounds>(
+    arrange: Arrange, range: [f32; 2], total: f32, count: u32, spacing: f32, edges: u32,
+) -> (f32, f32, f32) {
+    let share = geometry::auto_margin_share((range[1] - range[0]) - total, edges as usize);
+    let (position, gap) = if share > 0.0 { (range[0], spacing) }
+        else { geometry::line_start_and_gap::<M>(arrange, range, total, count, spacing) };
+    (position, gap, share)
 }
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
@@ -2665,11 +2712,19 @@ fn cursor_for<I: Copy, T: ParentTarget<I>, M: StackMath + FloatBounds>(tree: &T,
         ChildrenLayout::Free => Mode::Free,
         ChildrenLayout::Stack { axis, arrange, spacing } => {
             let x = matches!(axis, Axis::X);
-            let (position, gap) = stack_start::<_, _, M>(tree, first, &frame, x, arrange, spacing);
+            let (main, _) = axes(x);
+            let range = geometry::inner_range::<M>(frame.edges[main], frame.padding[main]);
+            let (position, gap, auto_share) = if matches!(arrange, Arrange::Start) {
+                (range[0], spacing, None)
+            } else {
+                let (total, count, edges) = stack_line_totals::<_, _, M>(tree, first, x, spacing);
+                let (position, gap, share) = arranged_line::<M>(arrange, range, total, count, spacing, edges);
+                (position, gap, Some(share))
+            };
             let batch = !partial && tree.prefers_batch() && tree.placed_children(parent) >= batch::CAPACITY as u32;
             let paired_leaves = !partial && tree.full_unsnapped() && !flipped[0] && !flipped[1]
                 && matches!(arrange, Arrange::Start) && tree.placed_children(parent) >= 8;
-            Mode::Stack { x, position, gap, batch, paired_leaves }
+            Mode::Stack { head: first, x, position, gap, auto_share, batch, paired_leaves }
         }
         ChildrenLayout::Wrap { axis, arrange, spacing, line_spacing } => {
             let x = matches!(axis, Axis::X);
@@ -2680,7 +2735,7 @@ fn cursor_for<I: Copy, T: ParentTarget<I>, M: StackMath + FloatBounds>(tree: &T,
                 x, arrange, spacing, line_spacing, next_line: Some(first), cross_position,
                 ready_cross,
                 ready_start: ready_cross && !flipped[0] && !flipped[1] && tree.ready_wrap_start(parent),
-                cross_edges: [0.0, 0.0], main_position: 0.0, gap: 0.0,
+                cross_edges: [0.0, 0.0], main_position: 0.0, gap: 0.0, auto_share: 0.0,
             })
         }
         ChildrenLayout::Block => Mode::Block(block_start(tree, parent)),
@@ -2800,8 +2855,8 @@ fn paired_start_leaves<I: Copy, T: StackTarget<I>, M: StackMath, const X: bool>(
             tree.hidden() == old(tree).hidden(), tree.plain() == old(tree).plain(),
             tree.rounding() == old(tree).rounding(),
             tree.start_aligned() == old(tree).start_aligned(),
-            cross == (if X { M::sum(frame.edges[1][0], frame.padding[1][0]) }
-                else { M::sum(frame.edges[0][0], frame.padding[0][0]) }),
+            cross == (if X { geometry::padded_start::<M>(frame.edges[1], frame.padding[1][0]) }
+                else { geometry::padded_start::<M>(frame.edges[0], frame.padding[0][0]) }),
             forall|id: I| #[trigger] tree.solved_size(id) == old(tree).solved_size(id),
             (tree.rectangles(), *position) == paired_start_rects::<I, T, M>(old(tree),
                 leaf_prefix(tree.links(), *old(next), count@).0, *old(position), frame, X, gap),
@@ -2937,7 +2992,7 @@ fn dispatch<I: Copy, T: ParentTarget<I>, M: StackMath + FloatBounds, const PARTI
         Mode::Block(flow) => block::<_, _, M, PARTIAL>(tree, next, frame, flow),
         Mode::Wrap(cursor) => wrap::<_, _, M, PARTIAL>(tree, next, frame, cursor),
         Mode::Grid { parent, spacing } => grid::<_, _, M, PARTIAL>(tree, *parent, next, frame, *spacing),
-        Mode::Stack { x, position, gap, batch, paired_leaves } => {
+        Mode::Stack { head, x, position, gap, auto_share, batch, paired_leaves } => {
             #[cfg(verus_keep_ghost)]
             let mut prefix = empty_staged_writes::<I>();
             #[cfg(verus_keep_ghost)]
@@ -2973,8 +3028,8 @@ fn dispatch<I: Copy, T: ParentTarget<I>, M: StackMath + FloatBounds, const PARTI
             let after_prefix = saved_sibling(tree);
             #[cfg(verus_keep_ghost)]
             let remaining = saved_next(next);
-            let result = if *batch { stack::<_, _, M, false, true>(tree, next, frame, *x, position, *gap) }
-                else { stack::<_, _, M, PARTIAL, false>(tree, next, frame, *x, position, *gap) };
+            let result = if *batch { stack::<_, _, M, false, true>(tree, *head, next, frame, *x, position, *gap, auto_share) }
+                else { stack::<_, _, M, PARTIAL, false>(tree, *head, next, frame, *x, position, *gap, auto_share) };
             #[cfg(verus_keep_ghost)]
             proof! {
                 if !PARTIAL {
@@ -3029,8 +3084,8 @@ fn dispatch<I: Copy, T: ParentTarget<I>, M: StackMath + FloatBounds, const PARTI
             match style.layout {
                 ChildrenLayout::Stack { axis, arrange: Arrange::Start, spacing } => {
                     let (main, cross): (int, int) = if axis is X { (0, 1) } else { (1, 0) };
-                    let position = M::sum(branch.rect[main][0], style.padding[main][0]);
-                    let cross_start = M::sum(branch.rect[cross][0], style.padding[cross][0]);
+                    let position = geometry::padded_start::<M>(branch.rect[main], style.padding[main][0]);
+                    let cross_start = geometry::padded_start::<M>(branch.rect[cross], style.padding[cross][0]);
                     let second = old(tree).links().next(branch.first).unwrap();
                     let (first_rect, next) = start_step::<M>(position, cross_start, axis is X, old(tree).solved_size(branch.first), spacing);
                     let (second_rect, _) = start_step::<M>(next, cross_start, axis is X, old(tree).solved_size(second), spacing);
@@ -3051,8 +3106,8 @@ fn place_pair<I: Copy, T: ParentTarget<I>, M: StackMath>(tree: &mut T, branch: &
     let Some(second) = tree.next_sibling(branch.first) else { return false; };
     let x = matches!(axis, Axis::X);
     let (main, cross) = axes(x);
-    let mut position = M::add(branch.rect[main][0], padding[main][0]);
-    let cross_start = M::add(branch.rect[cross][0], padding[cross][0]);
+    let mut position = geometry::inner_start::<M>(branch.rect[main], padding[main][0]);
+    let cross_start = geometry::inner_start::<M>(branch.rect[cross], padding[cross][0]);
     let a = M::place_start(&mut position, cross_start, x, tree.size(branch.first), spacing);
     let b = M::place_start(&mut position, cross_start, x, tree.size(second), spacing);
     node::write_snapped(tree, branch.first, a, branch.origin, false);
@@ -3113,8 +3168,8 @@ fn place_packed_leaves<I: Copy, T: ParentTarget<I>, M: StackMath>(tree: &mut T, 
     }
     let x = matches!(axis, Axis::X);
     let (main, cross) = axes(x);
-    let position = M::add(branch.rect[main][0], padding[main][0]);
-    let cross_start = M::add(branch.rect[cross][0], padding[cross][0]);
+    let position = geometry::inner_start::<M>(branch.rect[main], padding[main][0]);
+    let cross_start = geometry::inner_start::<M>(branch.rect[cross], padding[cross][0]);
     match (x, wrap) {
         (true, Some(line_spacing)) => {
             publish_packed_wrap::<_, _, M, true>(tree, branch, &rows, start, end, position, cross_start, line_spacing);
@@ -3274,8 +3329,8 @@ fn publish_packed_wrap<I: Copy, T: ParentTarget<I>, M: StackMath, const HORIZONT
         final(tree).written() == old(tree).written() + ids@,
         final(tree).rectangles() == ({
             let (main, cross): (int, int) = if X { (0, 1) } else { (1, 0) };
-            let position = M::sum(branch.rect[main][0], padding[main][0]);
-            let cross_start = M::sum(branch.rect[cross][0], padding[cross][0]);
+            let position = geometry::padded_start::<M>(branch.rect[main], padding[main][0]);
+            let cross_start = geometry::padded_start::<M>(branch.rect[cross], padding[cross][0]);
             draw_rows::<I, T, _, _>(old(tree).rectangles(), ids@, position, branch.origin, uniform_step::<I, M>(cross_start, X, size, gap)).0
         }),
     no_unwind
@@ -3284,8 +3339,8 @@ fn emit_uniform_leaves<I: Copy, T: ParentTarget<I>, M: StackMath, const X: bool>
     tree: &mut T, ids: &[I], size: [f32; 2], branch: &Branch<I>, padding: Edges, gap: f32,
 ) {
     let (main, cross) = axes(X);
-    let position = M::add(branch.rect[main][0], padding[main][0]);
-    let cross_start = M::add(branch.rect[cross][0], padding[cross][0]);
+    let position = geometry::inner_start::<M>(branch.rect[main], padding[main][0]);
+    let cross_start = geometry::inner_start::<M>(branch.rect[cross], padding[cross][0]);
     let mut cursor = position;
     let mut at = 0;
     #[cfg(verus_keep_ghost)]
