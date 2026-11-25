@@ -1,0 +1,61 @@
+<!-- Hand-derived parent-local rectangles. Each listed fixture is still scored
+     against the browser. Only a match of the entire native tree is accepted. -->
+<contracts>
+  <case reason="A horizontal Stack preserves pixel widths when children overflow."
+        fixtures="flex/flex_basis_flex_shrink_row__border_box_ltr
+                  flex/flex_basis_flex_shrink_row__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="100" height="100"/>
+      <node x="100" y="0" width="50" height="100"/>
+    </node>
+  </case>
+  <case reason="A vertical Stack preserves pixel heights when children overflow."
+        fixtures="flex/flex_basis_flex_shrink_column__border_box_ltr
+                  flex/flex_basis_flex_shrink_column__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="100" height="100"/>
+      <node x="0" y="100" width="100" height="50"/>
+    </node>
+  </case>
+  <case reason="A Stack places each fixed-width child after its predecessor at its declared width."
+        fixtures="flex/rounding_flex_basis_flex_shrink_row__border_box_ltr
+                  flex/rounding_flex_basis_flex_shrink_row__content_box_ltr">
+    <node x="0" y="0" width="101" height="100">
+      <node x="0" y="0" width="100" height="100"/>
+      <node x="100" y="0" width="25" height="100"/>
+      <node x="125" y="0" width="25" height="100"/>
+    </node>
+  </case>
+  <case reason="Frac(1.2) resolves to 240 px in a 200 px parent."
+        fixtures="flex/percentage_sizes_should_not_prevent_flex_shrinking__border_box_ltr
+                  flex/percentage_sizes_should_not_prevent_flex_shrinking__content_box_ltr">
+    <node x="0" y="0" width="200" height="200">
+      <node x="0" y="0" width="240" height="200">
+        <node x="0" y="0" width="0" height="200"/>
+      </node>
+    </node>
+  </case>
+  <case reason="AspectRatio(2) on width uses the declared 40 px height."
+        fixtures="flex/aspect_ratio_flex_column_stretch_fill_width__border_box_ltr
+                  flex/aspect_ratio_flex_column_stretch_fill_width__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="80" height="40"/>
+    </node>
+  </case>
+  <case reason="AspectRatio(2) on height uses the declared 40 px width."
+        fixtures="flex/aspect_ratio_flex_row_stretch_fill_height__border_box_ltr
+                  flex/aspect_ratio_flex_row_stretch_fill_height__content_box_ltr">
+    <node x="0" y="0" width="100" height="100">
+      <node x="0" y="0" width="40" height="20"/>
+    </node>
+  </case>
+  <case reason="The block fills its 100 px containing width. Its derived height is capped at 40 px."
+        fixtures="block/block_aspect_ratio_stretch_width_max_height__border_box_ltr
+                  block/block_aspect_ratio_stretch_width_max_height__content_box_ltr">
+    <node x="0" y="0" width="100" height="200">
+      <node x="0" y="0" width="100" height="40">
+        <node x="0" y="0" width="100" height="0"/>
+      </node>
+    </node>
+  </case>
+</contracts>

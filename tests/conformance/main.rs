@@ -10,14 +10,15 @@
 //! cargo test --test conformance -- --update         # rewrite the ratchet
 //! ```
 //!
-//! Fixtures listed in `tests/conformance/passing.txt` must keep passing.
+//! Fixtures in `passing.txt` must match Chrome. Cases in
+//! `native_expectations.xml` must also satisfy their native sizing contract.
 
 mod ahem;
 mod css;
 mod translate;
 
-use keru_layout::{NodeId, PixelScale, Xy};
-use std::collections::BTreeMap;
+use keru_layout::{NodeId, PixelScale, TreeError, Xy};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use translate::{Built, Parent, Tree};
 
@@ -29,6 +30,7 @@ const UNBOUNDED: f32 = 1.0e6;
 #[derive(Debug)]
 enum Outcome {
     Pass,
+    NativeMatch,
     Fail(String),
     Unsupported(String),
 }
@@ -48,6 +50,24 @@ fn expectation(node: roxmltree::Node) -> Expected {
     }
 }
 
+struct NativeCase<'a> {
+    reason: &'a str,
+    expected: Expected,
+}
+
+fn native_cases<'a>(document: &'a roxmltree::Document) -> BTreeMap<&'a str, NativeCase<'a>> {
+    let mut cases = BTreeMap::new();
+    for case in document.root_element().children().filter(|node| node.is_element()) {
+        let root = case.first_element_child().expect("native rectangle tree");
+        let reason = case.attribute("reason").expect("native sizing rule");
+        for name in case.attribute("fixtures").expect("fixture names").split_whitespace() {
+            let previous = cases.insert(name, NativeCase { reason, expected: expectation(root) });
+            assert!(previous.is_none(), "duplicate native expectation for {name}");
+        }
+    }
+    cases
+}
+
 fn viewport_axis(raw: Option<&str>) -> Option<f32> {
     raw.and_then(|v| v.strip_suffix("px")).and_then(|v| v.parse().ok())
 }
@@ -58,7 +78,7 @@ fn measure(_: NodeId, text: Option<&mut ahem::AhemText>, wrap: Option<f32>) -> X
     Xy::new(width, height)
 }
 
-fn run(path: &Path) -> Outcome {
+fn run(path: &Path, native: Option<&NativeCase>) -> Outcome {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) => return Outcome::Fail(error.to_string()),
@@ -95,13 +115,37 @@ fn run(path: &Path) -> Outcome {
         return Outcome::Fail("no expectations".into());
     };
     let mut failures = Vec::new();
-    compare(&tree, &built, &expected, [0.0, 0.0], "root", &mut failures);
+    compare(&tree, &built, &expected, Some([0.0, 0.0]), "root", &mut failures);
+    if let Some(native) = native {
+        let mut native_failures = Vec::new();
+        compare(&tree, &built, &native.expected, Some([0.0, 0.0]), "root", &mut native_failures);
+        if !native_failures.is_empty() {
+            return Outcome::Fail(format!("{} {}", native.reason, native_failures.join("; ")));
+        }
+        if !failures.is_empty() {
+            return Outcome::NativeMatch;
+        }
+    }
     if failures.is_empty() { Outcome::Pass } else { Outcome::Fail(failures.join("; ")) }
 }
 
-fn compare(tree: &Tree, built: &Built, expected: &Expected, origin: [f32; 2], path: &str, failures: &mut Vec<String>) {
-    let absolute = tree.layout(&built.node).map(|r| [r.x[0], r.y[0], r.x[1], r.y[1]]).unwrap_or([0.0; 4]);
-    let actual = [absolute[0] - origin[0], absolute[1] - origin[1], absolute[2] - absolute[0], absolute[3] - absolute[1]];
+fn compare(tree: &Tree, built: &Built, expected: &Expected, origin: Option<[f32; 2]>, path: &str, failures: &mut Vec<String>) {
+    // A hidden subtree has zero boxes in the fixture and no published rectangles.
+    let (actual, child_origin) = match (origin.filter(|_| !built.disabled), tree.layout(&built.node)) {
+        (Some([x, y]), Ok(rect)) => (
+            [rect.x[0] - x, rect.y[0] - y, rect.x[1] - rect.x[0], rect.y[1] - rect.y[0]],
+            Some([rect.x[0], rect.y[0]]),
+        ),
+        (None, Err(TreeError::LayoutUnavailable)) => ([0.0; 4], None),
+        (None, Ok(_)) => {
+            failures.push(format!("{path}: hidden node published a rectangle"));
+            return;
+        }
+        (_, Err(error)) => {
+            failures.push(format!("{path}: {error}"));
+            return;
+        }
+    };
     if actual.iter().zip(expected.rect).any(|(a, e)| !((a - e).abs() < TOLERANCE)) {
         failures.push(format!("{path}: expected {:?}, got {:?}", expected.rect, actual));
     }
@@ -113,7 +157,7 @@ fn compare(tree: &Tree, built: &Built, expected: &Expected, origin: [f32; 2], pa
         return;
     }
     for (index, (child, expected)) in built.children.iter().zip(&expected.children).enumerate() {
-        compare(tree, child, expected, [absolute[0], absolute[1]], &format!("{path}.{index}"), failures);
+        compare(tree, child, expected, child_origin, &format!("{path}.{index}"), failures);
     }
 }
 
@@ -146,8 +190,16 @@ fn fixtures(dir: &Path) -> Vec<(String, PathBuf)> {
 #[derive(Default)]
 struct Tally {
     pass: usize,
+    native: usize,
     fail: usize,
     unsupported: usize,
+}
+
+impl Tally {
+    fn print(&self, name: &str) {
+        let total = self.pass + self.native + self.fail + self.unsupported;
+        println!("{name:<12} {:>6} {:>6} {:>6} {:>12} {total:>6}", self.pass, self.native, self.fail, self.unsupported);
+    }
 }
 
 fn main() {
@@ -162,29 +214,41 @@ fn main() {
         println!("conformance: fixtures not found; run benchmarks/conformance/fetch.sh (skipping)");
         return;
     };
-    let ratchet: Vec<String> = std::fs::read_to_string(&ratchet_path)
-        .unwrap_or_default()
+    let ratchet: BTreeSet<String> = std::fs::read_to_string(&ratchet_path)
+        .expect("read browser ratchet")
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(String::from)
         .collect();
+    let native_document = roxmltree::Document::parse(include_str!("native_expectations.xml")).expect("parse native expectations");
+    let native_cases = native_cases(&native_document);
 
     let mut tallies: BTreeMap<String, Tally> = BTreeMap::new();
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
     let mut passing = Vec::new();
     let mut regressions = Vec::new();
+    let mut required: BTreeSet<&str> = ratchet.iter().map(String::as_str)
+        .chain(native_cases.keys().copied()).filter(|name| name.contains(&filter)).collect();
     for (name, path) in fixtures(&dir) {
         if !name.contains(&filter) {
             continue;
         }
         let category = name.split('/').next().unwrap().to_string();
         let tally = tallies.entry(category).or_default();
-        let outcome = std::panic::catch_unwind(|| run(&path)).unwrap_or_else(|_| Outcome::Fail("panic".into()));
+        required.remove(name.as_str());
+        let native = native_cases.get(name.as_str());
+        let outcome = std::panic::catch_unwind(|| run(&path, native)).unwrap_or_else(|_| Outcome::Fail("panic".into()));
         match &outcome {
             Outcome::Pass => {
                 tally.pass += 1;
                 passing.push(name.clone());
+            }
+            Outcome::NativeMatch => {
+                tally.native += 1;
+                if verbose {
+                    println!("NATIVE {name}: {}", native.unwrap().reason);
+                }
             }
             Outcome::Fail(reason) => {
                 tally.fail += 1;
@@ -198,28 +262,34 @@ fn main() {
                 *reasons.entry(key).or_default() += 1;
             }
         }
-        if !matches!(outcome, Outcome::Pass) && ratchet.binary_search(&name).is_ok() {
+        let lost_browser_match = ratchet.contains(&name) && !matches!(outcome, Outcome::Pass);
+        let lost_native_match = native.is_some() && !matches!(outcome, Outcome::Pass | Outcome::NativeMatch);
+        if lost_browser_match || lost_native_match {
             regressions.push(format!("{name}: {outcome:?}"));
         }
     }
+    regressions.extend(required.into_iter().map(|name| format!("{name}: fixture missing")));
 
-    println!("{:<12} {:>6} {:>6} {:>12} {:>6}", "category", "pass", "fail", "unsupported", "total");
+    println!("{:<12} {:>6} {:>6} {:>6} {:>12} {:>6}", "category", "pass", "native", "fail", "unsupported", "total");
     let mut total = Tally::default();
     for (category, tally) in &tallies {
-        let sum = tally.pass + tally.fail + tally.unsupported;
-        println!("{category:<12} {:>6} {:>6} {:>12} {sum:>6}", tally.pass, tally.fail, tally.unsupported);
+        tally.print(category);
         total.pass += tally.pass;
+        total.native += tally.native;
         total.fail += tally.fail;
         total.unsupported += tally.unsupported;
     }
-    println!(
-        "{:<12} {:>6} {:>6} {:>12} {:>6}",
-        "all", total.pass, total.fail, total.unsupported, total.pass + total.fail + total.unsupported
-    );
+    total.print("all");
     let mut top: Vec<_> = reasons.into_iter().collect();
     top.sort_by(|a, b| b.1.cmp(&a.1));
     println!("top unsupported: {}", top.iter().take(12).map(|(r, n)| format!("{r} ({n})")).collect::<Vec<_>>().join(", "));
 
+    if !regressions.is_empty() {
+        for regression in regressions.iter().take(50) {
+            println!("REGRESSION {regression}");
+        }
+        panic!("{} fixture expectations regressed", regressions.len());
+    }
     if update {
         assert!(filter.is_empty(), "--update rewrites the whole ratchet; drop --filter");
         let mut contents = String::from("# Fixtures that must keep passing. Regenerate with `cargo test --test conformance -- --update`.\n");
@@ -229,10 +299,5 @@ fn main() {
         }
         std::fs::write(&ratchet_path, contents).expect("write ratchet");
         println!("ratchet: {} fixtures", passing.len());
-    } else if !regressions.is_empty() {
-        for regression in regressions.iter().take(50) {
-            println!("REGRESSION {regression}");
-        }
-        panic!("{} ratcheted fixtures no longer pass", regressions.len());
     }
 }

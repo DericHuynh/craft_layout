@@ -90,6 +90,14 @@ std::fs::write("example.svg", tree.to_svg())?;
 # }
 ```
 
+### Choosing which dimension drives layout
+
+Declare the dimension you know and put `Size::AspectRatio(width / height)` on the dimension you want derived. In a 100 × 100 row, a child with `size: Xy::new(Size::Pixels(40.0), Size::AspectRatio(2.0))` is 40 × 20. To make height drive width, use `Xy::new(Size::AspectRatio(2.0), Size::Fill)`. The solver resolves the height before computing the width. The [giraffe layout test](tests/article_layout.rs) uses this ordering to size an image from a neighboring column of wrapped text.
+
+A stack also preserves explicit pixel and fractional sizes when its children overflow. For children that should share the available space, use `Size::Fill` and `fill_weight`. A `FitContent` stack can derive its own size from fractional children. For example, in a row with no gaps, margins, or padding, a 1 px child beside a child requesting `Size::Frac(1023.0 / 1024.0)` gives a 1,024 px row. The fractional child occupies the remaining 1,023 px.
+
+A maximum can make a row fit even when the requested fractions add up to more than one. Put a 1 px item beside two 75% items and cap the first 75% item at 12 px. The row is 52 px wide, with children occupying 1, 12, and 39 px. Removing the cap makes the same declarations impossible to satisfy and produces an `ImpossibleFracChildren` warning on the row.
+
 ### Wrapping, margins, and block flow
 
 - `ChildrenLayout::Wrap` lays out successive rows or columns. Choose an axis, per-line arrangement, item spacing, and line spacing. Line breaks use item sizes before distributing the remaining main-axis space to weighted `Fill` children. The tallest or widest intrinsic item sets the cross-axis extent of its line. Cross-axis `Fill` children stretch inside that extent.

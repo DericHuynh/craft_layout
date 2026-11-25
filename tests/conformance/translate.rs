@@ -1,8 +1,8 @@
 //! Translates fixture CSS into keru `LayoutParams`.
 //!
-//! The translation only uses keru features whose semantics coincide with the
-//! CSS property. Anything else is reported as unsupported, so the scoreboard
-//! separates "keru computes this differently" from "keru cannot express this".
+//! The translation maps the supported CSS subset to native declarations.
+//! Some declarations resolve differently under CSS flex or intrinsic sizing.
+//! The runner checks documented differences against hand-derived native rectangles.
 
 use crate::ahem::AhemText;
 use crate::css::{Style, Value};
@@ -32,6 +32,7 @@ pub enum Align {
 
 pub struct Built {
     pub node: NodeId,
+    pub disabled: bool,
     pub children: Vec<Built>,
 }
 
@@ -195,7 +196,9 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
     };
 
     let grow = style.number("flex-grow", 0.0)?;
-    let _shrink = style.number("flex-shrink", 1.0)?;
+    // Stacks keep declared sizes in negative free space. Read the CSS factor
+    // for validation; the scoreboard still compares against the Chrome result.
+    style.number("flex-shrink", 1.0)?;
     let basis = style.value("flex-basis");
     let align_self = align(style.keyword("align-self", "auto"))?;
     let aspect = style.value("aspect-ratio");
@@ -291,5 +294,5 @@ pub fn build(tree: &mut Tree, parent: &NodeId, xml: roxmltree::Node, context: Pa
     for child in xml.children().filter(|child| child.is_element()) {
         children.push(build(tree, &node, child, child_context)?);
     }
-    Ok(Built { node, children })
+    Ok(Built { node, disabled: params.disabled, children })
 }

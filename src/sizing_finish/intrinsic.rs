@@ -189,32 +189,53 @@ pub(crate) open spec fn stack_row_extent<F: FrameFloat>(row: StackRow) -> f32 {
         F::sum(row.margins[0], row.margins[1]))
 }
 
+/// Earliest finite parent size at which this child's positive fraction reaches
+/// its maximum. Division can round just below the necessary breakpoint.
+pub(crate) open spec fn next_bound<F: FrameFloat>(frac: f32, maximum: Option<f32>, wanted: f32,
+    prior: Option<f32>) -> Option<f32> {
+    match maximum {
+        Some(cap) if F::at_most(0.0f32, frac) && !F::number_eq(0.0f32, frac)
+            && F::at_most(wanted, cap) && !F::number_eq(wanted, cap) => {
+            let x = F::quotient(cap, frac);
+            let probe = if F::at_most(F::product(x, frac), cap) && !F::number_eq(F::product(x, frac), cap) {
+                F::decode(F::word(x).saturating_add(1))
+            } else { x };
+            if !F::finite_word(probe) { prior } else {
+                Some(match prior { Some(prev) => F::minimum(prev, probe), None => probe })
+            }
+        }
+        _ => prior,
+    }
+}
+
 /// A fractional contribution is either accumulated into the free fraction
 /// or clamped and added to the fixed extent. Each margin reaches the sum first.
 pub(crate) open spec fn stack_row_progress<F: FrameFloat>(
-    row: StackRow, estimate: f32, current: (f32, f32, bool),
-) -> (f32, f32, bool) {
-    let (extent, free_frac, has_frac) = current;
+    row: StackRow, estimate: f32, current: (f32, f32, bool, Option<f32>),
+) -> (f32, f32, bool, Option<f32>) {
+    let (extent, free_frac, has_frac, next_cap) = current;
     let margin = F::sum(row.margins[0], row.margins[1]);
     match row.fraction {
         Some(frac) => {
             let extent = F::sum(extent, margin);
             let wanted = F::product(estimate, frac);
             let allowed = clamp_extent::<F>(wanted, row.minimum, row.maximum);
-            if F::number_eq(allowed, wanted) { (extent, F::sum(free_frac, frac), true) }
-            else { (F::sum(extent, allowed), free_frac, true) }
+            let next_cap = next_bound::<F>(frac, row.maximum, wanted, next_cap);
+            if F::number_eq(allowed, wanted) && !matches!(row.maximum, Some(cap) if F::number_eq(wanted, cap)) {
+                (extent, F::sum(free_frac, frac), true, next_cap)
+            } else { (F::sum(extent, allowed), free_frac, true, next_cap) }
         }
-        None => (F::sum(extent, stack_row_extent::<F>(row)), free_frac, has_frac),
+        None => (F::sum(extent, stack_row_extent::<F>(row)), free_frac, has_frac, next_cap),
     }
 }
 
 /// Keep the execution order of floating point addition, including skipped rows.
 pub(crate) closed spec fn stack_prefix<F: FrameFloat>(
     rows: Seq<Option<StackRow>>, estimate: f32, end: nat,
-) -> (f32, f32, bool)
+) -> (f32, f32, bool, Option<f32>)
     decreases end,
 {
-    if end == 0 { (0.0f32, 0.0f32, false) } else {
+    if end == 0 { (0.0f32, 0.0f32, false, None) } else {
         let before = stack_prefix::<F>(rows, estimate, (end - 1) as nat);
         match rows[end - 1] {
             Some(row) => stack_row_progress::<F>(row, estimate, before), None => before,
@@ -242,13 +263,13 @@ pub(crate) open spec fn stack_intrinsic<A: FinishModel + ?Sized>(access: &A, slo
 }
 
 pub(crate) open spec fn stack_intrinsic_value<A: FinishModel + IntrinsicOracle<A::Id> + ?Sized>(access: &A, slot: Request<A::Id>) -> f32 {
-    let result = fit_stack_recipe::<A::Float>(stack_rows(access, slot), 0.0f32, false, MAX_FIT_STACK_STEPS as nat);
+    let result = fit_stack_recipe::<A::Float>(stack_rows(access, slot), 0.0f32, false, (MAX_FIT_STACK_STEPS + access.finish_child_count(slot.node)) as nat);
     inherent_extent::<A::Float>(result.0, own_extent(access, slot),
         declared_gaps(access, slot.node, slot.axis()), pad_extent::<A::Float>(access.finish_layout(slot.node), slot.axis()))
 }
 
 pub(crate) open spec fn stack_intrinsic_warnings<A: FinishModel + ?Sized>(access: &A, slot: Request<A::Id>) -> Seq<FinishEffect<A::Id>> {
-    let result = fit_stack_recipe::<A::Float>(stack_rows(access, slot), 0.0f32, false, MAX_FIT_STACK_STEPS as nat);
+    let result = fit_stack_recipe::<A::Float>(stack_rows(access, slot), 0.0f32, false, (MAX_FIT_STACK_STEPS + access.finish_child_count(slot.node)) as nat);
     if result.1 { seq![FinishEffect::Warning(slot, Warning::ImpossibleFracChildren)] }
     else { Seq::empty() }
 }
@@ -725,6 +746,20 @@ fn add_margin<F: FrameFloat>(size: f32, margin: f32) -> f32 {
     if F::is_zero(margin) { size } else { F::add(size, margin) }
 }
 
+#[inline]
+#[cfg_attr(verus_keep_ghost, verus_verify)]
+#[cfg_attr(verus_keep_ghost, verus_spec(result => ensures result == next_bound::<F>(frac, maximum, wanted, prior), no_unwind))]
+fn next_fraction_cap<F: FrameFloat>(frac: f32, maximum: Option<f32>, wanted: f32, prior: Option<f32>) -> Option<f32> {
+    let Some(cap) = maximum else { return prior; };
+    if !F::less_than(0.0, frac) || !F::less_than(wanted, cap) { return prior; }
+    let x = F::divide(cap, frac);
+    let probe = if F::less_than(F::multiply(x, frac), cap) {
+        F::from_word(F::bits(x).saturating_add(1))
+    } else { x };
+    if !F::finite(probe) { return prior; }
+    Some(match prior { Some(prev) => F::min(prev, probe), None => probe })
+}
+
 #[inline(always)]
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(next =>
@@ -735,10 +770,10 @@ fn add_margin<F: FrameFloat>(size: f32, margin: f32) -> f32 {
     no_unwind
 ))]
 fn scan_stack_child<A: IntrinsicRows>(
-    access: &A, slot: Request<A::Id>, child: A::Id, estimate: f32, current: (f32, f32, bool),
+    access: &A, slot: Request<A::Id>, child: A::Id, estimate: f32, current: (f32, f32, bool, Option<f32>),
     #[cfg(verus_keep_ghost)] cursor: Ghost<nat>,
-) -> (f32, f32, bool) {
-    let (extent, free_frac, has_frac) = current;
+) -> (f32, f32, bool, Option<f32>) {
+    let (extent, free_frac, has_frac, next_cap) = current;
     let declaration = access.declaration(target(child, slot.vertical, Kind::Regular));
     let [start, end] = A::margins(access.params(child), slot.axis());
     let margin = A::Float::add(start, end);
@@ -750,14 +785,16 @@ fn scan_stack_child<A: IntrinsicRows>(
         let minimum = intrinsic_bound(access, slot, child, Kind::Min, #[cfg(verus_keep_ghost)] cursor);
         let maximum = intrinsic_bound(access, slot, child, Kind::Max, #[cfg(verus_keep_ghost)] cursor);
         let allowed = clamp::<A::Float>(wanted, minimum, maximum);
-        if A::Float::equal_numbers(allowed, wanted) { (extent, A::Float::add(free_frac, frac), true) }
-        else { (A::Float::add(extent, allowed), free_frac, true) }
+        let next_cap = next_fraction_cap::<A::Float>(frac, maximum, wanted, next_cap);
+        if A::Float::equal_numbers(allowed, wanted) && !matches!(maximum, Some(cap) if A::Float::equal_numbers(wanted, cap)) {
+            (extent, A::Float::add(free_frac, frac), true, next_cap)
+        } else { (A::Float::add(extent, allowed), free_frac, true, next_cap) }
     } else {
         let size = pre_grow(access, slot, child, #[cfg(verus_keep_ghost)] cursor);
         let footprint = add_margin::<A::Float>(size, margin);
         #[cfg(verus_keep_ghost)]
         proof! { assert(footprint == stack_row_extent::<A::Float>(stack_rows(access, slot)[cursor@ as int].unwrap())); }
-        (A::Float::add(extent, footprint), free_frac, has_frac)
+        (A::Float::add(extent, footprint), free_frac, has_frac, next_cap)
     }
 }
 
@@ -817,27 +854,28 @@ fn scan_grid_child<A: IntrinsicRows>(
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[cfg_attr(verus_keep_ghost, verus_spec(scan =>
     requires is_intrinsic(access, slot), ready_inputs(access, slot), !(access.topology().intrinsic_flow)(slot),
-    ensures no_in_flow_children(access, slot.node) ==> scan == (0.0f32, 0.0f32, false),
+    ensures no_in_flow_children(access, slot.node) ==> scan == (0.0f32, 0.0f32, false, None),
         measure is Stack ==> {
             let rows = stack_rows(access, slot);
             scan == stack_prefix::<A::Float>(rows, stack_estimate(measure), rows.len())
         },
         measure is Largest ==> {
             let rows = stack_rows(access, slot);
-            scan == (largest_prefix::<A::Float>(rows, free_scan(measure), rows.len()), 0.0f32, false)
+            scan == (largest_prefix::<A::Float>(rows, free_scan(measure), rows.len()), 0.0f32, false, None)
         },
         measure is Grid ==> {
             let rows = stack_rows(access, slot);
             let (tracks, spacing) = grid_scan(measure);
-            scan == (grid_prefix::<A::Float>(rows, tracks, spacing, rows.len()), 0.0f32, false)
+            scan == (grid_prefix::<A::Float>(rows, tracks, spacing, rows.len()), 0.0f32, false, None)
         },
     no_unwind
 ))]
-fn scan_extent<A: IntrinsicRows>(access: &A, slot: Request<A::Id>, measure: Extent) -> (f32, f32, bool) {
+fn scan_extent<A: IntrinsicRows>(access: &A, slot: Request<A::Id>, measure: Extent) -> (f32, f32, bool, Option<f32>) {
     let mut next = access.first_child(slot.node);
     let mut extent = 0.0f32;
     let mut free_frac = 0.0f32;
     let mut has_frac = false;
+    let mut next_cap = None;
     #[cfg(verus_keep_ghost)]
     let mut cursor = start_children();
     #[cfg(verus_keep_ghost)]
@@ -852,16 +890,16 @@ fn scan_extent<A: IntrinsicRows>(access: &A, slot: Request<A::Id>, measure: Exte
             !(access.topology().intrinsic_flow)(slot),
             cursor@ <= (access.topology().children)(slot.node).len(),
             next == sizing_requests::child_at((access.topology().children)(slot.node), cursor@),
-            no_in_flow_children(access, slot.node) ==> extent == 0.0f32 && free_frac == 0.0f32 && !has_frac,
+            no_in_flow_children(access, slot.node) ==> extent == 0.0f32 && free_frac == 0.0f32 && !has_frac && next_cap.is_none(),
             stack_rows(access, slot).len() == (access.topology().children)(slot.node).len(),
-            measure is Stack ==> (extent, free_frac, has_frac)
+            measure is Stack ==> (extent, free_frac, has_frac, next_cap)
                 == stack_prefix::<A::Float>(stack_rows(access, slot), stack_estimate(measure), cursor@),
-            measure is Largest ==> (extent, free_frac, has_frac)
-                == (largest_prefix::<A::Float>(stack_rows(access, slot), free_scan(measure), cursor@), 0.0f32, false),
+            measure is Largest ==> (extent, free_frac, has_frac, next_cap)
+                == (largest_prefix::<A::Float>(stack_rows(access, slot), free_scan(measure), cursor@), 0.0f32, false, None),
             measure is Grid ==> {
                 let (tracks, spacing) = grid_scan(measure);
-                (extent, free_frac, has_frac)
-                    == (grid_prefix::<A::Float>(stack_rows(access, slot), tracks, spacing, cursor@), 0.0f32, false)
+                (extent, free_frac, has_frac, next_cap)
+                    == (grid_prefix::<A::Float>(stack_rows(access, slot), tracks, spacing, cursor@), 0.0f32, false, None)
             },
         ensures cursor@ == (access.topology().children)(slot.node).len(),
         decreases (access.topology().children)(slot.node).len() - cursor@,
@@ -891,12 +929,13 @@ fn scan_extent<A: IntrinsicRows>(access: &A, slot: Request<A::Id>, measure: Exte
                 }
                 Extent::Stack { estimate } => {
                     let progress = scan_stack_child(
-                        access, slot, child, estimate, (extent, free_frac, has_frac),
+                        access, slot, child, estimate, (extent, free_frac, has_frac, next_cap),
                         #[cfg(verus_keep_ghost)] cursor,
                     );
                     extent = progress.0;
                     free_frac = progress.1;
                     has_frac = progress.2;
+                    next_cap = progress.3;
                 }
             }
         }
@@ -908,7 +947,7 @@ fn scan_extent<A: IntrinsicRows>(access: &A, slot: Request<A::Id>, measure: Exte
                     stack_row_at(access, slot, cursor@);
                     assert(ordered[cursor@ as int].is_some() == in_flow);
                     stack_step::<A::Float>(ordered, stack_estimate(measure), cursor@);
-                    assert((extent, free_frac, has_frac) == stack_prefix::<A::Float>(ordered, stack_estimate(measure), cursor@ + 1));
+                    assert((extent, free_frac, has_frac, next_cap) == stack_prefix::<A::Float>(ordered, stack_estimate(measure), cursor@ + 1));
                 }
                 if measure is Largest {
                     let ordered = stack_rows(access, slot);
@@ -929,13 +968,11 @@ fn scan_extent<A: IntrinsicRows>(access: &A, slot: Request<A::Id>, measure: Exte
             cursor = step_child(cursor);
         }
     }
-    (extent, free_frac, has_frac)
+    (extent, free_frac, has_frac, next_cap)
 }
 
 #[cfg_attr(verus_keep_ghost, verus_verify)]
-const MAX_FIT_STACK_FRAC: f32 = 0.999;
-#[cfg_attr(verus_keep_ghost, verus_verify)]
-pub(crate) const MAX_FIT_STACK_STEPS: usize = 64;
+pub(crate) const MAX_FIT_STACK_STEPS: u64 = 64;
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 const FIT_STACK_EPSILON: f32 = 1e-6;
 
@@ -943,15 +980,25 @@ const FIT_STACK_EPSILON: f32 = 1e-6;
 verus! {
 
 spec fn fit_iteration<F: FrameFloat>(
-    scan: (f32, f32, bool), estimate: f32, overflow: bool,
+    scan: (f32, f32, bool, Option<f32>), estimate: f32, overflow: bool,
 ) -> ((f32, bool), bool) {
-    let (fixed, free_frac, has_frac) = scan;
-    if !has_frac { ((fixed, false), true) } else {
-        let within = F::at_most(free_frac, MAX_FIT_STACK_FRAC);
+    let (fixed, free_frac, has_frac, next_cap) = scan;
+    if !has_frac { ((fixed, false), true) }
+    else if F::number_eq(free_frac, 1.0f32) && F::number_eq(fixed, 0.0f32) { ((estimate, false), true) }
+    else {
+        let within = F::at_most(free_frac, 1.0f32) && !F::number_eq(free_frac, 1.0f32);
         let next = if within { F::quotient(fixed, F::difference(1.0f32, free_frac)) } else { fixed };
-        let settled = F::at_most(F::magnitude(F::difference(next, estimate)),
-            F::product(FIT_STACK_EPSILON, F::maximum(F::magnitude(next), 1.0f32)));
-        ((next, overflow || !within), settled)
+        let demand = F::sum(fixed, F::product(estimate, free_frac));
+        let positive = F::at_most(0.0f32, fixed) && !F::number_eq(0.0f32, fixed);
+        let growing = F::at_most(estimate, demand) && !F::number_eq(estimate, demand);
+        if (positive || growing) && next_cap.is_some() && (!within || !F::finite_word(next)) {
+            let probe = if F::finite_word(demand) { F::maximum(next_cap.unwrap(), demand) } else { next_cap.unwrap() };
+            ((probe, overflow), false)
+        } else {
+            let settled = F::at_most(F::magnitude(F::difference(next, estimate)),
+                F::product(FIT_STACK_EPSILON, F::maximum(F::magnitude(next), 1.0f32)));
+            ((next, overflow || !within), settled)
+        }
     }
 }
 
@@ -976,7 +1023,7 @@ proof fn fit_done<F: FrameFloat>(rows: Seq<Option<StackRow>>, estimate: f32, ove
 { reveal(fit_stack_recipe); }
 
 proof fn fit_next<F: FrameFloat>(
-    rows: Seq<Option<StackRow>>, estimate: f32, overflow: bool, remaining: nat, scan: (f32, f32, bool),
+    rows: Seq<Option<StackRow>>, estimate: f32, overflow: bool, remaining: nat, scan: (f32, f32, bool, Option<f32>),
 )
     requires remaining > 0, scan == stack_prefix::<F>(rows, estimate, rows.len()),
     ensures fit_stack_recipe::<F>(rows, estimate, overflow, remaining) == {
@@ -987,10 +1034,10 @@ proof fn fit_next<F: FrameFloat>(
 { reveal(fit_stack_recipe); }
 
 fn initial_stack_fit<A: FinishModel>(access: &A, slot: Request<A::Id>) -> (program: Ghost<(f32, bool)>)
-    ensures program@ == fit_stack_recipe::<A::Float>(stack_rows(access, slot), 0.0f32, false, MAX_FIT_STACK_STEPS as nat),
+    ensures program@ == fit_stack_recipe::<A::Float>(stack_rows(access, slot), 0.0f32, false, (MAX_FIT_STACK_STEPS + access.finish_child_count(slot.node)) as nat),
     no_unwind
 {
-    Ghost(fit_stack_recipe::<A::Float>(stack_rows(access, slot), 0.0f32, false, MAX_FIT_STACK_STEPS as nat))
+    Ghost(fit_stack_recipe::<A::Float>(stack_rows(access, slot), 0.0f32, false, (MAX_FIT_STACK_STEPS + access.finish_child_count(slot.node)) as nat))
 }
 
 }
@@ -1005,7 +1052,8 @@ fn initial_stack_fit<A: FinishModel>(access: &A, slot: Request<A::Id>) -> (progr
         final(access).measurement_requests() == old(access).measurement_requests(),
         final(access).wrap_effects() == old(access).wrap_effects(),
         ({
-            let result = fit_stack_recipe::<A::Float>(stack_rows(old(access), slot), 0.0f32, false, MAX_FIT_STACK_STEPS as nat);
+            let result = fit_stack_recipe::<A::Float>(stack_rows(old(access), slot), 0.0f32, false,
+                (MAX_FIT_STACK_STEPS + old(access).finish_child_count(slot.node)) as nat);
             &&& value == result.0
             &&& final(access).finish_effects() == if result.1 {
                 old(access).finish_effects().push(FinishEffect::Warning(slot, Warning::ImpossibleFracChildren))
@@ -1016,40 +1064,59 @@ fn initial_stack_fit<A: FinishModel>(access: &A, slot: Request<A::Id>) -> (progr
 fn fit_stack<A: IntrinsicRows>(access: &mut A, slot: Request<A::Id>) -> f32 {
     let mut estimate = 0.0f32;
     let mut overflow = false;
-    let mut step = 0usize;
+    // A saturated child can introduce one additional breakpoint.
+    let step_limit = MAX_FIT_STACK_STEPS + access.placed_child_count(slot.node) as u64;
+    let mut step = 0u64;
     #[cfg(verus_keep_ghost)]
     let program = initial_stack_fit(access, slot);
     #[cfg_attr(verus_keep_ghost, verifier::loop_isolation(false))]
     #[cfg_attr(verus_keep_ghost, verifier::allow_complex_invariants)]
     #[cfg_attr(verus_keep_ghost, verus_spec(
-        invariant_except_break step <= MAX_FIT_STACK_STEPS, access.topology() == old(access).topology(),
+        invariant_except_break step <= step_limit, access.topology() == old(access).topology(),
             access.ready() == old(access).ready(), is_intrinsic(access, slot),
             ready_inputs(access, slot), !(access.topology().intrinsic_flow)(slot),
             *access == *old(access),
             program@ == fit_stack_recipe::<A::Float>(stack_rows(access, slot), estimate, overflow,
-                (MAX_FIT_STACK_STEPS - step) as nat),
+                (step_limit - step) as nat),
         ensures *access == *old(access), program@ == (estimate, overflow),
-        decreases MAX_FIT_STACK_STEPS - step,
+        decreases step_limit - step,
     ))]
     loop {
-        if step == MAX_FIT_STACK_STEPS {
+        if step == step_limit {
             #[cfg(verus_keep_ghost)]
             proof! { fit_done::<A::Float>(stack_rows(access, slot), estimate, overflow); }
             break;
         }
         let scan = scan_extent(access, slot, Extent::Stack { estimate });
-        let (fixed, free_frac, has_frac) = scan;
+        let (fixed, free_frac, has_frac, next_cap) = scan;
         #[cfg(verus_keep_ghost)]
         proof! {
-            fit_next::<A::Float>(stack_rows(access, slot), estimate, overflow, (MAX_FIT_STACK_STEPS - step) as nat, scan);
+            fit_next::<A::Float>(stack_rows(access, slot), estimate, overflow, (step_limit - step) as nat, scan);
         }
         if !has_frac { return fixed; }
-        let next = if A::Float::less_or_equal(free_frac, MAX_FIT_STACK_FRAC) {
+        // On this interval the children's total is fixed + free_frac * width.
+        // A minimum can bring us to a solution where the equation is W = W.
+        if A::Float::equal_numbers(free_frac, 1.0) && A::Float::equal_numbers(fixed, 0.0) {
+            return estimate;
+        }
+        let within = A::Float::less_than(free_frac, 1.0);
+        let next = if within {
             A::Float::divide(fixed, A::Float::subtract(1.0, free_frac))
-        } else {
-            overflow = true;
-            fixed
-        };
+        } else { fixed };
+        if !within || !A::Float::finite(next) {
+            if let Some(cap) = next_cap {
+                // The next cap and the space children already demand both bound
+                // the next solution from below. Cross several caps at once when
+                // possible, including when the uncapped extrapolation overflowed.
+                let demand = A::Float::add(fixed, A::Float::multiply(estimate, free_frac));
+                if A::Float::less_than(0.0, fixed) || A::Float::less_than(estimate, demand) {
+                    estimate = if A::Float::finite(demand) { A::Float::max(cap, demand) } else { cap };
+                    step += 1;
+                    continue;
+                }
+            }
+        }
+        overflow |= !within;
         let settled = A::Float::less_or_equal(
             A::Float::absolute(A::Float::subtract(next, estimate)),
             A::Float::multiply(FIT_STACK_EPSILON, A::Float::max(A::Float::absolute(next), 1.0)),
@@ -1114,7 +1181,7 @@ pub(super) fn fit_content<A: IntrinsicRows>(access: &mut A, slot: Request<A::Id>
                 MainAxisCellSize::Width(width) if axis.index() == main_axis.index() => (1.0, width),
                 _ => {
                     let tracks = grid_tracks(access, slot);
-                    let (cell, _, _) = scan_extent(access, slot, Extent::Grid { tracks, spacing });
+                    let (cell, _, _, _) = scan_extent(access, slot, Extent::Grid { tracks, spacing });
                     (tracks, cell)
                 }
             };
@@ -1129,7 +1196,7 @@ pub(super) fn fit_content<A: IntrinsicRows>(access: &mut A, slot: Request<A::Id>
         ChildrenLayout::Block if slot.vertical => (read_own_flow(access, slot), 0.0),
         ChildrenLayout::Wrap { .. } => (read_own_flow(access, slot), 0.0),
         _ => {
-            let (largest, _, _) = scan_extent(access, slot, Extent::Largest { free: matches!(layout, ChildrenLayout::Free) });
+            let (largest, _, _, _) = scan_extent(access, slot, Extent::Largest { free: matches!(layout, ChildrenLayout::Free) });
             (largest, 0.0)
         }
     };

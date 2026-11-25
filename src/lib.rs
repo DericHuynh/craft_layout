@@ -302,7 +302,7 @@ pub enum LayoutWarning<Id> {
         /// Which of the node's dimensions the problem was found in.
         axis: Axis
     },
-    /// A `FitContent` node couldn't determine consistent sizes for its `Frac` children, because they add up to more than 100%.
+    /// A `FitContent` stack could not resolve its extent because its unconstrained fractions total 100% or more.
     ImpossibleFracChildren {
         /// The id of the problematic node.
         node: Id,
@@ -348,7 +348,7 @@ impl<Id: Debug> std::fmt::Display for LayoutWarning<Id> {
                 "On the {axis:?} axis, the '{node:?}' node's min size is bigger than its max size. "
             ),
             LayoutWarning::ImpossibleFracChildren { node, axis } => write!(f,
-                "On the {axis:?} axis, the '{node:?}' `FitContent` node couldn't determine consistent sizes for its `Frac` children, because they add up to more than 100%."
+                "The {axis:?} extent of `FitContent` node '{node:?}' is unresolved. Its active `Frac` children claim at least 100% of the available space."
             ),
             LayoutWarning::NotFinite { node, axis } => write!(f,
                 "The {axis:?} size of node '{node:?}' is infinite or NaN."
