@@ -30,11 +30,12 @@ use super::text_scan::windows::{TextAvx2, partition_windows, take_full_window, u
 impl<T> LayoutTree<T> {
     fn write_svg_inner(&self, svg: &mut (impl Write + ?Sized), text: impl Fn(&T) -> &str) -> fmt::Result {
         let mut numbers = SvgNumbers::new();
-        let window = self.layout_data.window_size;
+        let window = self.published_window();
         writeln!(svg, "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" font-family=\"monospace\" font-size=\"7.5\">", window.x, window.y)?;
         writeln!(svg, "<rect width=\"100%\" height=\"100%\" fill=\"#faf8f5\"/>")?;
         paint_nodes(self.root, self.nodes.len(), fmt::Error, &mut |i| {
             let node = self.nodes.get(i).ok_or(fmt::Error)?;
+            let size_px = self.published_size(i, node);
             let next = self.next_in_subtree(self.root, i, !node.params.disabled);
             if !node.has_published_rect() {
                 return Ok(next);
@@ -52,7 +53,7 @@ impl<T> LayoutTree<T> {
             if node.params.text != TextContent::None && let Some(context) = self.context(node) {
                 let [left, right] = node.params.padding.x;
                 let wraps = node.params.text == TextContent::Wrapping && !matches!(node.params.size.x, Size::AspectRatio(_));
-                let wrap_width = wraps.then(|| (node.layout.size().x - left - right).max(0.0));
+                let wrap_width = wraps.then(|| (size_px.x - left - right).max(0.0));
                 let mut n = 0usize;
                 for line in wrapped_lines(text(context), wrap_width) {
                     let y = rect.y[0] + node.params.padding.y[0] + (n as f32 + 0.75) * LINE_HEIGHT;

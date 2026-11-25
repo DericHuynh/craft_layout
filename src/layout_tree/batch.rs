@@ -126,6 +126,19 @@ impl State {
         self.output_dirty = true;
     }
 
+    /// The window of the last frame this scheduler solved.
+    pub(super) fn published_window(&self) -> Option<Xy<f32>> {
+        self.frame.as_ref().map(|frame| frame.data.window_size)
+    }
+
+    /// The unsnapped final size this scheduler last computed for `key`.
+    pub(super) fn published_size(&self, key: NodeKey) -> Option<Xy<f32>> {
+        let frame = self.frame.as_ref()?;
+        let &index = frame.indices.get(&key)?;
+        frame.nodes.get(index)?.as_ref().filter(|node| node.key == key)?;
+        Some(frame.records.get(index)?.size())
+    }
+
     pub(super) fn content_changed(&mut self, key: NodeKey) {
         self.viewport_memo.invalidate();
         if let Some(frame) = &mut self.frame {

@@ -20,6 +20,8 @@ use slotmap::{DefaultKey, Key, SlotMap, new_key_type};
 use stack_tail::StackTail;
 use solve_frame::TailEdits;
 use std::sync::Arc;
+#[cfg(feature = "batch-pilot")]
+use std::collections::HashMap;
 use id::TreeIdentity;
 pub use id::{ChildId, Destination, NodeId, TreeError};
 #[cfg(feature = "batch-pilot")]
@@ -55,6 +57,26 @@ impl BatchStart {
     }
 }
 
+/// Which solver produced the published rectangles. The Batch scheduler keeps
+/// its window and node sizes in its own frame, so readers of the published
+/// layout such as the SVG writer must look there instead of in `layout_data`.
+#[cfg(feature = "batch-pilot")]
+#[derive(Debug, Clone, Default)]
+enum Published {
+    #[default]
+    Default,
+    Batch,
+    /// A clone of a Batch-published tree, which does not carry the Batch state.
+    Snapshot(Arc<BatchSnapshot>),
+}
+
+#[cfg(feature = "batch-pilot")]
+#[derive(Debug)]
+struct BatchSnapshot {
+    window: Xy<f32>,
+    sizes: HashMap<NodeKey, Xy<f32>>,
+}
+
 /// A tree of layout nodes. It records the changes to the nodes, and `solve_layout` uses them to do an incremental relayout when it can.
 ///
 /// `T` is the type of the context of each node, for example its text. The measure function of `solve_layout_with_measure` receives it.
@@ -82,6 +104,8 @@ pub struct LayoutTree<T = ()> {
     // Allocate the Batch workspace when the first changed solve needs it.
     #[cfg(feature = "batch-pilot")]
     batch: Vec<batch::State>,
+    #[cfg(feature = "batch-pilot")]
+    published: Published,
 }
 
 impl<T: Clone> Clone for LayoutTree<T> {
@@ -109,6 +133,8 @@ impl<T: Clone> Clone for LayoutTree<T> {
             batch_start: BatchStart::First,
             #[cfg(feature = "batch-pilot")]
             batch: Vec::new(),
+            #[cfg(feature = "batch-pilot")]
+            published: self.published_snapshot(),
         }
     }
 }
@@ -148,6 +174,57 @@ impl<T> LayoutTree<T> {
             batch_start: BatchStart::First,
             #[cfg(feature = "batch-pilot")]
             batch: Vec::new(),
+            #[cfg(feature = "batch-pilot")]
+            published: Published::Default,
+        }
+    }
+
+    /// The window of the published layout.
+    pub(crate) fn published_window(&self) -> Xy<f32> {
+        #[cfg(feature = "batch-pilot")]
+        match &self.published {
+            Published::Default => {}
+            Published::Batch => {
+                if let Some(window) = self.batch.first().and_then(batch::State::published_window) {
+                    return window;
+                }
+            }
+            Published::Snapshot(snapshot) => return snapshot.window,
+        }
+        self.layout_data.window_size
+    }
+
+    /// The unsnapped size of a node in the published layout.
+    pub(crate) fn published_size(&self, key: NodeKey, node: &LayoutNode) -> Xy<f32> {
+        #[cfg(feature = "batch-pilot")]
+        match &self.published {
+            Published::Default => {}
+            Published::Batch => {
+                if let Some(size) = self.batch.first().and_then(|batch| batch.published_size(key)) {
+                    return size;
+                }
+            }
+            Published::Snapshot(snapshot) => {
+                if let Some(&size) = snapshot.sizes.get(&key) {
+                    return size;
+                }
+            }
+        }
+        let _ = key;
+        node.layout.size()
+    }
+
+    #[cfg(feature = "batch-pilot")]
+    fn published_snapshot(&self) -> Published {
+        match &self.published {
+            Published::Default => Published::Default,
+            Published::Snapshot(snapshot) => Published::Snapshot(Arc::clone(snapshot)),
+            Published::Batch => {
+                let sizes = self.nodes.iter()
+                    .map(|(key, node)| (key, self.published_size(key, node)))
+                    .collect();
+                Published::Snapshot(Arc::new(BatchSnapshot { window: self.published_window(), sizes }))
+            }
         }
     }
 
@@ -566,6 +643,7 @@ impl<T> LayoutTree<T> {
                 self.tail_stack = None;
                 if accepted {
                     self.batch_start = BatchStart::Default(scale);
+                    self.published = Published::Default;
                     self.tail_edits = TailEdits::None;
                     return Ok(BatchLayoutStats::default());
                 }
@@ -596,6 +674,7 @@ impl<T> LayoutTree<T> {
         let result = batch[0].solve(&mut adapter, population, window, scale);
         self.batch = batch;
         if result.is_ok() {
+            self.published = Published::Batch;
             self.layout_data.request_full_solve(IncrementalRelayoutOutcome::FallbackInvalidated);
             self.tail_edits = TailEdits::Other;
             self.tail_stack = None;
@@ -616,6 +695,7 @@ impl<T> LayoutTree<T> {
         {
             self.batch_start.changed();
             if let Some(batch) = self.batch.first_mut() { batch.output_changed(); }
+            self.published = Published::Default;
         }
         self.warnings.clear();
         let mut adapter = Adapter::new(self, text, content);
