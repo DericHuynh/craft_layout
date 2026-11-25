@@ -667,20 +667,7 @@ pub(crate) fn try_prepare<T: StartActions + ?Sized, const REGISTERED_PIXELS: boo
     let first = tree.first(parent)?;
     #[cfg(verus_keep_ghost)]
     proof! { tree.order().node_facts(parent); }
-    let first_size = tree.params(first).size;
-    if !matches!((first_size.x, first_size.y), (Size::Fill, Size::Fill)) {
-        #[cfg(any(feature = "incremental", verus_keep_ghost))]
-        if !REGISTERED_PIXELS && forward
-            && matches!((first_size.x, first_size.y), (Size::Pixels(_), Size::Pixels(_)))
-        {
-            let expected = tree.stack_leaf_count_hint(parent);
-            if expected >= 128 && expected <= 16_777_216 {
-                return prepare_fixed_queue(tree, parent, first, axis.other(), expected);
-            }
-        }
-        return None;
-    }
-    let expected = tree.stack_leaf_count_hint(parent);
+    let expected = tree.record(parent).n_placed_children;
     if expected == 2 {
         if let Some(summary) = prepare_two(tree, parent, first, axis, width, height) {
             return Some(summary);
@@ -688,6 +675,14 @@ pub(crate) fn try_prepare<T: StartActions + ?Sized, const REGISTERED_PIXELS: boo
     }
     // Summing unit weights up to 2^24 is exact in binary32.
     if expected >= 128 && expected <= 16_777_216 {
+        #[cfg(any(feature = "incremental", verus_keep_ghost))]
+        if !REGISTERED_PIXELS && forward
+            && matches!((tree.params(first).size.x, tree.params(first).size.y), (Size::Pixels(_), Size::Pixels(_)))
+        {
+            if let Some(summary) = prepare_fixed_queue(tree, parent, first, axis.other(), expected) {
+                return Some(summary);
+            }
+        }
         #[cfg(any(feature = "incremental", verus_keep_ghost))]
         let capture = if forward && matches!(eligible_leaf::<T, true>(tree, first),
             Some(leaf) if matches!(*leaf.position.component(axis.other()), Pos::Start))

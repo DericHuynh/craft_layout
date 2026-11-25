@@ -859,37 +859,6 @@ struct NodeSizing<I> {
     no_unwind
 ))]
 fn visit_sizing_slots<T: Access + ?Sized>(tree: &mut T, node: T::Id, flags: NodeFlags) -> NodeSizing<T::Id> {
-    const X_FINAL: usize = 4;
-    const Y_FINAL: usize = 6;
-    #[cfg(not(verus_keep_ghost))]
-    const _: () = {
-        assert!(X_FINAL == 2 * cycle_rules::slot_index(X.index(), Kind::Final));
-        assert!(Y_FINAL == 2 * cycle_rules::slot_index(Y.index(), Kind::Final));
-    };
-    const MASK: u32 = (3 << X_FINAL) | (3 << Y_FINAL) | NodeFlags::BLOCK_CONTAINER
-        | NodeFlags::WRAP_CONTAINER | NodeFlags::DESCENDANTS_NEED_SOLVE;
-    const SOLVED_LEAF: u32 = (SOLVED << X_FINAL) | (SOLVED << Y_FINAL);
-    if flags.0 & MASK == SOLVED_LEAF {
-        #[cfg(verus_keep_ghost)]
-        proof! {
-            assert(X_FINAL == 4 && Y_FINAL == 6 && SOLVED_LEAF == 0xa0 && MASK == 0x580000f0)
-                by(compute_only);
-            assert(cycle_rules::slot_index(X.index(), Kind::Final) == 2
-                && cycle_rules::slot_index(Y.index(), Kind::Final) == 3) by(compute_only);
-            let word = flags.0;
-            assert((word >> 4) & 3 == 2 && (word >> 6) & 3 == 2)
-                by(bit_vector) requires word & 0x580000f0 == 0xa0;
-            assert(sizing_fill::phase(flags, X, Kind::Final) == SOLVED);
-            assert(sizing_fill::phase(flags, Y, Kind::Final) == SOLVED);
-        }
-        return NodeSizing {
-            descend: false,
-            #[cfg(verus_keep_ghost)]
-            visit: record_visits_at_node(node, flags, prepared_final(), prepared_final(), false, None),
-            #[cfg(not(verus_keep_ghost))]
-            id: core::marker::PhantomData,
-        };
-    }
     let [first, second] = cycle_rules::canonical_axes(X, Y);
     #[cfg(verus_keep_ghost)]
     let mut x_path = final_sizing::<T::Id>(requested_final());

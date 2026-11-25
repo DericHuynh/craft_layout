@@ -131,13 +131,8 @@ impl<T: Solve + ?Sized> prepare_nodes::StartActions for T {
     #[cfg(feature = "incremental")]
     #[inline(always)]
     fn stack_leaf_hint(&mut self) -> Option<u32> {
-        #[cfg(feature = "batch-pilot")]
-        let first = self.first_stack_population_hint();
-        #[cfg(not(feature = "batch-pilot"))]
-        let first = 0;
         let data = self.layout_data();
-        let hint = data.n_nodes_solved.max(first);
-        data.pixel_scale.is_none().then_some(hint)
+        data.pixel_scale.is_none().then_some(data.n_nodes_solved)
     }
 
     #[inline(always)]

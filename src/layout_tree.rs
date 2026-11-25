@@ -551,15 +551,9 @@ impl<T> LayoutTree<T> {
         match self.batch_start {
             BatchStart::First => {
                 let registered_pixels = self.layout_data.n_nodes_solved != 0;
-                let population = if registered_pixels {
-                    0
-                } else {
-                    u32::try_from(self.nodes.len()).unwrap_or(u32::MAX)
-                };
                 let previous_warnings = std::mem::take(&mut self.warnings);
                 let mut adapter = Adapter::new(self, text, content);
                 adapter.cache_text = WrappedHeightCache::for_flow(cache_text);
-                adapter.first_stack_population = population;
                 let accepted = crate::full_layout::run_owned::<_, crate::vec_memory::RustVec>(
                     &mut adapter, window, registered_pixels, true,
                 );
@@ -855,8 +849,6 @@ struct Adapter<'a, T, M, C> {
     text: M,
     content: C,
     cache_text: WrappedHeightCache,
-    #[cfg(feature = "batch-pilot")]
-    first_stack_population: u32,
     // The solver's borrowed-data interface is total. A missing internal key
     // has no links or callbacks and its writes stay in this adapter.
     missing_layout: NodeLayoutData,
@@ -889,12 +881,7 @@ impl WrappedHeightCache {
 
 impl<'a, T, M, C> Adapter<'a, T, M, C> {
     fn new(tree: &'a mut LayoutTree<T>, text: M, content: C) -> Self {
-        Self {
-            tree, text, content, cache_text: WrappedHeightCache::Disabled,
-            #[cfg(feature = "batch-pilot")]
-            first_stack_population: 0,
-            missing_layout: NodeLayoutData::new(),
-        }
+        Self { tree, text, content, cache_text: WrappedHeightCache::Disabled, missing_layout: NodeLayoutData::new() }
     }
 }
 
@@ -956,28 +943,6 @@ where
     }
 
     fn retains_output_rects(&self) -> bool { true }
-
-    #[cfg(feature = "batch-pilot")]
-    #[inline]
-    fn stack_leaf_count_hint(&self, id: NodeKey) -> u32 {
-        let Some(parent) = self.tree.nodes.get(id) else { return 0; };
-        let recorded = parent.layout.n_placed_children;
-        let capacity = self.first_stack_population;
-        if recorded != 0 || capacity == 0 { return recorded; }
-        if parent.first_child == parent.last_child { return 0; }
-        // Adjacent fresh allocations often describe a complete leaf group.
-        // The preparation kernels still check the actual sibling count.
-        let Some(first) = parent.first_child.and_then(|id| self.tree.nodes.get(id)) else { return 0; };
-        let Some(last) = parent.last_child.and_then(|id| self.tree.nodes.get(id)) else { return 0; };
-        if first.first_child.is_some() || last.first_child.is_some() { return 0; }
-        let first = incarnation(first.identity);
-        let last = incarnation(last.identity);
-        records::leaf_count_hint(first, last, capacity)
-    }
-
-    #[cfg(feature = "batch-pilot")]
-    #[inline(always)]
-    fn first_stack_population_hint(&self) -> u32 { self.first_stack_population }
 
     #[inline(always)]
     fn root(&self) -> NodeKey {
