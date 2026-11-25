@@ -1,0 +1,16 @@
+<test name="edge_grid_status_rail" use-rounding="false">
+  <viewport width="116px" height="20px"/>
+  <input>
+    <div display="grid" width="116px" height="20px" column-gap="8px" grid-auto-columns="36px"
+         grid-template-columns="repeat(auto-fit, minmax(100px, 1fr))" grid-template-rows="20px">
+      <div grid-column-end="1" grid-row-start="1"/>
+      <div grid-column-start="1" grid-row-start="1"/>
+    </div>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="116" height="20" resolved-columns="36px 100px">
+      <node x="0" y="0" width="36" height="20"/>
+      <node x="44" y="0" width="100" height="20"/>
+    </node>
+  </expectations>
+</test>

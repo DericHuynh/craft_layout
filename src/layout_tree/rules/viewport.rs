@@ -70,7 +70,9 @@ pub enum Placement {
     /// Pin a node to the viewport across ancestor scrolling.
     Fixed(Edges),
     /// Keep the normal slot and constrain the visual box to its nearest
-    /// scrollport, stopping at its parent's trailing edge.
+    /// scrollport on each axis. The parent's content edges and the sticky
+    /// item's margins limit its travel. A section inside a grid row can
+    /// provide a row-local boundary for its sticky children.
     Sticky(Edges),
     /// Place a popup next to another box using ordered fallback sides.
     Anchor {
@@ -556,9 +558,13 @@ fn stick(
     insets: &Edges,
     nearest: Xy<Option<usize>>,
     parent: usize,
+    child: usize,
     views: &[ViewGeometry],
-    window: XyRect,
+    frame: &Frame<'_>,
 ) -> XyRect {
+    let containing = &views[parent];
+    let content_box = inset_box(containing.rect, frame.nodes[parent].effective.padding);
+    let window = viewport(frame.window);
     for a in [Axis::X, Axis::Y] {
         let [before, after] = insets[a];
         if before.is_none() && after.is_none() {
@@ -571,16 +577,21 @@ fn stick(
         let high = after.map_or(f32::INFINITY, |v| {
             scrollport[1] - v.resolve(available) - length
         });
-        let mut start = rect[a][0].clamp(low, high.max(low));
-        let containing = &views[parent];
-        let mut bounds = containing.rect[a];
+        let normal = rect[a][0];
+        let wanted = normal.clamp(low, high.max(low)) - normal;
+        let mut bounds = content_box[a];
         if nearest[a] == Some(parent) {
-            for side in 0..2 {
-                bounds[side] = containing.scrollport[a][0] + containing.content[a][side]
-                    - containing.offset[a];
-            }
+            // The content box moves with the parent's scrollable contents.
+            // Extend it by the overflow on each side, preserving its padding.
+            bounds[0] += containing.content[a][0] - containing.offset[a];
+            bounds[1] += containing.content[a][1] - available - containing.offset[a];
         }
-        start = start.clamp(bounds[0], (bounds[1] - length).max(bounds[0]));
+        // Limit movement toward the inset to the space available for the
+        // margin box. A box already outside its section keeps its flow position.
+        let [before, after] = frame.nodes[child].base.margin[a].map(|m| m.as_px().unwrap_or(0.));
+        let lower = (bounds[0] + before - normal).min(0.);
+        let upper = (bounds[1] - after - rect[a][1]).max(0.);
+        let start = normal + wanted.clamp(lower, upper);
         rect[a] = [start, start + length];
     }
     rect
@@ -674,7 +685,7 @@ pub(super) fn publish(
                     );
                 }
                 Placement::Sticky(insets) => {
-                    rect = stick(rect, insets, containing_scroll, p, &views, window)
+                    rect = stick(rect, insets, containing_scroll, p, i, &views, frame)
                 }
                 Placement::Fixed(insets) => {
                     rect = positioned(

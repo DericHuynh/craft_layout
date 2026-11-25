@@ -2,7 +2,21 @@
 //! Values the parser does not recognize become `Value::Other`, which the
 //! translator reports as unsupported instead of silently dropping.
 
+use keru_layout::{Logical, WritingContext};
 use std::collections::BTreeMap;
+
+pub(super) const PHYSICAL_MARGINS: [&str; 4] =
+    ["margin-left", "margin-right", "margin-top", "margin-bottom"];
+const LOGICAL_MARGINS: Logical<[&str; 2]> = Logical::new(
+    ["margin-inline-start", "margin-inline-end"],
+    ["margin-block-start", "margin-block-end"],
+);
+
+pub(super) fn has_logical_margin(node: roxmltree::Node) -> bool {
+    node.attributes().any(|a| {
+        LOGICAL_MARGINS.inline.contains(&a.name()) || LOGICAL_MARGINS.block.contains(&a.name())
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
@@ -34,7 +48,9 @@ impl Value {
             return px.parse().map_or(Self::Other, Self::Px);
         }
         if let Some(percent) = raw.strip_suffix('%') {
-            return percent.parse::<f32>().map_or(Self::Other, |p| Self::Percent(p / 100.0));
+            return percent
+                .parse::<f32>()
+                .map_or(Self::Other, |p| Self::Percent(p / 100.0));
         }
         raw.parse().map_or(Self::Other, Self::Number)
     }
@@ -52,9 +68,39 @@ impl Style {
     pub fn new(node: roxmltree::Node) -> Self {
         let attrs = node
             .attributes()
-            .map(|attribute| (attribute.name().to_string(), attribute.value().trim().to_string()))
+            .map(|attribute| {
+                (
+                    attribute.name().to_string(),
+                    attribute.value().trim().to_string(),
+                )
+            })
             .collect();
-        Self { attrs, used: Default::default() }
+        Self {
+            attrs,
+            used: Default::default(),
+        }
+    }
+
+    /// XML attribute order represents CSS declaration order for these longhands.
+    /// Replay physical and logical declarations onto the same four physical edges.
+    pub fn resolve_logical_margins(&mut self, node: roxmltree::Node, writing: WritingContext) {
+        if !has_logical_margin(node) {
+            return;
+        }
+        let logical = writing.physical_edges(LOGICAL_MARGINS);
+        let aliases = [logical.x[0], logical.x[1], logical.y[0], logical.y[1]];
+        for attr in node.attributes() {
+            if let Some(edge) = aliases.iter().position(|&name| name == attr.name()) {
+                self.attrs.remove(attr.name());
+                self.attrs.insert(
+                    PHYSICAL_MARGINS[edge].to_owned(),
+                    attr.value().trim().to_owned(),
+                );
+            } else if PHYSICAL_MARGINS.contains(&attr.name()) {
+                self.attrs
+                    .insert(attr.name().to_owned(), attr.value().trim().to_owned());
+            }
+        }
     }
 
     /// The raw keyword or value of a property, marking it as handled.

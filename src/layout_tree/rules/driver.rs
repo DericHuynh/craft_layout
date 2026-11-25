@@ -766,7 +766,9 @@ impl State {
             .extend(frame.nodes.iter().filter_map(|n| {
                 matches!(
                     n.rule.placement,
-                    super::Placement::Fixed(_) | super::Placement::Absolute { .. }
+                    super::Placement::Fixed(_)
+                        | super::Placement::Absolute { .. }
+                        | super::Placement::Sticky(_)
                 )
                 .then_some((n.id.key(), (n.base, n.block_static_y)))
             }));

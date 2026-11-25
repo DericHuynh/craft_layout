@@ -220,28 +220,32 @@ impl TrackAxis {
             }
         }
     }
+    /// Start of the explicit template after any leading implicit tracks.
+    fn explicit_template(&self) -> (usize, &Self) {
+        let mut template = self;
+        let mut start = 0;
+        while let Self::Prefixed { implicit, explicit } = template {
+            start += implicit.len();
+            template = explicit;
+        }
+        (start, template)
+    }
+
     pub(crate) fn collapsed_range(&self, explicit: usize) -> Range<usize> {
-        match self {
-            Self::AutoFit { .. } => 0..explicit,
+        let (start, template) = self.explicit_template();
+        let start = start.min(explicit);
+        match template {
+            Self::AutoFit { .. } => start..explicit,
             Self::AutoRepeat {
                 before,
                 after,
                 fit: true,
                 ..
             } => {
-                before.len().min(explicit)
-                    ..explicit
-                        .saturating_sub(after.len())
-                        .max(before.len().min(explicit))
+                let first = start + before.len().min(explicit - start);
+                first..explicit.saturating_sub(after.len()).max(first)
             }
-            Self::Prefixed {
-                implicit,
-                explicit: inner,
-            } => {
-                let r = inner.collapsed_range(explicit.saturating_sub(implicit.len()));
-                implicit.len() + r.start..implicit.len() + r.end
-            }
-            _ => 0..0,
+            _ => start..start,
         }
     }
     pub(crate) fn at(&self, index: usize, explicit: usize, implicit: Track) -> Track {
@@ -389,10 +393,7 @@ impl TrackGrid {
         if matches!(template, TrackAxis::Subgrid) || self.areas.is_empty() {
             return tracks;
         }
-        let preceding = match template {
-            TrackAxis::Prefixed { implicit, .. } => implicit.len(),
-            _ => 0,
-        };
+        let (preceding, _) = template.explicit_template();
         self.areas
             .values()
             .map(|area| area[a].end.saturating_add(preceding))
@@ -937,13 +938,14 @@ impl TrackGrid {
         }
         let visible = used.iter().filter(|&&v| v).count();
         let gaps = gap * visible.saturating_sub(1) as f32;
+        let (repeated_start, declared) = template.explicit_template();
         let states: Vec<_> = (0..count)
             .map(|i| {
                 if used[i] {
                     let mut state = sizing(self.track_at(axis, i, explicit), extent);
-                    if i < explicit
+                    if (repeated_start..explicit).contains(&i)
                         && let TrackAxis::AutoFit { minimum, .. }
-                        | TrackAxis::AutoFill { minimum, .. } = template
+                        | TrackAxis::AutoFill { minimum, .. } = declared
                     {
                         state.base = state.base.max(f64::from(*minimum));
                         state.cap = state.cap.max(state.base);

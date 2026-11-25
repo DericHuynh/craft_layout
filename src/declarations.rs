@@ -258,7 +258,11 @@ impl Margin {
     #[cfg_attr(verus_keep_ghost, verus_spec(returns self.is_zero(), no_unwind))]
     pub(crate) fn is_zero(self) -> bool { self.0 == 0 }
 
-    /// Share the unused inline space in block flow. On other edges it is zero.
+    /// Share spare inline space in block flow. In a [`FlexLayout`](crate::flex::FlexLayout),
+    /// main-axis auto margins share each line’s positive free space before justification.
+    /// For example, a leading auto margin pushes a trailing action to the far edge of its line.
+    /// Set `NodeRules::flex` on an owned tree to select flexible lines.
+    /// The simple `ChildrenLayout::Stack` and `ChildrenLayout::Wrap` treat auto margins as zero.
     #[cfg(not(verus_keep_ghost))]
     pub const AUTO: Self = Self(f32::NAN.to_bits());
 

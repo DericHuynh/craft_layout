@@ -2,6 +2,8 @@
 
 We took published CSS recipes, wrote down the component geometry we wanted, and tried the direct declaration first. The trials changed the viewport, content, item count or footer size on the same tree. The controls included explicit hard minima, visible and clipped content, an empty grid slot and an out-of-flow overlay. These details distinguish a layout that meets the request from one that merely looks right at one size.
 
+The [follow-up edge cases](edge-cases.md) cover grid minima, sticky limits, wrapping and writing direction, including a replay in Chrome 158.
+
 ## Public Rust API
 
 | Component and original recipe | What the author asked for | What Craft did |

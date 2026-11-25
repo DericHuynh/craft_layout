@@ -13,7 +13,7 @@ mod box_css;
 mod grid_css;
 
 use crate::ahem::AhemText;
-use crate::css::{Style, Value};
+use crate::css::{PHYSICAL_MARGINS, Style, Value, has_logical_margin};
 use keru_layout::flex::{FlexAlign, FlexBasis, FlexItem, FlexLayout, FlexWrap, LineAlign};
 use keru_layout::layout_rules::NodeRules;
 use keru_layout::{
@@ -133,6 +133,7 @@ fn margin(style: &Style, name: &str, _block_item: bool) -> Result<Margin> {
         None => Ok(Margin::ZERO),
         Some(Value::Auto) => Ok(Margin::AUTO),
         Some(Value::Percent(_)) => Ok(Margin::ZERO),
+        Some(Value::Number(0.0)) => Ok(Margin::ZERO),
         Some(Value::Px(v)) => Margin::px(v).ok_or_else(|| format!("{name}={v}")),
         Some(other) => unsupported(format!("{name}={other:?}")),
     }
@@ -252,7 +253,50 @@ fn line_align(raw: &str, reverse: bool) -> Result<LineAlign> {
     })
 }
 
-fn needs_managed_items(xml: roxmltree::Node, axis: Axis, inline: Axis, align_items: Align) -> bool {
+fn logical_style(style: &Style) -> Result<LogicalStyle> {
+    Ok(LogicalStyle {
+        direction: match style.get("direction") {
+            None => None,
+            Some("ltr") => Some(Direction::Ltr),
+            Some("rtl") => Some(Direction::Rtl),
+            Some(value) => return unsupported(format!("direction={value}")),
+        },
+        writing_mode: match style.get("writing-mode") {
+            None => None,
+            Some("horizontal-tb") => Some(WritingMode::HorizontalTb),
+            Some("vertical-lr") => Some(WritingMode::VerticalLr),
+            Some("vertical-rl") => Some(WritingMode::VerticalRl),
+            Some(value) => return unsupported(format!("writing-mode={value}")),
+        },
+        ..LogicalStyle::default()
+    })
+}
+
+fn needs_managed_margins(child: roxmltree::Node, inherited: WritingContext) -> bool {
+    let dynamic = |v: &str| v == "auto" || v.ends_with('%');
+    if !has_logical_margin(child) {
+        return PHYSICAL_MARGINS
+            .iter()
+            .any(|&p| child.attribute(p).is_some_and(dynamic));
+    }
+    let mut style = Style::new(child);
+    let Ok(logical) = logical_style(&style) else {
+        // Building the child reports its unsupported writing mode.
+        return false;
+    };
+    style.resolve_logical_margins(child, logical.context(inherited));
+    PHYSICAL_MARGINS
+        .iter()
+        .any(|p| style.get(p).is_some_and(dynamic))
+}
+
+fn needs_managed_items(
+    xml: roxmltree::Node,
+    axis: Axis,
+    writing: WritingContext,
+    align_items: Align,
+) -> bool {
+    let inline = writing.axis(LogicalAxis::Inline);
     let main_size = if axis == Axis::X { "width" } else { "height" };
     let main_overflow = if axis == Axis::X {
         "overflow-x"
@@ -334,13 +378,7 @@ fn needs_managed_items(xml: roxmltree::Node, axis: Axis, inline: Axis, align_ite
                 || child
                     .attribute("align-self")
                     .is_some_and(|a| a.contains("baseline") || a.contains("safe "))
-                || ["margin-left", "margin-right", "margin-top", "margin-bottom"]
-                    .iter()
-                    .any(|k| {
-                        child
-                            .attribute(*k)
-                            .is_some_and(|v| v == "auto" || v.ends_with('%'))
-                    })
+                || needs_managed_margins(child, writing)
         })
 }
 
@@ -496,28 +534,14 @@ fn build_in_context(
     inherited: WritingContext,
     parent_params: LayoutParams,
     features: FixtureFeatures,
-    containing: Option<NodeId>,
+    containing: Option<(&NodeId, WritingContext)>,
 ) -> Result<Built> {
-    let style = Style::new(xml);
+    let mut style = Style::new(xml);
     let mut params = LayoutParams::DEFAULT;
 
-    let logical = LogicalStyle {
-        direction: match style.get("direction") {
-            None => None,
-            Some("ltr") => Some(Direction::Ltr),
-            Some("rtl") => Some(Direction::Rtl),
-            Some(value) => return unsupported(format!("direction={value}")),
-        },
-        writing_mode: match style.get("writing-mode") {
-            None => None,
-            Some("horizontal-tb") => Some(WritingMode::HorizontalTb),
-            Some("vertical-lr") => Some(WritingMode::VerticalLr),
-            Some("vertical-rl") => Some(WritingMode::VerticalRl),
-            Some(value) => return unsupported(format!("writing-mode={value}")),
-        },
-        ..LogicalStyle::default()
-    };
+    let logical = logical_style(&style)?;
     let writing = logical.context(inherited);
+    style.resolve_logical_margins(xml, writing);
     params.children_origin_flipped = writing.origins();
     // Box edges. Borders lay out exactly like padding.
     let edges = |side: &str| -> Result<f32> {
@@ -695,7 +719,7 @@ fn build_in_context(
                     || main_percent != 0.
                     || cross_percent != 0.
                     || style.get("align-content").is_some()
-                    || needs_managed_items(xml, main, writing.axis(LogicalAxis::Inline), own_align))
+                    || needs_managed_items(xml, main, writing, own_align))
             {
                 rule.flex = Some(FlexLayout {
                     axis: main,
@@ -836,7 +860,9 @@ fn build_in_context(
                     Size::FitContent
                 });
             }
-            if containing.as_ref().is_some_and(|id| id != parent) {
+            if let Some((reference, reference_writing)) = containing
+                && reference != parent
+            {
                 use keru_layout::tracks::GridAlign;
                 for a in [Axis::X, Axis::Y] {
                     let f = match rule.grid_item.align[a] {
@@ -850,12 +876,14 @@ fn build_in_context(
                         rule.grid_item.align[a],
                         Some(GridAlign::SafeCenter | GridAlign::SafeEnd)
                     );
-                    rule.box_model.reverse_insets[a] = grid.origins[a];
+                    rule.box_model.reverse_insets[a] = if insets[a].iter().all(Option::is_some) {
+                        reference_writing.origins()[a]
+                    } else {
+                        grid.origins[a]
+                    };
                 }
                 rule.placement = keru_layout::layout_rules::Placement::Absolute {
-                    containing: keru_layout::layout_rules::BoxReference::Node(
-                        containing.clone().unwrap(),
-                    ),
+                    containing: keru_layout::layout_rules::BoxReference::Node(reference.clone()),
                     insets,
                 };
             } else {
@@ -952,6 +980,11 @@ fn build_in_context(
                     insets[a] = [inset(style.value(l))?, inset(style.value(r))?]
                         .map(|s| s.map(|(fraction, pixels)| Length { fraction, pixels }));
                     let both = insets[a].iter().all(Option::is_some);
+                    // A static wrapper supplies static alignment, but the positioned
+                    // containing block decides which of two specified insets wins.
+                    if both && let Some((_, reference_writing)) = containing {
+                        rule.box_model.reverse_insets[a] = reference_writing.origins()[a];
+                    }
                     declared[a].get_or_insert(if both { Size::Auto } else { Size::FitContent });
                     rule.box_model.absolute_static[a] =
                         Some(static_alignment(parent_params, a, alignment));
@@ -964,7 +997,7 @@ fn build_in_context(
                     rule.box_model.safe_static[inline] = safe;
                 }
                 if upper_containing_block
-                    && let Some(reference) = &containing
+                    && let Some((reference, _)) = containing
                     && tree
                         .rules(reference)
                         .ok()
@@ -975,9 +1008,9 @@ fn build_in_context(
                 }
                 rule.placement = Placement::Absolute {
                     containing: if upper_containing_block {
-                        containing
-                            .clone()
-                            .map_or(BoxReference::Window, BoxReference::Node)
+                        containing.map_or(BoxReference::Window, |(id, _)| {
+                            BoxReference::Node(id.clone())
+                        })
                     } else {
                         BoxReference::Parent
                     },
@@ -1515,9 +1548,9 @@ fn build_in_context(
             child_params,
             features,
             if forms_containing {
-                Some(node.clone())
+                Some((&node, writing))
             } else {
-                containing.clone()
+                containing
             },
         )?);
     }

@@ -1,0 +1,49 @@
+<test name="edge_logical_margins" use-rounding="false">
+  <viewport width="200px" height="240px" />
+  <input>
+    <div display="block" width="200px" height="240px">
+      <!--The logical auto margin pushes the trailing action to the RTL inline end.-->
+      <div display="flex" direction="rtl" width="200px" height="40px">
+        <div display="block" width="30px" height="20px" />
+        <div display="block" width="22px" height="20px" margin-inline-start="auto" />
+      </div>
+      <!--All four logical edges on a vertical strip. The percentage uses its 120px inline size.-->
+      <div display="flex" writing-mode="vertical-rl" direction="rtl" width="80px" height="120px">
+        <div display="block" height="20px" margin-inline-start="10%" margin-inline-end="3px" margin-block-start="5px" margin-block-end="7px" />
+        <div display="block" width="11px" height="11px" />
+      </div>
+      <!--Later declarations win for the same physical edge, in either spelling.-->
+      <div display="flex" width="200px" height="40px">
+        <div display="block" width="20px" height="10px" margin-left="9px" margin-inline-start="3px" margin-inline-end="-4px" />
+        <div display="block" width="20px" height="10px" margin-inline-start="3px" margin-left="9px" margin-right="11px" margin-inline-end="0" />
+        <div display="block" width="10px" height="10px" />
+      </div>
+      <!--An orthogonal item uses its own block start for its automatic right margin.-->
+      <div display="flex" direction="rtl" width="200px" height="40px">
+        <div display="block" width="30px" height="20px" />
+        <div display="block" width="22px" height="20px" writing-mode="vertical-rl" direction="ltr" margin-block-start="auto" />
+      </div>
+    </div>
+  </input>
+  <expectations>
+    <node x="0" y="0" width="200" height="240">
+      <node x="0" y="0" width="200" height="40">
+        <node x="170" y="0" width="30" height="20" />
+        <node x="0" y="0" width="22" height="20" />
+      </node>
+      <node x="0" y="40" width="80" height="120">
+        <node x="7" y="88" width="68" height="20" />
+        <node x="69" y="74" width="11" height="11" />
+      </node>
+      <node x="0" y="160" width="200" height="40">
+        <node x="3" y="0" width="20" height="10" />
+        <node x="28" y="0" width="20" height="10" />
+        <node x="48" y="0" width="10" height="10" />
+      </node>
+      <node x="0" y="200" width="200" height="40">
+        <node x="170" y="0" width="30" height="20" />
+        <node x="0" y="0" width="22" height="20" />
+      </node>
+    </node>
+  </expectations>
+</test>
